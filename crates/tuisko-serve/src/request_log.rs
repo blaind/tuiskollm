@@ -35,6 +35,10 @@ impl RequestLog {
         self.prompt_metrics = metrics;
     }
 
+    pub(crate) const fn accepted(&self) -> Instant {
+        self.accepted
+    }
+
     pub(crate) fn observe_output(&mut self) {
         self.first_output.get_or_insert_with(Instant::now);
     }

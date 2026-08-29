@@ -310,7 +310,7 @@ impl ResidentMtpBatchGenerator {
         )
         .map_err(GpuError::from)?;
 
-        Ok(Self {
+        let generator = Self {
             frontend,
             program,
             stream,
@@ -329,7 +329,11 @@ impl ResidentMtpBatchGenerator {
             next_request_id: 1,
             retention_clock: 0,
             stop_ids,
-        })
+        };
+        if let Some(progress) = progress {
+            progress.finish();
+        }
+        Ok(generator)
     }
 
     /// Admits one request and restores only an exact shared target/MTP prefix.

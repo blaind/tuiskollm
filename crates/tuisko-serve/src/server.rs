@@ -229,109 +229,265 @@ enum InferencePhase {
     Decode,
 }
 
+#[derive(Clone, Copy)]
+struct InferenceProgress {
+    phase: InferencePhase,
+    active: usize,
+    rounds: usize,
+    output_tokens: usize,
+    first_output_tokens: usize,
+    spinner_tick: usize,
+    phase_elapsed: Duration,
+    elapsed: Duration,
+    ttft: Option<Duration>,
+    last_prefill: Option<(usize, Duration)>,
+    mtp_acceptance: Option<(usize, usize)>,
+}
+
 struct InferenceDisplay {
+    state: Arc<Mutex<InferenceDisplayState>>,
+    stop: Option<std_mpsc::Sender<()>>,
+    reporter: Option<std::thread::JoinHandle<()>>,
+}
+
+struct InferenceDisplayState {
     interactive: bool,
     color: bool,
     phase: Option<InferencePhase>,
-    last_draw: Option<Instant>,
+    phase_epoch: u64,
+    phase_started: Instant,
+    session_started: Instant,
+    first_output: Option<Instant>,
+    first_output_tokens: usize,
     last_active: usize,
     spinner_tick: usize,
     rounds: usize,
     output_tokens: usize,
+    last_prefill: Option<(usize, Duration)>,
+    mtp_by_request: HashMap<ResidentRequestId, (usize, usize)>,
     session_active: bool,
 }
 
 impl InferenceDisplay {
     fn new(interactive: bool, color: bool) -> Self {
-        Self {
+        let state = Arc::new(Mutex::new(InferenceDisplayState {
             interactive,
             color,
             phase: None,
-            last_draw: None,
+            phase_epoch: 0,
+            phase_started: Instant::now(),
+            session_started: Instant::now(),
+            first_output: None,
+            first_output_tokens: 0,
             last_active: 0,
             spinner_tick: 0,
             rounds: 0,
             output_tokens: 0,
+            last_prefill: None,
+            mtp_by_request: HashMap::new(),
             session_active: false,
+        }));
+        if !interactive {
+            return Self {
+                state,
+                stop: None,
+                reporter: None,
+            };
+        }
+
+        let (stop, stopped) = std_mpsc::channel();
+        let reporter_state = Arc::clone(&state);
+        let reporter = std::thread::Builder::new()
+            .name("tuiskollm-display".into())
+            .spawn(move || inference_display_reporter(reporter_state, stopped));
+        match reporter {
+            Ok(reporter) => Self {
+                state,
+                stop: Some(stop),
+                reporter: Some(reporter),
+            },
+            Err(_) => {
+                state.lock().expect("display mutex poisoned").interactive = false;
+                Self {
+                    state,
+                    stop: None,
+                    reporter: None,
+                }
+            }
         }
     }
 
-    fn prefill(&mut self, requests: usize) {
-        self.begin_session();
-        self.draw(InferencePhase::Prefill, requests, true);
+    fn prefill(&mut self, requests: usize, accepted: Instant) {
+        let mut state = self.state.lock().expect("display mutex poisoned");
+        state.begin_session(accepted);
+        state.phase = Some(InferencePhase::Prefill);
+        state.phase_epoch = state.phase_epoch.wrapping_add(1);
+        state.phase_started = Instant::now();
+        state.last_active = requests;
+    }
+
+    fn observe_prefill(&mut self, tokens: usize, elapsed: Duration) {
+        self.state
+            .lock()
+            .expect("display mutex poisoned")
+            .last_prefill = Some((tokens, elapsed));
     }
 
     fn decode(&mut self, active: usize) {
-        self.begin_session();
-        self.rounds = self.rounds.saturating_add(1);
-        let redraw = self.phase != Some(InferencePhase::Decode)
-            || self.last_active != active
-            || self
-                .last_draw
-                .is_none_or(|draw| draw.elapsed() >= Duration::from_millis(100));
-        self.draw(InferencePhase::Decode, active, redraw);
+        let mut state = self.state.lock().expect("display mutex poisoned");
+        state.begin_session(Instant::now());
+        state.rounds = state.rounds.saturating_add(1);
+        if state.phase != Some(InferencePhase::Decode) {
+            let now = Instant::now();
+            state.phase = Some(InferencePhase::Decode);
+            state.phase_epoch = state.phase_epoch.wrapping_add(1);
+            state.phase_started = now;
+        }
+        state.last_active = active;
     }
 
     fn observe_outputs(&mut self, outputs: usize) {
-        self.output_tokens = self.output_tokens.saturating_add(outputs);
+        let mut state = self.state.lock().expect("display mutex poisoned");
+        if outputs > 0 && state.first_output.is_none() {
+            state.first_output = Some(Instant::now());
+            state.first_output_tokens = outputs;
+        }
+        state.output_tokens = state.output_tokens.saturating_add(outputs);
+    }
+
+    fn observe_mtp_acceptance(
+        &mut self,
+        request_id: ResidentRequestId,
+        accepted: usize,
+        proposed: usize,
+    ) {
+        self.state
+            .lock()
+            .expect("display mutex poisoned")
+            .mtp_by_request
+            .insert(request_id, (accepted, proposed));
     }
 
     fn clear(&mut self) {
-        if self.interactive && self.phase.take().is_some() {
+        let mut state = self.state.lock().expect("display mutex poisoned");
+        if state.interactive && state.phase.take().is_some() {
+            state.phase_epoch = state.phase_epoch.wrapping_add(1);
+            drop(state);
             let mut stdout = std::io::stdout().lock();
-            if stdout
+            let failed = stdout
                 .write_all(b"\r\x1b[2K")
                 .and_then(|_| stdout.flush())
-                .is_err()
-            {
-                self.interactive = false;
+                .is_err();
+            drop(stdout);
+            if failed {
+                self.state
+                    .lock()
+                    .expect("display mutex poisoned")
+                    .interactive = false;
             }
         }
     }
 
     fn idle(&mut self) {
         self.clear();
-        self.last_draw = None;
-        self.last_active = 0;
-        self.rounds = 0;
-        self.output_tokens = 0;
-        self.session_active = false;
+        let mut state = self.state.lock().expect("display mutex poisoned");
+        state.first_output = None;
+        state.first_output_tokens = 0;
+        state.last_active = 0;
+        state.rounds = 0;
+        state.output_tokens = 0;
+        state.last_prefill = None;
+        state.mtp_by_request.clear();
+        state.session_active = false;
     }
+}
 
-    fn begin_session(&mut self) {
+impl Drop for InferenceDisplay {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(reporter) = self.reporter.take() {
+            let _ = reporter.join();
+        }
+    }
+}
+
+impl InferenceDisplayState {
+    fn begin_session(&mut self, accepted: Instant) {
         if !self.session_active {
             self.rounds = 0;
             self.output_tokens = 0;
+            self.last_prefill = None;
+            self.mtp_by_request.clear();
+            self.session_started = accepted;
+            self.first_output = None;
+            self.first_output_tokens = 0;
             self.session_active = true;
         }
     }
+}
 
-    fn draw(&mut self, phase: InferencePhase, active: usize, redraw: bool) {
-        if !self.interactive || !redraw {
-            return;
+fn inference_display_reporter(
+    state: Arc<Mutex<InferenceDisplayState>>,
+    stopped: std_mpsc::Receiver<()>,
+) {
+    while let Err(std_mpsc::RecvTimeoutError::Timeout) =
+        stopped.recv_timeout(Duration::from_millis(100))
+    {
+        let rendered = {
+            let mut state = state.lock().expect("display mutex poisoned");
+            render_inference_state(&mut state)
+        };
+        if let Some((epoch, line)) = rendered {
+            let mut stdout = std::io::stdout().lock();
+            let current = {
+                let state = state.lock().expect("display mutex poisoned");
+                state.interactive && state.phase.is_some() && state.phase_epoch == epoch
+            };
+            if current
+                && stdout
+                    .write_all(line.as_bytes())
+                    .and_then(|_| stdout.flush())
+                    .is_err()
+            {
+                let mut state = state.lock().expect("display mutex poisoned");
+                state.interactive = false;
+                state.phase = None;
+            }
         }
-        let line = render_inference_progress(
-            phase,
-            active,
-            self.rounds,
-            self.output_tokens,
-            self.spinner_tick,
-            self.color,
-        );
-        let mut stdout = std::io::stdout().lock();
-        if stdout
-            .write_all(line.as_bytes())
-            .and_then(|_| stdout.flush())
-            .is_err()
-        {
-            self.interactive = false;
-            return;
-        }
-        self.phase = Some(phase);
-        self.last_draw = Some(Instant::now());
-        self.last_active = active;
-        self.spinner_tick = self.spinner_tick.wrapping_add(1);
     }
+}
+
+fn render_inference_state(state: &mut InferenceDisplayState) -> Option<(u64, String)> {
+    if !state.interactive {
+        return None;
+    }
+    let phase = state.phase?;
+    let now = Instant::now();
+    let mtp_acceptance = state
+        .mtp_by_request
+        .values()
+        .copied()
+        .reduce(|left, right| (left.0 + right.0, left.1 + right.1));
+    let line = render_inference_progress(
+        InferenceProgress {
+            phase,
+            active: state.last_active,
+            rounds: state.rounds,
+            output_tokens: state.output_tokens,
+            first_output_tokens: state.first_output_tokens,
+            spinner_tick: state.spinner_tick,
+            phase_elapsed: now.saturating_duration_since(state.phase_started),
+            elapsed: now.saturating_duration_since(state.session_started),
+            ttft: state
+                .first_output
+                .map(|first| first.saturating_duration_since(state.session_started)),
+            last_prefill: state.last_prefill,
+            mtp_acceptance,
+        },
+        state.color,
+    );
+    state.spinner_tick = state.spinner_tick.wrapping_add(1);
+    Some((state.phase_epoch, line))
 }
 
 trait ReloadableGenerator: TextGenerator + Sized {
@@ -585,7 +741,13 @@ fn start_worker(
             Ok(ready) => break ready,
             Err(std_mpsc::RecvTimeoutError::Timeout) if interactive => {
                 let snapshot = progress.snapshot();
-                if (snapshot.0 == ResidentLoadPhase::Preparing || Some(snapshot) != displayed)
+                let spinning = !matches!(
+                    snapshot.0,
+                    ResidentLoadPhase::Uploading
+                        | ResidentLoadPhase::UploadingMtp
+                        | ResidentLoadPhase::Ready
+                );
+                if (spinning || Some(snapshot) != displayed)
                     && let Some(line) = render_load_progress(
                         snapshot.0,
                         snapshot.1,
@@ -996,6 +1158,9 @@ fn serve_requests<G: TextGenerator>(
         }
         for event in events.iter() {
             let request_id = event.request_id();
+            if let Some((accepted, proposed)) = event.mtp_acceptance() {
+                display.observe_mtp_acceptance(request_id, accepted, proposed);
+            }
             let failed = replies.get_mut(&request_id).is_some_and(|reply| {
                 if let Some((accepted, proposed)) = event.mtp_acceptance() {
                     reply.log.observe_mtp_acceptance(accepted, proposed);
@@ -1309,6 +1474,9 @@ fn serve_reloadable<G: ReloadableGenerator>(
         }
         for event in events.iter() {
             let request_id = event.request_id();
+            if let Some((accepted, proposed)) = event.mtp_acceptance() {
+                display.observe_mtp_acceptance(request_id, accepted, proposed);
+            }
             let failed = replies.get_mut(&request_id).is_some_and(|reply| {
                 if let Some((accepted, proposed)) = event.mtp_acceptance() {
                     reply.log.observe_mtp_acceptance(accepted, proposed);
@@ -1365,35 +1533,51 @@ fn render_load_progress(
     spinner_tick: usize,
     color: bool,
 ) -> Option<String> {
-    let finalizing = match phase {
-        ResidentLoadPhase::Preparing => {
-            const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
-            let frame = FRAMES[spinner_tick % FRAMES.len()];
-            let (loading, reset) = if color {
-                ("\x1b[1;33m", "\x1b[0m")
-            } else {
-                ("", "")
-            };
-            return Some(format!(
-                "\r\x1b[2K{loading}LOADING{reset} {frame}       preparing resident model…"
+    let stage = match phase {
+        ResidentLoadPhase::Preparing => "preparing resident model",
+        ResidentLoadPhase::Planning => "planning exact resident layout",
+        ResidentLoadPhase::Allocating => "allocating device arenas",
+        ResidentLoadPhase::PreparingOperators => "preparing target CUDA operators",
+        ResidentLoadPhase::CapturingTargetGraphs => "capturing target CUDA graphs",
+        ResidentLoadPhase::PreparingMtpOperators => "preparing MTP CUDA operators",
+        ResidentLoadPhase::CapturingMtpGraphs => "capturing MTP CUDA graphs",
+        ResidentLoadPhase::Finalizing => "finalizing resident scheduler",
+        ResidentLoadPhase::Ready => return None,
+        ResidentLoadPhase::Uploading => {
+            return Some(render_weight_progress(
+                submitted_bytes,
+                total_bytes,
+                "",
+                color,
             ));
         }
-        ResidentLoadPhase::Ready => return None,
-        ResidentLoadPhase::Uploading => false,
-        ResidentLoadPhase::Finalizing => true,
+        ResidentLoadPhase::UploadingMtp => {
+            return Some(render_weight_progress(
+                submitted_bytes,
+                total_bytes,
+                " · MTP weights",
+                color,
+            ));
+        }
     };
-    Some(render_weight_progress(
-        submitted_bytes,
-        total_bytes,
-        finalizing,
-        color,
-    ))
+    Some(render_load_stage(stage, spinner_tick, color))
+}
+
+fn render_load_stage(stage: &str, spinner_tick: usize, color: bool) -> String {
+    const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+    let frame = FRAMES[spinner_tick % FRAMES.len()];
+    let (loading, reset) = if color {
+        ("\x1b[1;33m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    format!("\r\x1b[2K{loading}LOADING{reset} {frame}       {stage}…")
 }
 
 fn render_weight_progress(
     submitted_bytes: usize,
     total_bytes: usize,
-    finalizing: bool,
+    suffix: &str,
     color: bool,
 ) -> String {
     const BAR_WIDTH: usize = 20;
@@ -1408,7 +1592,6 @@ fn render_weight_progress(
     } else {
         ("", "")
     };
-    let suffix = if finalizing { " · finalizing…" } else { "" };
     format!(
         "\r\x1b[2K{loading}LOADING{reset} weights  {bar}  {:.2} / {:.2} GiB{suffix}",
         gibibytes(submitted_bytes),
@@ -1416,25 +1599,72 @@ fn render_weight_progress(
     )
 }
 
-fn render_inference_progress(
-    phase: InferencePhase,
-    active: usize,
-    rounds: usize,
-    output_tokens: usize,
-    spinner_tick: usize,
-    color: bool,
-) -> String {
+fn render_inference_progress(progress: InferenceProgress, color: bool) -> String {
     const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
-    let frame = FRAMES[spinner_tick % FRAMES.len()];
-    let (label, detail) = match phase {
+    let frame = FRAMES[progress.spinner_tick % FRAMES.len()];
+    let (label, detail) = match progress.phase {
         InferencePhase::Prefill => {
-            let suffix = if active == 1 { "" } else { "s" };
-            ("PREFILL", format!("{active} request{suffix}"))
+            let suffix = if progress.active == 1 { "" } else { "s" };
+            (
+                "PREFILL",
+                format!(
+                    "{} request{suffix} · {:.1} s",
+                    progress.active,
+                    progress.phase_elapsed.as_secs_f64()
+                ),
+            )
         }
-        InferencePhase::Decode => (
-            "DECODE",
-            format!("B={active} · {rounds} rounds · {output_tokens} output tok"),
-        ),
+        InferencePhase::Decode => {
+            let decode_elapsed = progress
+                .ttft
+                .map(|ttft| progress.elapsed.saturating_sub(ttft))
+                .unwrap_or_default();
+            let decode_seconds = decode_elapsed.as_secs_f64();
+            let measured_tokens = progress
+                .output_tokens
+                .saturating_sub(progress.first_output_tokens);
+            let speed = if decode_seconds > 0.0 {
+                measured_tokens as f64 / decode_seconds
+            } else {
+                0.0
+            };
+            let ttft = progress.ttft.map_or_else(
+                || "ttft pending".into(),
+                |ttft| format!("ttft {:.1} s", ttft.as_secs_f64()),
+            );
+            let prefill = progress
+                .last_prefill
+                .map_or_else(String::new, |(tokens, elapsed)| {
+                    let seconds = elapsed.as_secs_f64();
+                    let speed = if seconds > 0.0 {
+                        tokens as f64 / seconds
+                    } else {
+                        0.0
+                    };
+                    format!(" · prefill {speed:.1} tok/s")
+                });
+            let mtp = progress
+                .mtp_acceptance
+                .map_or_else(String::new, |(accepted, proposed)| {
+                    let percent = if proposed == 0 {
+                        0.0
+                    } else {
+                        100.0 * accepted as f64 / proposed as f64
+                    };
+                    format!(" · MTP {accepted}/{proposed} ({percent:.1}%)")
+                });
+            (
+                "DECODE",
+                format!(
+                    "B={} · elapsed {:.1} s · {ttft} · decode {:.1} s · {} rounds · {} tok · {speed:.1} tok/s{prefill}{mtp}",
+                    progress.active,
+                    progress.elapsed.as_secs_f64(),
+                    decode_elapsed.as_secs_f64(),
+                    progress.rounds,
+                    progress.output_tokens,
+                ),
+            )
+        }
     };
     let (active_color, reset) = if color {
         ("\x1b[1;36m", "\x1b[0m")
@@ -1553,9 +1783,22 @@ fn admit_group<G: TextGenerator>(
     waiting: &mut Vec<ChatJob>,
     display: &mut InferenceDisplay,
 ) {
-    display.prefill(waiting.len());
+    let accepted = waiting
+        .iter()
+        .map(|job| job.log.accepted())
+        .min()
+        .unwrap_or_else(Instant::now);
+    display.prefill(waiting.len(), accepted);
+    let prefill_started = Instant::now();
     let requests = waiting.iter().map(|job| &job.request).collect::<Vec<_>>();
     let admissions = generator.admit_batch(&requests);
+    let prefill_elapsed = prefill_started.elapsed();
+    let prefill_tokens = admissions
+        .iter()
+        .filter_map(|admission| admission.as_ref().ok())
+        .map(|admission| admission.native_prefill_tokens)
+        .sum();
+    display.observe_prefill(prefill_tokens, prefill_elapsed);
     display.clear();
     debug_assert_eq!(admissions.len(), waiting.len());
     for (job, admission) in waiting.drain(..).zip(admissions) {
@@ -1681,9 +1924,30 @@ fn reload_qwen38(snapshot: &Path) -> Result<(ResidentMtpBatchGenerator, Ready), 
                         ResidentLoadPhase::Preparing => {
                             eprintln!("tuiskollm: runtime model load: preparing");
                         }
+                        ResidentLoadPhase::Planning => {
+                            eprintln!("tuiskollm: runtime model load: planning layout");
+                        }
+                        ResidentLoadPhase::Allocating => {
+                            eprintln!("tuiskollm: runtime model load: allocating arenas");
+                        }
+                        ResidentLoadPhase::PreparingOperators => {
+                            eprintln!("tuiskollm: runtime model load: preparing target operators");
+                        }
                         ResidentLoadPhase::Uploading => eprintln!(
                             "tuiskollm: runtime model load: uploading {submitted}/{total} bytes"
                         ),
+                        ResidentLoadPhase::CapturingTargetGraphs => {
+                            eprintln!("tuiskollm: runtime model load: capturing target graphs");
+                        }
+                        ResidentLoadPhase::UploadingMtp => eprintln!(
+                            "tuiskollm: runtime model load: uploading MTP {submitted}/{total} bytes"
+                        ),
+                        ResidentLoadPhase::PreparingMtpOperators => {
+                            eprintln!("tuiskollm: runtime model load: preparing MTP operators");
+                        }
+                        ResidentLoadPhase::CapturingMtpGraphs => {
+                            eprintln!("tuiskollm: runtime model load: capturing MTP graphs");
+                        }
                         ResidentLoadPhase::Finalizing => {
                             eprintln!("tuiskollm: runtime model load: finalizing");
                         }
@@ -2219,12 +2483,12 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, ChatJob, EnqueueError, InferencePhase, Job, LifecycleState,
+        AppState, ChatJob, EnqueueError, InferencePhase, InferenceProgress, Job, LifecycleState,
         QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerConfig, ServerError, ServerModel,
         chat_completions, completion_id, enqueue_chat_job, fail_queued, health, load, models,
-        readiness, record_admission, render_inference_progress, render_loading, render_shutdown,
-        render_startup, render_weight_progress, router, run, serve_reloadable,
-        serve_until_worker_failure, serve_until_worker_failure_or_shutdown,
+        readiness, record_admission, render_inference_progress, render_load_progress,
+        render_loading, render_shutdown, render_startup, render_weight_progress, router, run,
+        serve_reloadable, serve_until_worker_failure, serve_until_worker_failure_or_shutdown,
         try_send_generation_steps, unload,
     };
     use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
@@ -2247,7 +2511,7 @@ mod tests {
     use tuisko_engine::{
         ChatGenerationRequest, EngineError, EngineErrorCode, FinishReason, GeneratedText,
         GenerationStep, MAX_BATCH, QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, ResidentBatchAdmission,
-        ResidentCancellation, ResidentRequestId,
+        ResidentCancellation, ResidentLoadPhase, ResidentRequestId,
     };
     use tuisko_frontend::{ChatMessage, GenerationDefaults};
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
@@ -2465,13 +2729,17 @@ mod tests {
         assert!(colored_loading.starts_with("\x1b[1;36mTuiskoLLM\x1b[0m"));
         assert!(colored_loading.contains("\x1b[1;33mLOADING\x1b[0m"));
 
-        let progress = render_weight_progress(3 << 30, 4 << 30, false, false);
+        let progress = render_weight_progress(3 << 30, 4 << 30, "", false);
         assert!(progress.contains("███████████████░░░░░"));
         assert!(progress.contains("3.00 / 4.00 GiB"));
-        let finalizing = render_weight_progress(4 << 30, 4 << 30, true, true);
-        assert!(finalizing.contains("\x1b[1;33mLOADING\x1b[0m"));
-        assert!(finalizing.contains("████████████████████"));
-        assert!(finalizing.ends_with("4.00 / 4.00 GiB · finalizing…"));
+        let mtp = render_weight_progress(4 << 30, 4 << 30, " · MTP weights", true);
+        assert!(mtp.contains("\x1b[1;33mLOADING\x1b[0m"));
+        assert!(mtp.contains("████████████████████"));
+        assert!(mtp.ends_with("4.00 / 4.00 GiB · MTP weights"));
+        let finalizing =
+            render_load_progress(ResidentLoadPhase::Finalizing, 4 << 30, 4 << 30, 1, false)
+                .unwrap();
+        assert!(finalizing.ends_with("finalizing resident scheduler…"));
 
         let colored = render_startup(&ready, Duration::from_micros(1_925_200), address, true);
         assert!(colored.starts_with("\x1b[32mOK\x1b[0m device"));
@@ -2689,12 +2957,44 @@ mod tests {
 
     #[test]
     fn interactive_inference_and_shutdown_lines_are_terminal_only() {
-        let prefill = render_inference_progress(InferencePhase::Prefill, 2, 0, 0, 0, false);
-        assert_eq!(prefill, "\r\x1b[2KPREFILL ⠋       2 requests…");
+        let prefill = render_inference_progress(
+            InferenceProgress {
+                phase: InferencePhase::Prefill,
+                active: 2,
+                rounds: 0,
+                output_tokens: 0,
+                first_output_tokens: 0,
+                spinner_tick: 0,
+                phase_elapsed: Duration::from_millis(1_250),
+                elapsed: Duration::from_millis(1_250),
+                ttft: None,
+                last_prefill: None,
+                mtp_acceptance: None,
+            },
+            false,
+        );
+        assert_eq!(prefill, "\r\x1b[2KPREFILL ⠋       2 requests · 1.2 s…");
 
-        let decode = render_inference_progress(InferencePhase::Decode, 3, 17, 41, 1, true);
+        let decode = render_inference_progress(
+            InferenceProgress {
+                phase: InferencePhase::Decode,
+                active: 3,
+                rounds: 17,
+                output_tokens: 41,
+                first_output_tokens: 1,
+                spinner_tick: 1,
+                phase_elapsed: Duration::from_secs(2),
+                elapsed: Duration::from_secs(5),
+                ttft: Some(Duration::from_secs(1)),
+                last_prefill: Some((2_000, Duration::from_secs(2))),
+                mtp_acceptance: Some((23, 30)),
+            },
+            true,
+        );
         assert!(decode.starts_with("\r\x1b[2K\x1b[1;36mDECODE\x1b[0m ⠙"));
-        assert!(decode.ends_with("B=3 · 17 rounds · 41 output tok…"));
+        assert!(decode.contains("B=3 · elapsed 5.0 s · ttft 1.0 s · decode 4.0 s"));
+        assert!(decode.contains("17 rounds · 41 tok · 10.0 tok/s"));
+        assert!(decode.ends_with("prefill 1000.0 tok/s · MTP 23/30 (76.7%)…"));
 
         let daemon = render_shutdown(false, false);
         assert_eq!(

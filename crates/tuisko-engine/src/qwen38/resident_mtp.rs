@@ -515,6 +515,7 @@ impl ResidentMtpProgram {
         snapshot: Arc<CheckpointSnapshot<Qwen38_27B>>,
         progress: &ResidentLoadProgress,
     ) -> EngineResult<Self> {
+        progress.plan();
         let mtp_upload_bytes = ResidentMtpLayout::build()?.resident_weight_bytes();
         let (target, reservation) =
             ResidentModelProgram::from_snapshot_reserving_mtp_with_progress(
@@ -551,10 +552,13 @@ impl ResidentMtpProgram {
         let cache_regions = layout.cache_regions();
         let stream = context.new_stream().map_err(GpuError::from)?;
 
+        if let Some(progress) = progress {
+            progress.begin_mtp_upload();
+        }
         load_mtp_source_weights(&arena, &stream, regions, target.snapshot().as_ref())?;
         if let Some(progress) = progress {
             progress.submit(layout.resident_weight_bytes())?;
-            progress.finish_upload()?;
+            progress.finish_mtp_upload()?;
         }
         stream.synchronize().map_err(GpuError::from)?;
         let mtp_weight_load_ns = elapsed_ns("resident MTP weight load", weight_start)?;
@@ -615,12 +619,15 @@ impl ResidentMtpProgram {
             rope_sin: &rope_sin_stager,
             continuation_hidden: &continuation_hidden_stager,
         };
+        if let Some(progress) = progress {
+            progress.capture_mtp_graphs();
+        }
         let graph_start = Instant::now();
         let graphs = capture_graphs(&stream, &target, &arena, regions, pointers, ops, stagers)?;
         stream.synchronize().map_err(GpuError::from)?;
         let mtp_graph_capture_ns = elapsed_ns("resident MTP graph capture", graph_start)?;
         if let Some(progress) = progress {
-            progress.finish();
+            progress.finalize();
         }
         let base_address = arena.base_address();
         let cache_base_address = cache_arena.base_address();

@@ -739,6 +739,9 @@ impl ResidentModelProgram {
         let swizzled_source_bytes =
             upload_plan.weight_bytes_for(ResidentUploadPreparation::SwizzledSource);
         let layout_plan_ns = elapsed_ns("resident layout and upload plan", layout_start)?;
+        if let Some(progress) = progress {
+            progress.allocate();
+        }
 
         let allocation_start = Instant::now();
         let stream = context.new_stream().map_err(GpuError::from)?;
@@ -782,6 +785,9 @@ impl ResidentModelProgram {
             })
             .transpose()?;
         stream.synchronize().map_err(GpuError::from)?;
+        if let Some(progress) = progress {
+            progress.prepare_operators();
+        }
 
         let operator_start = Instant::now();
         let kv_slots = PagedKvSlotPool::new(LONG_CONTEXT_PHYSICAL_PAGES)?;
@@ -973,7 +979,7 @@ impl ResidentModelProgram {
                 if let Some(progress) = progress
                     && progress_tail_upload_bytes == 0
                 {
-                    progress.finish_upload()?;
+                    progress.finish_target_upload()?;
                 }
                 let arena = arena.seal()?;
                 let kv_arena = kv_arena.seal()?;
@@ -1009,6 +1015,11 @@ impl ResidentModelProgram {
                 (arena, kv_arena, scalars, load_stats)
             }
         };
+        if let Some(progress) = progress
+            && progress_tail_upload_bytes != 0
+        {
+            progress.capture_target_graphs();
+        }
         let graph_start = Instant::now();
         let pointers = ProgramPointers::bind(&arena, &kv_arena, &layout, &scalars)?;
         let dense_mlp_maps = DenseMlpMaps::bind_all(&stream, &pointers)?;
@@ -1050,6 +1061,7 @@ impl ResidentModelProgram {
         if let Some(progress) = progress
             && progress_tail_upload_bytes == 0
         {
+            progress.finalize();
             progress.finish();
         }
 
