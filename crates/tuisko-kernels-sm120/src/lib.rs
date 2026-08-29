@@ -11,11 +11,11 @@ pub use inventory::kernel_ptx_names;
 pub use tuisko_kernels_sm120_attention::{
     ATTENTION_PAGE_SIZE, AttentionQkPrepareOp, IndexerCompressArgs, IndexerPrepareArgs,
     IndexerSelectionArgs, LONG_CONTEXT_GQA_MAX_PARTITIONS, LONG_CONTEXT_GQA_MAX_TOKENS,
-    LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE, LongContextPagedGqaOp,
-    PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PAGED_GQA_PREFILL_MACRO_MAX_PARTITIONS,
-    PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES, PAGED_GQA_PREFILL_MACRO_TOKENS,
-    PAGED_GQA_PREFILL_MAX_CONTEXT, PAGED_GQA_PREFILL_PARTIAL_BYTES, PagedGqaOp,
-    Qwen35AttentionQkPrepareOp, Qwen35PagedGqaOp, Qwen36AttentionQkPrepareOp,
+    LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE, LongContextMtpPagedGqaOp,
+    LongContextPagedGqaOp, PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT,
+    PAGED_GQA_PREFILL_MACRO_MAX_PARTITIONS, PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES,
+    PAGED_GQA_PREFILL_MACRO_TOKENS, PAGED_GQA_PREFILL_MAX_CONTEXT, PAGED_GQA_PREFILL_PARTIAL_BYTES,
+    PagedGqaOp, Qwen35AttentionQkPrepareOp, Qwen35PagedGqaOp, Qwen36AttentionQkPrepareOp,
     Qwen36Fp8AttentionQkPrepareOp, Qwen36Fp8PagedGqaOp, Qwen36PagedGqaOp,
     Qwen38FlashNextAttentionQkPrepareOp, Qwen38FlashNextIndexerPrepareOp,
     Qwen38FlashNextIndexerSelectionOp, Qwen38FlashNextPagedGqaOp,
@@ -59,8 +59,8 @@ pub use tuisko_kernels_sm120_moe::{
 };
 pub use tuisko_kernels_sm120_mtp::{
     MtpBf16AttentionOutputOp, MtpBf16FusionOp, MtpBf16MlpOp, MtpBf16PagedGqaOp, MtpBf16QkPrepareOp,
-    MtpBf16QkvOp, Qwen35MtpBf16AttentionOutputOp, Qwen35MtpBf16FusionOp, Qwen35MtpBf16MlpOp,
-    Qwen35MtpBf16PagedGqaOp, Qwen35MtpBf16QkPrepareOp, Qwen35MtpBf16QkvOp,
+    MtpBf16QkvOp, MtpBf16SplitKvPagedGqaOp, Qwen35MtpBf16AttentionOutputOp, Qwen35MtpBf16FusionOp,
+    Qwen35MtpBf16MlpOp, Qwen35MtpBf16PagedGqaOp, Qwen35MtpBf16QkPrepareOp, Qwen35MtpBf16QkvOp,
     Qwen36MtpBf16AttentionOutputOp, Qwen36MtpBf16FusionOp, Qwen36MtpBf16QkvOp,
 };
 pub use tuisko_kernels_sm120_norm::{Qwen35ResidualNormOp, Qwen36ResidualNormOp, ResidualNormOp};

@@ -34,8 +34,9 @@ use tuisko_kernels_sm120::{
     DenseFp8GdnInputTmaMaps, DenseFp8GdnOutputTmaMaps, DenseFp8QkvTmaMaps, DenseFp8SwiGluOp,
     DenseFp8SwiGluTmaMaps, FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp,
     GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, LONG_CONTEXT_GQA_PARTITION_BUCKETS,
-    LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp, LongContextPagedGqaOp, Nvfp4DownOp, Nvfp4SwiGluOp,
-    PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PagedGqaOp, ResidualNormOp,
+    LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp, LongContextMtpPagedGqaOp, LongContextPagedGqaOp,
+    Nvfp4DownOp, Nvfp4SwiGluOp, PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PagedGqaOp,
+    ResidualNormOp,
 };
 use tuisko_model::{
     Arch, CheckpointSnapshot, DenseFp8DownBindings, DenseFp8GateUpBindings,
@@ -54,6 +55,8 @@ const PREFILL_GRAPH_ROUTE_COUNT: usize = 6;
 const TARGET_VERIFY_ROUTE_COUNT: usize = 4;
 const TARGET_SEGMENTED_BATCH_ROUTES: usize = MAX_BATCH - 1;
 const TARGET_VERIFY_ROWS: usize = MAX_BATCH * TARGET_VERIFY_ROUTE_COUNT;
+// The shared-tile route wins at 65K and above; the generic row-parallel route wins at 8K.
+const LONG_CONTEXT_MTP_CACHE_REUSE_MIN_CONTEXT: usize = 65_536;
 const GDN_LAYER_COUNT: usize =
     Qwen38_27B::LAYERS - Qwen38_27B::LAYERS / Qwen38_27B::FULL_ATTENTION_INTERVAL;
 const DENSE_MLP_LAYER_COUNT: usize = Qwen38_27B::LAYERS - NVFP4_MLP_LAYER_END;
@@ -560,6 +563,7 @@ pub struct ResidentModelProgram {
     _attention_qk_prepare: AttentionQkPrepareOp<Qwen38_27B>,
     _paged_gqa: PagedGqaOp<Qwen38_27B>,
     _long_context_paged_gqa: LongContextPagedGqaOp<Qwen38_27B>,
+    _long_context_mtp_paged_gqa: LongContextMtpPagedGqaOp<Qwen38_27B>,
     _attention_output: AttentionOutputOp<Qwen38_27B>,
     _dense_swiglu: DenseFp8SwiGluOp<Qwen38_27B>,
     _dense_down: DenseFp8DownOp<Qwen38_27B>,
@@ -801,6 +805,7 @@ impl ResidentModelProgram {
         let attention_qk_prepare = AttentionQkPrepareOp::new(context)?;
         let paged_gqa = PagedGqaOp::new(context)?;
         let long_context_paged_gqa = LongContextPagedGqaOp::new(context)?;
+        let long_context_mtp_paged_gqa = LongContextMtpPagedGqaOp::new(context)?;
         let attention_output = AttentionOutputOp::new(context)?;
         let dense_swiglu = DenseFp8SwiGluOp::new(context)?;
         let dense_down = DenseFp8DownOp::new(context)?;
@@ -1040,6 +1045,7 @@ impl ResidentModelProgram {
             attention_qk_prepare: &attention_qk_prepare,
             paged_gqa: &paged_gqa,
             long_context_paged_gqa: &long_context_paged_gqa,
+            long_context_mtp_paged_gqa: &long_context_mtp_paged_gqa,
             attention_output: &attention_output,
             dense_swiglu: &dense_swiglu,
             dense_down: &dense_down,
@@ -1086,6 +1092,7 @@ impl ResidentModelProgram {
                 _attention_qk_prepare: attention_qk_prepare,
                 _paged_gqa: paged_gqa,
                 _long_context_paged_gqa: long_context_paged_gqa,
+                _long_context_mtp_paged_gqa: long_context_mtp_paged_gqa,
                 _attention_output: attention_output,
                 _dense_swiglu: dense_swiglu,
                 _dense_down: dense_down,
@@ -3706,6 +3713,7 @@ impl ResidentModelProgram {
                 route.tokens,
                 0,
                 route.maximum_length,
+                true,
                 route.attention,
                 self.ops(),
                 workspace,
@@ -3864,6 +3872,7 @@ impl ResidentModelProgram {
                     route.tokens,
                     0,
                     route.maximum_length,
+                    true,
                     route.attention,
                     self.ops(),
                     workspace,
@@ -4195,6 +4204,7 @@ impl ResidentModelProgram {
             attention_qk_prepare: &self._attention_qk_prepare,
             paged_gqa: &self._paged_gqa,
             long_context_paged_gqa: &self._long_context_paged_gqa,
+            long_context_mtp_paged_gqa: &self._long_context_mtp_paged_gqa,
             attention_output: &self._attention_output,
             dense_swiglu: &self._dense_swiglu,
             dense_down: &self._dense_down,
@@ -5147,6 +5157,7 @@ struct Ops<'a> {
     attention_qk_prepare: &'a AttentionQkPrepareOp<Qwen38_27B>,
     paged_gqa: &'a PagedGqaOp<Qwen38_27B>,
     long_context_paged_gqa: &'a LongContextPagedGqaOp<Qwen38_27B>,
+    long_context_mtp_paged_gqa: &'a LongContextMtpPagedGqaOp<Qwen38_27B>,
     attention_output: &'a AttentionOutputOp<Qwen38_27B>,
     dense_swiglu: &'a DenseFp8SwiGluOp<Qwen38_27B>,
     dense_down: &'a DenseFp8DownOp<Qwen38_27B>,
@@ -5432,6 +5443,7 @@ fn launch_target_mtp_verify(
         stream,
         route.tokens,
         0,
+        true,
         route.maximum_length,
         route.attention,
         ops,
@@ -5452,6 +5464,7 @@ fn launch_target_mtp_segmented_verify(
             stream,
             route.tokens,
             lane,
+            route.batch == 1,
             route.maximum_length,
             route.attention,
             ops,
@@ -5467,6 +5480,7 @@ fn launch_target_mtp_verify_lane(
     stream: &CudaStream,
     tokens: usize,
     lane: usize,
+    allow_long_context_mtp_cache_reuse: bool,
     maximum_length: usize,
     attention: AttentionRoute,
     ops: Ops<'_>,
@@ -5499,6 +5513,7 @@ fn launch_target_mtp_verify_lane(
             tokens,
             lane,
             maximum_length,
+            allow_long_context_mtp_cache_reuse,
             attention,
             ops,
             workspace,
@@ -5575,6 +5590,7 @@ fn launch_target_mtp_mixer(
     tokens: usize,
     lane: usize,
     maximum_length: usize,
+    allow_long_context_mtp_cache_reuse: bool,
     attention: AttentionRoute,
     ops: Ops<'_>,
     workspace: WorkspacePointers,
@@ -5717,24 +5733,49 @@ fn launch_target_mtp_mixer(
                         p.scalars.key_cache_scale,
                         p.scalars.value_cache_scale,
                     )?,
-                    AttentionRoute::Long { .. } => ops.long_context_paged_gqa.launch(
-                        stream,
-                        tokens,
-                        maximum_length,
-                        workspace.query,
-                        p.key_pages,
-                        p.value_pages,
-                        workspace.block_tables,
-                        workspace.table_rows,
-                        LONG_CONTEXT_PHYSICAL_PAGES,
-                        workspace.lengths,
-                        workspace.partial_maximum,
-                        workspace.partial_denominator,
-                        workspace.partial_numerator,
-                        workspace.attention,
-                        p.scalars.key_cache_scale,
-                        p.scalars.value_cache_scale,
-                    )?,
+                    AttentionRoute::Long { .. } => {
+                        if !allow_long_context_mtp_cache_reuse
+                            || !use_long_context_mtp_cache_reuse(tokens, maximum_length)
+                        {
+                            ops.long_context_paged_gqa.launch(
+                                stream,
+                                tokens,
+                                maximum_length,
+                                workspace.query,
+                                p.key_pages,
+                                p.value_pages,
+                                workspace.block_tables,
+                                workspace.table_rows,
+                                LONG_CONTEXT_PHYSICAL_PAGES,
+                                workspace.lengths,
+                                workspace.partial_maximum,
+                                workspace.partial_denominator,
+                                workspace.partial_numerator,
+                                workspace.attention,
+                                p.scalars.key_cache_scale,
+                                p.scalars.value_cache_scale,
+                            )?
+                        } else {
+                            ops.long_context_mtp_paged_gqa.launch(
+                                stream,
+                                tokens,
+                                maximum_length,
+                                workspace.query,
+                                p.key_pages,
+                                p.value_pages,
+                                workspace.block_tables,
+                                workspace.table_rows,
+                                LONG_CONTEXT_PHYSICAL_PAGES,
+                                workspace.lengths,
+                                workspace.partial_maximum,
+                                workspace.partial_denominator,
+                                workspace.partial_numerator,
+                                workspace.attention,
+                                p.scalars.key_cache_scale,
+                                p.scalars.value_cache_scale,
+                            )?
+                        }
+                    }
                 }
                 ops.attention_output.launch(
                     stream,
@@ -5750,6 +5791,10 @@ fn launch_target_mtp_mixer(
             }
         }
     }
+}
+
+const fn use_long_context_mtp_cache_reuse(tokens: usize, maximum_length: usize) -> bool {
+    tokens >= 2 && maximum_length >= LONG_CONTEXT_MTP_CACHE_REUSE_MIN_CONTEXT
 }
 
 fn launch_target_mtp_commit(
@@ -7468,18 +7513,34 @@ fn measure_preparation<T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        LONG_CONTEXT_ROUTE_COUNT, PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT,
-        PREFILL_GRAPH_ROUTE_COUNT, PRODUCTION_LOAD_MODE, ResidentLoadMode,
-        TARGET_VERIFY_ROUTE_COUNT, bf16_to_f32, decode_lengths, prefill_graph_index,
-        prefill_graph_routes, prefill_index, require_batch, require_rows, require_segmented_commit,
-        require_target_verify_tokens, select_decode_route, select_prefill_route,
-        select_segmented_target_route, slot_rows,
+        LONG_CONTEXT_MTP_CACHE_REUSE_MIN_CONTEXT, LONG_CONTEXT_ROUTE_COUNT,
+        PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PREFILL_GRAPH_ROUTE_COUNT,
+        PRODUCTION_LOAD_MODE, ResidentLoadMode, TARGET_VERIFY_ROUTE_COUNT, bf16_to_f32,
+        decode_lengths, prefill_graph_index, prefill_graph_routes, prefill_index, require_batch,
+        require_rows, require_segmented_commit, require_target_verify_tokens, select_decode_route,
+        select_prefill_route, select_segmented_target_route, slot_rows,
+        use_long_context_mtp_cache_reuse,
     };
     use crate::EngineErrorCode;
 
     #[test]
     fn production_loader_is_the_prefaulted_selective_route() {
         assert_eq!(PRODUCTION_LOAD_MODE, ResidentLoadMode::Selective);
+    }
+
+    #[test]
+    fn target_mtp_cache_reuse_starts_at_the_measured_long_context_crossover() {
+        assert!(!use_long_context_mtp_cache_reuse(1, 220_000));
+        assert!(!use_long_context_mtp_cache_reuse(
+            4,
+            LONG_CONTEXT_MTP_CACHE_REUSE_MIN_CONTEXT - 1
+        ));
+        for tokens in 2..=4 {
+            assert!(use_long_context_mtp_cache_reuse(
+                tokens,
+                LONG_CONTEXT_MTP_CACHE_REUSE_MIN_CONTEXT
+            ));
+        }
     }
 
     #[test]

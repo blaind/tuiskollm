@@ -73,6 +73,10 @@ mod gdn_recurrence_benchmark;
 mod gdn_state_snapshot;
 mod harness;
 #[cfg(feature = "device")]
+mod long_context_mtp_paged_gqa;
+#[cfg(feature = "device")]
+mod long_context_mtp_paged_gqa_benchmark;
+#[cfg(feature = "device")]
 mod long_context_paged_gqa;
 #[cfg(feature = "device")]
 mod long_context_paged_gqa_benchmark;
@@ -92,6 +96,10 @@ mod mtp_bf16_mlp_benchmark;
 mod mtp_bf16_qkv;
 #[cfg(feature = "device")]
 mod mtp_bf16_qkv_benchmark;
+#[cfg(feature = "device")]
+mod mtp_bf16_split_kv_paged_gqa;
+#[cfg(feature = "device")]
+mod mtp_bf16_split_kv_paged_gqa_benchmark;
 #[cfg(feature = "device")]
 mod mtp_layer;
 #[cfg(feature = "device")]
@@ -481,6 +489,13 @@ pub use gdn_state_snapshot::{
     GdnStateSnapshotQualification, GdnStateSnapshotQualificationError, qualify_gdn_state_snapshot,
 };
 #[cfg(feature = "device")]
+pub use long_context_mtp_paged_gqa::{
+    LongContextMtpPagedGqaQualification, LongContextMtpPagedGqaQualificationError,
+    qualify_long_context_mtp_paged_gqa,
+};
+#[cfg(feature = "device")]
+pub use long_context_mtp_paged_gqa_benchmark::benchmark_long_context_mtp_paged_gqa;
+#[cfg(feature = "device")]
 pub use long_context_paged_gqa::{
     LongContextPagedGqaQualification, LongContextPagedGqaQualificationError,
     qualify_long_context_paged_gqa,
@@ -516,6 +531,13 @@ pub use mtp_bf16_qkv::{
 };
 #[cfg(feature = "device")]
 pub use mtp_bf16_qkv_benchmark::benchmark_mtp_bf16_qkv;
+#[cfg(feature = "device")]
+pub use mtp_bf16_split_kv_paged_gqa::{
+    MtpBf16SplitKvPagedGqaQualification, MtpBf16SplitKvPagedGqaQualificationError,
+    qualify_mtp_bf16_split_kv_paged_gqa,
+};
+#[cfg(feature = "device")]
+pub use mtp_bf16_split_kv_paged_gqa_benchmark::benchmark_mtp_bf16_split_kv_paged_gqa;
 #[cfg(feature = "device")]
 pub use mtp_layer::{MtpLayerQualification, MtpLayerQualificationError, qualify_mtp_layer};
 #[cfg(feature = "device")]

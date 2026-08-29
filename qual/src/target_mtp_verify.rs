@@ -127,10 +127,10 @@ pub fn qualify_target_mtp_verify(
     verify_owner(&program)?;
     let base = (program.base_address(), program.kv_base_address());
     let addresses = program.qualification_addresses();
-    if addresses.len() != 1_168 || addresses.iter().copied().collect::<BTreeSet<_>>().len() != 1_168
+    if addresses.len() != 1_424 || addresses.iter().copied().collect::<BTreeSet<_>>().len() != 1_424
     {
         return Err(TargetMtpVerifyQualificationError::Mismatch(format!(
-            "target resident owner exposes {} addresses, expected 1,168 unique addresses",
+            "target resident owner exposes {} addresses, expected 1,424 unique addresses",
             addresses.len()
         )));
     }
@@ -786,19 +786,32 @@ fn run_leaf_oracles() -> Result<(), TargetMtpVerifyQualificationError> {
 }
 
 fn verify_owner(program: &ResidentModelProgram) -> Result<(), TargetMtpVerifyQualificationError> {
-    if program.workspace_bytes() != 923_695_108
-        || program.resident_arena_bytes() != 21_258_945_792
-        || program.kv_arena_bytes() != 7_210_118_656
-        || program.arena_bytes() != 28_469_064_448
-        || program.padding_bytes() != 15_676
-        || program.target_mtp_graph_count() != 228
-        || program.target_mtp_graph_executable_count() != 88
-        || program.graph_route_count() != 290
-        || program.graph_executable_count() != 150
-    {
-        return Err(TargetMtpVerifyQualificationError::Mismatch(
-            "target verify owner accounting differs from the admitted layout".to_string(),
-        ));
+    let actual = (
+        program.workspace_bytes(),
+        program.resident_arena_bytes(),
+        program.kv_arena_bytes(),
+        program.arena_bytes(),
+        program.padding_bytes(),
+        program.target_mtp_graph_count(),
+        program.target_mtp_graph_executable_count(),
+        program.graph_route_count(),
+        program.graph_executable_count(),
+    );
+    let expected = (
+        948_860_932,
+        21_284_111_616,
+        7_210_118_656,
+        28_494_230_272,
+        15_676,
+        228,
+        88,
+        290,
+        150,
+    );
+    if actual != expected {
+        return Err(TargetMtpVerifyQualificationError::Mismatch(format!(
+            "target verify owner accounting differs from the admitted layout: actual={actual:?}, expected={expected:?}"
+        )));
     }
     Ok(())
 }
@@ -809,7 +822,7 @@ fn qualify_long_segmented_variants(
     fixture: &Fixture,
     report: &mut TargetMtpVerifyQualification,
 ) -> Result<(), TargetMtpVerifyQualificationError> {
-    const LENGTHS: [usize; 6] = [193, 1_025, 4_097, 16_385, 65_537, 131_073];
+    const LENGTHS: [usize; 7] = [193, 1_025, 4_097, 16_385, 65_536, 65_537, 131_073];
     program.reserve_kv_slot_tokens(stream, 0, LENGTHS[LENGTHS.len() - 1])?;
     let fixtures = [segmented_fixture(fixture, 0), segmented_fixture(fixture, 1)];
     for (slot, lane_fixture) in fixtures.iter().enumerate() {
@@ -820,62 +833,80 @@ fn qualify_long_segmented_variants(
             &lane_fixture.state,
         )?;
     }
-    let token_ids = [
-        TOKEN_IDS[0],
-        (TOKEN_IDS[0] + 8_191) % Qwen38_27B::VOCAB as u32,
-    ];
-    program.stage_target_mtp_segmented_embeddings(stream, &token_ids)?;
     let slots = [0, 1];
-    let mut routes = Vec::with_capacity(LENGTHS.len());
-    for length in LENGTHS {
-        let first_positions = [length - 1, 0];
-        let position = u32::try_from(length - 1).map_err(|_| {
-            TargetMtpVerifyQualificationError::Mismatch(format!(
-                "long-context graph position {length} exceeds u32"
-            ))
-        })?;
-        let positions = [position, 0];
-        let (cosine, sine) = rope(&positions);
-        program.qualification_reset_workspace(stream, BYTE_SENTINEL)?;
-        let route = program.load_target_mtp_segmented_verify_state(
-            stream,
-            1,
-            &slots,
-            &first_positions,
-            &cosine,
-            &sine,
-        )?;
-        program.launch_target_mtp_segmented_verify_eager(stream, route)?;
-        let eager = program.qualification_target_mtp_segmented_observables(stream, route)?;
+    let mut routes = Vec::with_capacity(LENGTHS.len() * VERIFY_ROUTES);
+    for tokens in 1..=VERIFY_ROUTES {
+        let token_ids = (0..slots.len())
+            .flat_map(|lane| {
+                TOKEN_IDS[..tokens]
+                    .iter()
+                    .map(move |&token| (token + lane as u32 * 8_191) % Qwen38_27B::VOCAB as u32)
+            })
+            .collect::<Vec<_>>();
+        program.stage_target_mtp_segmented_embeddings(stream, &token_ids)?;
 
-        program.qualification_reset_workspace(stream, BYTE_SENTINEL)?;
-        let replay_route = program.load_target_mtp_segmented_verify_state(
-            stream,
-            1,
-            &slots,
-            &first_positions,
-            &cosine,
-            &sine,
-        )?;
-        program.replay_target_mtp_segmented_verify(stream, replay_route)?;
-        let replay =
-            program.qualification_target_mtp_segmented_observables(stream, replay_route)?;
-        compare_observables(
-            &format!("segmented long-context={length} graph variant"),
-            &replay,
-            &eager,
-        )?;
-        routes.push((replay_route, first_positions, cosine, sine));
-        report.graph_replay_values += observable_values(&eager);
-        report.long_segmented_variant_routes += 1;
+        for length in LENGTHS {
+            let first_positions = [length - tokens, 0];
+            let positions = first_positions
+                .iter()
+                .flat_map(|&first| first..first + tokens)
+                .map(|position| {
+                    u32::try_from(position).map_err(|_| {
+                        TargetMtpVerifyQualificationError::Mismatch(format!(
+                            "long-context graph position {position} exceeds u32"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let (cosine, sine) = rope(&positions);
+            program.qualification_reset_workspace(stream, BYTE_SENTINEL)?;
+            let route = program.load_target_mtp_segmented_verify_state(
+                stream,
+                tokens,
+                &slots,
+                &first_positions,
+                &cosine,
+                &sine,
+            )?;
+            program.launch_target_mtp_segmented_verify_eager(stream, route)?;
+            let eager = program.qualification_target_mtp_segmented_observables(stream, route)?;
+
+            program.qualification_reset_workspace(stream, BYTE_SENTINEL)?;
+            let replay_route = program.load_target_mtp_segmented_verify_state(
+                stream,
+                tokens,
+                &slots,
+                &first_positions,
+                &cosine,
+                &sine,
+            )?;
+            program.replay_target_mtp_segmented_verify(stream, replay_route)?;
+            let replay =
+                program.qualification_target_mtp_segmented_observables(stream, replay_route)?;
+            compare_observables(
+                &format!("segmented K={tokens} long-context={length} graph variant"),
+                &replay,
+                &eager,
+            )?;
+            routes.push((
+                replay_route,
+                first_positions,
+                cosine,
+                sine,
+                token_ids.clone(),
+            ));
+            report.graph_replay_values += observable_values(&eager);
+            report.long_segmented_variant_routes += 1;
+        }
     }
 
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(program.context())?;
-    for (route, first_positions, cosine, sine) in routes.iter().rev() {
+    for (route, first_positions, cosine, sine, token_ids) in routes.iter().rev() {
+        program.stage_target_mtp_segmented_embeddings(stream, token_ids)?;
         let replay_route = program.load_target_mtp_segmented_verify_state(
             stream,
-            1,
+            route.tokens(),
             &slots,
             first_positions,
             cosine,
@@ -1149,7 +1180,7 @@ fn compare_observables(
     Ok(())
 }
 
-fn compare_exact<T: Eq>(
+fn compare_exact<T: Eq + std::fmt::Debug>(
     role: &str,
     actual: &[T],
     expected: &[T],
@@ -1163,7 +1194,8 @@ fn compare_exact<T: Eq>(
     }
     if let Some(index) = actual.iter().zip(expected).position(|(a, b)| a != b) {
         return Err(TargetMtpVerifyQualificationError::Mismatch(format!(
-            "{role} differs at value {index}"
+            "{role} differs at value {index}: actual={:?}, expected={:?}",
+            actual[index], expected[index]
         )));
     }
     Ok(())
@@ -1379,9 +1411,9 @@ mod tests {
         assert_eq!(report.endpoint_oracle_values, 1_896_250);
         assert_eq!(report.graph_count, 228);
         assert_eq!(report.graph_executable_count, 88);
-        assert_eq!(report.long_segmented_variant_routes, 6);
-        assert_eq!(report.workspace_bytes, 923_695_108);
-        assert_eq!(report.arena_bytes, 28_469_064_448);
+        assert_eq!(report.long_segmented_variant_routes, 28);
+        assert_eq!(report.workspace_bytes, 948_860_932);
+        assert_eq!(report.arena_bytes, 28_494_230_272);
         assert_eq!(report.padding_bytes, 15_676);
         Ok(())
     }

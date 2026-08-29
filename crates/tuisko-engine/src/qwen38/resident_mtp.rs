@@ -11,18 +11,31 @@ use crate::{
 use std::sync::Arc;
 use std::time::Instant;
 use tuisko_gpu::{
-    CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult, PinnedHostBuffer,
-    VmmSegmentClass, VmmSegmentManifest, vmm_allocation_granularity,
+    CudaContext, CudaGraph, CudaGraphDefinition, CudaGraphVariants, CudaStream, DeviceArena,
+    GpuError, GpuResult, PinnedHostBuffer, VmmSegmentClass, VmmSegmentManifest,
+    vmm_allocation_granularity,
 };
 use tuisko_kernels_sm120::{
-    ATTENTION_PAGE_SIZE, LmHeadOp, MtpBf16AttentionOutputOp, MtpBf16FusionOp, MtpBf16MlpOp,
-    MtpBf16PagedGqaOp, MtpBf16QkPrepareOp, MtpBf16QkvOp, ResidualNormOp,
+    ATTENTION_PAGE_SIZE, LONG_CONTEXT_GQA_MAX_TOKENS, LONG_CONTEXT_GQA_PARTITION_BUCKETS,
+    LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp, MtpBf16AttentionOutputOp, MtpBf16FusionOp,
+    MtpBf16MlpOp, MtpBf16PagedGqaOp, MtpBf16QkPrepareOp, MtpBf16QkvOp, MtpBf16SplitKvPagedGqaOp,
+    ResidualNormOp,
 };
 use tuisko_model::{Arch, CheckpointSnapshot, MtpBindings, Qwen38_27B, TextEndpointBindings};
 
 const ROTARY_PAIRS: usize = 32;
 const PROMPT_ROUTES: [usize; 5] = [1, 32, 64, 128, MTP_PROMPT_ROWS];
 const REALIGN_ROUTES: usize = 4;
+const SHORT_MTP_ATTENTION_CAPACITY: usize = 1_792;
+const LONG_MTP_ATTENTION_FIRST_BUCKET_INDEX: usize = 1;
+const LONG_MTP_ATTENTION_ROUTES: usize =
+    LONG_CONTEXT_GQA_PARTITION_BUCKETS.len() - LONG_MTP_ATTENTION_FIRST_BUCKET_INDEX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MtpAttentionRoute {
+    Short,
+    Long { index: usize, maximum_length: usize },
+}
 
 /// Combined target-plus-MTP startup work exposed by the production server owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +129,7 @@ impl ResidentMtpPromptRoute {
 #[must_use = "the resident MTP draft route must be replayed with its staged inputs"]
 pub struct ResidentMtpDraftRoute {
     batch: usize,
+    attention: MtpAttentionRoute,
 }
 
 impl ResidentMtpDraftRoute {
@@ -128,7 +142,10 @@ impl ResidentMtpDraftRoute {
     /// Constructs one exact route for qualification graph lookup.
     pub fn qualified(batch: usize) -> EngineResult<Self> {
         require_batch(batch)?;
-        Ok(Self { batch })
+        Ok(Self {
+            batch,
+            attention: MtpAttentionRoute::Short,
+        })
     }
 }
 
@@ -139,6 +156,7 @@ pub struct ResidentMtpRealignRoute {
     tokens: usize,
     slot: usize,
     first_position: usize,
+    attention: MtpAttentionRoute,
 }
 
 impl ResidentMtpRealignRoute {
@@ -160,11 +178,75 @@ impl ResidentMtpRealignRoute {
 
 struct Graphs {
     prompt: [CudaGraph; PROMPT_ROUTES.len()],
-    draft: [CudaGraph; MAX_BATCH],
-    continue_draft: [CudaGraph; MAX_BATCH],
-    staged_continue_draft: [CudaGraph; MAX_BATCH],
+    draft_short: [CudaGraph; MAX_BATCH],
+    draft_long: [CudaGraphVariants<LONG_MTP_ATTENTION_ROUTES>; MAX_BATCH],
+    continue_draft_short: [CudaGraph; MAX_BATCH],
+    continue_draft_long: [CudaGraphVariants<LONG_MTP_ATTENTION_ROUTES>; MAX_BATCH],
+    staged_continue_draft_short: [CudaGraph; MAX_BATCH],
+    staged_continue_draft_long: [CudaGraphVariants<LONG_MTP_ATTENTION_ROUTES>; MAX_BATCH],
     prime: [CudaGraph; REALIGN_ROUTES],
-    realign: [CudaGraph; REALIGN_ROUTES],
+    realign_short: [CudaGraph; REALIGN_ROUTES],
+    realign_long: [CudaGraphVariants<LONG_MTP_ATTENTION_ROUTES>; REALIGN_ROUTES],
+}
+
+impl Graphs {
+    unsafe fn launch_draft(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpDraftRoute,
+    ) -> GpuResult<()> {
+        match route.attention {
+            MtpAttentionRoute::Short => unsafe { self.draft_short[route.batch - 1].launch(stream) },
+            MtpAttentionRoute::Long { index, .. } => unsafe {
+                self.draft_long[route.batch - 1].launch(stream, index)
+            },
+        }
+    }
+
+    unsafe fn launch_continue_draft(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpDraftRoute,
+    ) -> GpuResult<()> {
+        match route.attention {
+            MtpAttentionRoute::Short => unsafe {
+                self.continue_draft_short[route.batch - 1].launch(stream)
+            },
+            MtpAttentionRoute::Long { index, .. } => unsafe {
+                self.continue_draft_long[route.batch - 1].launch(stream, index)
+            },
+        }
+    }
+
+    unsafe fn launch_staged_continue_draft(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpDraftRoute,
+    ) -> GpuResult<()> {
+        match route.attention {
+            MtpAttentionRoute::Short => unsafe {
+                self.staged_continue_draft_short[route.batch - 1].launch(stream)
+            },
+            MtpAttentionRoute::Long { index, .. } => unsafe {
+                self.staged_continue_draft_long[route.batch - 1].launch(stream, index)
+            },
+        }
+    }
+
+    unsafe fn launch_realign(
+        &self,
+        stream: &CudaStream,
+        route: ResidentMtpRealignRoute,
+    ) -> GpuResult<()> {
+        match route.attention {
+            MtpAttentionRoute::Short => unsafe {
+                self.realign_short[route.tokens - 1].launch(stream)
+            },
+            MtpAttentionRoute::Long { index, .. } => unsafe {
+                self.realign_long[route.tokens - 1].launch(stream, index)
+            },
+        }
+    }
 }
 
 /// Target plus one source-native MTP weight set and one shared-lifecycle cache mirror.
@@ -178,6 +260,7 @@ pub struct ResidentMtpProgram {
     _qkv: MtpBf16QkvOp,
     _qk_prepare: MtpBf16QkPrepareOp,
     _paged_gqa: MtpBf16PagedGqaOp,
+    _split_kv_paged_gqa: MtpBf16SplitKvPagedGqaOp,
     _attention_output: MtpBf16AttentionOutputOp,
     _mlp: MtpBf16MlpOp,
     embedding_stager: PinnedHostBuffer<u16>,
@@ -221,6 +304,9 @@ struct Pointers {
     key_pages: *mut u16,
     value_pages: *mut u16,
     attention: *mut f32,
+    attention_partial_maximum: *mut f32,
+    attention_partial_denominator: *mut f32,
+    attention_partial_numerator: *mut f32,
     attention_activation: *mut u16,
     attention_output_weight: *const u16,
     attention_branch: *mut u16,
@@ -275,6 +361,9 @@ impl Pointers {
             key_pages: cache_arena.address(cache.key_pages)?,
             value_pages: cache_arena.address(cache.value_pages)?,
             attention: arena.address(regions.attention)?,
+            attention_partial_maximum: arena.address(regions.attention_partial_maximum)?,
+            attention_partial_denominator: arena.address(regions.attention_partial_denominator)?,
+            attention_partial_numerator: arena.address(regions.attention_partial_numerator)?,
             attention_activation: arena.address(regions.attention_activation)?,
             attention_output_weight: arena.address(regions.attention_output_weight)?.cast_const(),
             attention_branch: arena.address(regions.attention_branch)?,
@@ -374,6 +463,9 @@ impl Pointers {
             self.key_pages.addr(),
             self.value_pages.addr(),
             self.attention.addr(),
+            self.attention_partial_maximum.addr(),
+            self.attention_partial_denominator.addr(),
+            self.attention_partial_numerator.addr(),
             self.attention_activation.addr(),
             self.attention_output_weight.addr(),
             self.attention_branch.addr(),
@@ -403,6 +495,7 @@ struct Ops<'a> {
     qkv: &'a MtpBf16QkvOp,
     qk_prepare: &'a MtpBf16QkPrepareOp,
     paged_gqa: &'a MtpBf16PagedGqaOp,
+    split_kv_paged_gqa: &'a MtpBf16SplitKvPagedGqaOp,
     attention_output: &'a MtpBf16AttentionOutputOp,
     mlp: &'a MtpBf16MlpOp,
     lm_head: &'a LmHeadOp<Qwen38_27B>,
@@ -568,6 +661,7 @@ impl ResidentMtpProgram {
         let qkv_op = MtpBf16QkvOp::new(&context)?;
         let qk_prepare = MtpBf16QkPrepareOp::new(&context)?;
         let paged_gqa = MtpBf16PagedGqaOp::new(&context)?;
+        let split_kv_paged_gqa = MtpBf16SplitKvPagedGqaOp::new(&context)?;
         let attention_output = MtpBf16AttentionOutputOp::new(&context)?;
         let mlp = MtpBf16MlpOp::new(&context)?;
         let embedding_stager = PinnedHostBuffer::zeroed(
@@ -606,6 +700,7 @@ impl ResidentMtpProgram {
             qkv: &qkv_op,
             qk_prepare: &qk_prepare,
             paged_gqa: &paged_gqa,
+            split_kv_paged_gqa: &split_kv_paged_gqa,
             attention_output: &attention_output,
             mlp: &mlp,
             lm_head: target.mtp_lm_head_op(),
@@ -647,6 +742,7 @@ impl ResidentMtpProgram {
             _qkv: qkv_op,
             _qk_prepare: qk_prepare,
             _paged_gqa: paged_gqa,
+            _split_kv_paged_gqa: split_kv_paged_gqa,
             _attention_output: attention_output,
             _mlp: mlp,
             embedding_stager,
@@ -721,7 +817,10 @@ impl ResidentMtpProgram {
             }
         }
         self.stage_rows(stream, next_token_ids, slots, positions, rope_cos, rope_sin)?;
-        Ok(ResidentMtpDraftRoute { batch: slots.len() })
+        Ok(ResidentMtpDraftRoute {
+            batch: slots.len(),
+            attention: select_mtp_attention_route(positions)?,
+        })
     }
 
     /// Stages compact draft rows with explicit prior target-conditioned hidden values.
@@ -787,6 +886,7 @@ impl ResidentMtpProgram {
             tokens,
             slot,
             first_position,
+            attention: select_mtp_attention_route(&positions[..tokens])?,
         })
     }
 
@@ -897,7 +997,7 @@ impl ResidentMtpProgram {
         // SAFETY: this ResidentMtpProgram owns every captured allocation (local
         // and target arenas, pinned stagers, op modules) for its whole life and
         // drops the graphs first.
-        unsafe { self.graphs.draft[route.batch - 1].launch(stream) }?;
+        unsafe { self.graphs.launch_draft(stream, route) }?;
         Ok(())
     }
 
@@ -911,7 +1011,7 @@ impl ResidentMtpProgram {
         // SAFETY: this ResidentMtpProgram owns every captured allocation (local
         // and target arenas, pinned stagers, op modules) for its whole life and
         // drops the graphs first.
-        unsafe { self.graphs.continue_draft[route.batch - 1].launch(stream) }?;
+        unsafe { self.graphs.launch_continue_draft(stream, route) }?;
         Ok(())
     }
 
@@ -925,7 +1025,7 @@ impl ResidentMtpProgram {
         // SAFETY: this ResidentMtpProgram owns every captured allocation (local
         // and target arenas, pinned stagers, op modules) for its whole life and
         // drops the graphs first.
-        unsafe { self.graphs.staged_continue_draft[route.batch - 1].launch(stream) }?;
+        unsafe { self.graphs.launch_staged_continue_draft(stream, route) }?;
         Ok(())
     }
 
@@ -953,7 +1053,7 @@ impl ResidentMtpProgram {
         // SAFETY: this ResidentMtpProgram owns every captured allocation (local
         // and target arenas, pinned stagers, op modules) for its whole life and
         // drops the graphs first.
-        unsafe { self.graphs.realign[route.tokens - 1].launch(stream) }?;
+        unsafe { self.graphs.launch_realign(stream, route) }?;
         Ok(())
     }
 
@@ -1444,9 +1544,11 @@ impl ResidentMtpProgram {
         self.load_stats
     }
 
-    /// Exact prompt, seeded draft, two continuation, prime, and realignment inventories.
+    /// Exact prompt, short, and long-context graph-definition inventory.
     pub const fn graph_count(&self) -> usize {
-        PROMPT_ROUTES.len() + 3 * MAX_BATCH + 2 * REALIGN_ROUTES
+        PROMPT_ROUTES.len()
+            + 3 * MAX_BATCH * (1 + LONG_MTP_ATTENTION_ROUTES)
+            + REALIGN_ROUTES * (2 + LONG_MTP_ATTENTION_ROUTES)
     }
 
     /// Checked resident MTP layout.
@@ -1490,7 +1592,13 @@ impl ResidentMtpProgram {
             self.layout.regions(),
             self.stagers(),
         )?;
-        launch_full(stream, route.batch, self.ops(), self.pointers()?)?;
+        launch_full(
+            stream,
+            route.batch,
+            route.attention,
+            self.ops(),
+            self.pointers()?,
+        )?;
         Ok(())
     }
 
@@ -1510,7 +1618,13 @@ impl ResidentMtpProgram {
             self.layout.regions(),
             self.stagers(),
         )?;
-        launch_full(stream, route.batch, self.ops(), self.pointers()?)?;
+        launch_full(
+            stream,
+            route.batch,
+            route.attention,
+            self.ops(),
+            self.pointers()?,
+        )?;
         Ok(())
     }
 
@@ -1530,7 +1644,13 @@ impl ResidentMtpProgram {
             self.layout.regions(),
             self.stagers(),
         )?;
-        launch_full(stream, route.batch, self.ops(), self.pointers()?)?;
+        launch_full(
+            stream,
+            route.batch,
+            route.attention,
+            self.ops(),
+            self.pointers()?,
+        )?;
         Ok(())
     }
 
@@ -1570,7 +1690,13 @@ impl ResidentMtpProgram {
             self.layout.regions(),
             self.stagers(),
         )?;
-        launch_realign(stream, route.tokens, self.ops(), self.pointers()?)?;
+        launch_realign(
+            stream,
+            route.tokens,
+            route.attention,
+            self.ops(),
+            self.pointers()?,
+        )?;
         Ok(())
     }
 
@@ -1601,7 +1727,7 @@ impl ResidentMtpProgram {
                     self.layout.regions(),
                     stagers,
                 )?;
-                launch_full(stream, batch, ops, pointers)?;
+                launch_full(stream, batch, MtpAttentionRoute::Short, ops, pointers)?;
             }
             Ok(())
         })?)
@@ -1634,7 +1760,7 @@ impl ResidentMtpProgram {
                     self.layout.regions(),
                     stagers,
                 )?;
-                launch_full(stream, batch, ops, pointers)?;
+                launch_full(stream, batch, MtpAttentionRoute::Short, ops, pointers)?;
             }
             Ok(())
         })?)
@@ -1661,7 +1787,12 @@ impl ResidentMtpProgram {
         route: ResidentMtpDraftRoute,
     ) -> EngineResult<&CudaGraph> {
         require_batch(route.batch)?;
-        Ok(&self.graphs.draft[route.batch - 1])
+        match route.attention {
+            MtpAttentionRoute::Short => Ok(&self.graphs.draft_short[route.batch - 1]),
+            MtpAttentionRoute::Long { .. } => Err(EngineError::route(
+                "long-context resident MTP draft uses an updated graph variant",
+            )),
+        }
     }
 
     #[cfg(feature = "qualification")]
@@ -1671,7 +1802,12 @@ impl ResidentMtpProgram {
         route: ResidentMtpDraftRoute,
     ) -> EngineResult<&CudaGraph> {
         require_batch(route.batch)?;
-        Ok(&self.graphs.continue_draft[route.batch - 1])
+        match route.attention {
+            MtpAttentionRoute::Short => Ok(&self.graphs.continue_draft_short[route.batch - 1]),
+            MtpAttentionRoute::Long { .. } => Err(EngineError::route(
+                "long-context resident MTP continuation uses an updated graph variant",
+            )),
+        }
     }
 
     #[cfg(feature = "qualification")]
@@ -1681,7 +1817,14 @@ impl ResidentMtpProgram {
         route: ResidentMtpDraftRoute,
     ) -> EngineResult<&CudaGraph> {
         require_batch(route.batch)?;
-        Ok(&self.graphs.staged_continue_draft[route.batch - 1])
+        match route.attention {
+            MtpAttentionRoute::Short => {
+                Ok(&self.graphs.staged_continue_draft_short[route.batch - 1])
+            }
+            MtpAttentionRoute::Long { .. } => Err(EngineError::route(
+                "long-context resident MTP staged continuation uses an updated graph variant",
+            )),
+        }
     }
 
     #[cfg(feature = "qualification")]
@@ -1719,6 +1862,12 @@ impl ResidentMtpProgram {
         self.arena.fill(stream, regions.qkv, byte)?;
         self.arena.fill(stream, regions.query, byte)?;
         self.arena.fill(stream, regions.attention, byte)?;
+        self.arena
+            .fill(stream, regions.attention_partial_maximum, byte)?;
+        self.arena
+            .fill(stream, regions.attention_partial_denominator, byte)?;
+        self.arena
+            .fill(stream, regions.attention_partial_numerator, byte)?;
         self.arena
             .fill(stream, regions.attention_activation, byte)?;
         self.arena.fill(stream, regions.attention_branch, byte)?;
@@ -1941,6 +2090,7 @@ impl ResidentMtpProgram {
             qkv: &self._qkv,
             qk_prepare: &self._qk_prepare,
             paged_gqa: &self._paged_gqa,
+            split_kv_paged_gqa: &self._split_kv_paged_gqa,
             attention_output: &self._attention_output,
             mlp: &self._mlp,
             lm_head: self.target.mtp_lm_head_op(),
@@ -2035,26 +2185,114 @@ fn capture_graphs(
             launch_prime(stream, rows, ops, pointers)
         })?);
     }
-    let mut draft = Vec::with_capacity(MAX_BATCH);
+    let mut draft_short = Vec::with_capacity(MAX_BATCH);
     for rows in 1..=MAX_BATCH {
-        draft.push(CudaGraph::capture(stream, || {
+        draft_short.push(CudaGraph::capture(stream, || {
             launch_upload(stream, rows, target, arena, regions, stagers)?;
-            launch_full(stream, rows, ops, pointers)
+            launch_full(stream, rows, MtpAttentionRoute::Short, ops, pointers)
         })?);
     }
-    let mut continue_draft = Vec::with_capacity(MAX_BATCH);
+    let mut draft_long = Vec::with_capacity(MAX_BATCH);
     for rows in 1..=MAX_BATCH {
-        continue_draft.push(CudaGraph::capture(stream, || {
+        let mut definitions = Vec::with_capacity(LONG_MTP_ATTENTION_ROUTES);
+        for (index, &partitions) in LONG_CONTEXT_GQA_PARTITION_BUCKETS
+            .iter()
+            .skip(LONG_MTP_ATTENTION_FIRST_BUCKET_INDEX)
+            .enumerate()
+        {
+            let maximum_length =
+                (partitions * LONG_CONTEXT_GQA_PARTITION_SIZE).min(LONG_CONTEXT_GQA_MAX_TOKENS);
+            definitions.push(CudaGraphDefinition::capture(stream, || {
+                launch_upload(stream, rows, target, arena, regions, stagers)?;
+                launch_full(
+                    stream,
+                    rows,
+                    MtpAttentionRoute::Long {
+                        index,
+                        maximum_length,
+                    },
+                    ops,
+                    pointers,
+                )
+            })?);
+        }
+        draft_long.push(CudaGraphVariants::new(definitions.try_into().map_err(
+            |_| EngineError::layout("resident MTP draft long partition inventory differs"),
+        )?)?);
+    }
+    let mut continue_draft_short = Vec::with_capacity(MAX_BATCH);
+    for rows in 1..=MAX_BATCH {
+        continue_draft_short.push(CudaGraph::capture(stream, || {
             launch_continue_upload(stream, rows, target, arena, regions, stagers)?;
-            launch_full(stream, rows, ops, pointers)
+            launch_full(stream, rows, MtpAttentionRoute::Short, ops, pointers)
         })?);
     }
-    let mut staged_continue_draft = Vec::with_capacity(MAX_BATCH);
+    let mut continue_draft_long = Vec::with_capacity(MAX_BATCH);
     for rows in 1..=MAX_BATCH {
-        staged_continue_draft.push(CudaGraph::capture(stream, || {
+        let mut definitions = Vec::with_capacity(LONG_MTP_ATTENTION_ROUTES);
+        for (index, &partitions) in LONG_CONTEXT_GQA_PARTITION_BUCKETS
+            .iter()
+            .skip(LONG_MTP_ATTENTION_FIRST_BUCKET_INDEX)
+            .enumerate()
+        {
+            let maximum_length =
+                (partitions * LONG_CONTEXT_GQA_PARTITION_SIZE).min(LONG_CONTEXT_GQA_MAX_TOKENS);
+            definitions.push(CudaGraphDefinition::capture(stream, || {
+                launch_continue_upload(stream, rows, target, arena, regions, stagers)?;
+                launch_full(
+                    stream,
+                    rows,
+                    MtpAttentionRoute::Long {
+                        index,
+                        maximum_length,
+                    },
+                    ops,
+                    pointers,
+                )
+            })?);
+        }
+        continue_draft_long.push(CudaGraphVariants::new(definitions.try_into().map_err(
+            |_| EngineError::layout("resident MTP continuation long partition inventory differs"),
+        )?)?);
+    }
+    let mut staged_continue_draft_short = Vec::with_capacity(MAX_BATCH);
+    for rows in 1..=MAX_BATCH {
+        staged_continue_draft_short.push(CudaGraph::capture(stream, || {
             launch_staged_continue_upload(stream, rows, target, arena, regions, stagers)?;
-            launch_full(stream, rows, ops, pointers)
+            launch_full(stream, rows, MtpAttentionRoute::Short, ops, pointers)
         })?);
+    }
+    let mut staged_continue_draft_long = Vec::with_capacity(MAX_BATCH);
+    for rows in 1..=MAX_BATCH {
+        let mut definitions = Vec::with_capacity(LONG_MTP_ATTENTION_ROUTES);
+        for (index, &partitions) in LONG_CONTEXT_GQA_PARTITION_BUCKETS
+            .iter()
+            .skip(LONG_MTP_ATTENTION_FIRST_BUCKET_INDEX)
+            .enumerate()
+        {
+            let maximum_length =
+                (partitions * LONG_CONTEXT_GQA_PARTITION_SIZE).min(LONG_CONTEXT_GQA_MAX_TOKENS);
+            definitions.push(CudaGraphDefinition::capture(stream, || {
+                launch_staged_continue_upload(stream, rows, target, arena, regions, stagers)?;
+                launch_full(
+                    stream,
+                    rows,
+                    MtpAttentionRoute::Long {
+                        index,
+                        maximum_length,
+                    },
+                    ops,
+                    pointers,
+                )
+            })?);
+        }
+        staged_continue_draft_long.push(CudaGraphVariants::new(definitions.try_into().map_err(
+            |_| {
+                EngineError::layout(
+                    "resident MTP staged-continuation long partition inventory differs",
+                )
+            },
+        )?)?);
     }
     let mut prime = Vec::with_capacity(REALIGN_ROUTES);
     for rows in 1..=REALIGN_ROUTES {
@@ -2063,32 +2301,72 @@ fn capture_graphs(
             launch_prime(stream, rows, ops, pointers)
         })?);
     }
-    let mut realign = Vec::with_capacity(REALIGN_ROUTES);
+    let mut realign_short = Vec::with_capacity(REALIGN_ROUTES);
     for rows in 1..=REALIGN_ROUTES {
-        realign.push(CudaGraph::capture(stream, || {
+        realign_short.push(CudaGraph::capture(stream, || {
             launch_upload(stream, rows, target, arena, regions, stagers)?;
-            launch_realign(stream, rows, ops, pointers)
+            launch_realign(stream, rows, MtpAttentionRoute::Short, ops, pointers)
         })?);
+    }
+    let mut realign_long = Vec::with_capacity(REALIGN_ROUTES);
+    for rows in 1..=REALIGN_ROUTES {
+        let mut definitions = Vec::with_capacity(LONG_MTP_ATTENTION_ROUTES);
+        for (index, &partitions) in LONG_CONTEXT_GQA_PARTITION_BUCKETS
+            .iter()
+            .skip(LONG_MTP_ATTENTION_FIRST_BUCKET_INDEX)
+            .enumerate()
+        {
+            let maximum_length =
+                (partitions * LONG_CONTEXT_GQA_PARTITION_SIZE).min(LONG_CONTEXT_GQA_MAX_TOKENS);
+            definitions.push(CudaGraphDefinition::capture(stream, || {
+                launch_upload(stream, rows, target, arena, regions, stagers)?;
+                launch_realign(
+                    stream,
+                    rows,
+                    MtpAttentionRoute::Long {
+                        index,
+                        maximum_length,
+                    },
+                    ops,
+                    pointers,
+                )
+            })?);
+        }
+        realign_long.push(CudaGraphVariants::new(definitions.try_into().map_err(
+            |_| EngineError::layout("resident MTP realign long partition inventory differs"),
+        )?)?);
     }
     Ok(Graphs {
         prompt: prompt
             .try_into()
             .map_err(|_| EngineError::layout("resident MTP prompt graph inventory differs"))?,
-        draft: draft
+        draft_short: draft_short
             .try_into()
-            .map_err(|_| EngineError::layout("resident MTP draft graph inventory differs"))?,
-        continue_draft: continue_draft.try_into().map_err(|_| {
-            EngineError::layout("resident MTP continuation graph inventory differs")
+            .map_err(|_| EngineError::layout("resident MTP short draft graph inventory differs"))?,
+        draft_long: draft_long
+            .try_into()
+            .map_err(|_| EngineError::layout("resident MTP long draft graph inventory differs"))?,
+        continue_draft_short: continue_draft_short.try_into().map_err(|_| {
+            EngineError::layout("resident MTP short continuation graph inventory differs")
         })?,
-        staged_continue_draft: staged_continue_draft.try_into().map_err(|_| {
-            EngineError::layout("resident MTP staged-continuation graph inventory differs")
+        continue_draft_long: continue_draft_long.try_into().map_err(|_| {
+            EngineError::layout("resident MTP long continuation graph inventory differs")
+        })?,
+        staged_continue_draft_short: staged_continue_draft_short.try_into().map_err(|_| {
+            EngineError::layout("resident MTP short staged-continuation graph inventory differs")
+        })?,
+        staged_continue_draft_long: staged_continue_draft_long.try_into().map_err(|_| {
+            EngineError::layout("resident MTP long staged-continuation graph inventory differs")
         })?,
         prime: prime
             .try_into()
             .map_err(|_| EngineError::layout("resident MTP prime graph inventory differs"))?,
-        realign: realign
+        realign_short: realign_short
             .try_into()
-            .map_err(|_| EngineError::layout("resident MTP realign graph inventory differs"))?,
+            .map_err(|_| EngineError::layout("resident MTP short realign inventory differs"))?,
+        realign_long: realign_long
+            .try_into()
+            .map_err(|_| EngineError::layout("resident MTP long realign inventory differs"))?,
     })
 }
 
@@ -2327,6 +2605,7 @@ fn launch_prime(
 fn launch_full(
     stream: &CudaStream,
     rows: usize,
+    attention_route: MtpAttentionRoute,
     ops: Ops<'_>,
     pointers: Pointers,
 ) -> GpuResult<()> {
@@ -2334,18 +2613,36 @@ fn launch_full(
     // SAFETY: downstream storage covers exact B=1..8 and target endpoint weights remain owned by
     // the outer resident program until these graphs are dropped.
     unsafe {
-        ops.paged_gqa.launch(
-            stream,
-            rows,
-            pointers.query,
-            pointers.key_pages,
-            pointers.value_pages,
-            pointers.block_tables,
-            pointers.table_rows,
-            LONG_CONTEXT_PHYSICAL_PAGES,
-            pointers.lengths,
-            pointers.attention,
-        )?;
+        match attention_route {
+            MtpAttentionRoute::Short => ops.paged_gqa.launch(
+                stream,
+                rows,
+                pointers.query,
+                pointers.key_pages,
+                pointers.value_pages,
+                pointers.block_tables,
+                pointers.table_rows,
+                LONG_CONTEXT_PHYSICAL_PAGES,
+                pointers.lengths,
+                pointers.attention,
+            )?,
+            MtpAttentionRoute::Long { maximum_length, .. } => ops.split_kv_paged_gqa.launch(
+                stream,
+                rows,
+                maximum_length,
+                pointers.query,
+                pointers.key_pages,
+                pointers.value_pages,
+                pointers.block_tables,
+                pointers.table_rows,
+                LONG_CONTEXT_PHYSICAL_PAGES,
+                pointers.lengths,
+                pointers.attention_partial_maximum,
+                pointers.attention_partial_denominator,
+                pointers.attention_partial_numerator,
+                pointers.attention,
+            )?,
+        }
         ops.attention_output.launch(
             stream,
             rows,
@@ -2399,13 +2696,57 @@ fn launch_full(
 fn launch_realign(
     stream: &CudaStream,
     tokens: usize,
+    attention_route: MtpAttentionRoute,
     ops: Ops<'_>,
     pointers: Pointers,
 ) -> GpuResult<()> {
     if tokens > 1 {
         launch_prime(stream, tokens - 1, ops, pointers)?;
     }
-    launch_full(stream, 1, ops, pointers.offset_rows(tokens - 1))
+    launch_full(
+        stream,
+        1,
+        attention_route,
+        ops,
+        pointers.offset_rows(tokens - 1),
+    )
+}
+
+fn select_mtp_attention_route(positions: &[u32]) -> EngineResult<MtpAttentionRoute> {
+    let maximum_length = positions
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| EngineError::route("resident MTP attention requires at least one row"))?
+        .checked_add(1)
+        .ok_or_else(|| EngineError::route("resident MTP attention length overflows"))?
+        as usize;
+    if maximum_length > LONG_CONTEXT_GQA_MAX_TOKENS {
+        return Err(EngineError::route(format!(
+            "resident MTP maximum cache length {maximum_length} exceeds {LONG_CONTEXT_GQA_MAX_TOKENS}"
+        )));
+    }
+    if maximum_length <= SHORT_MTP_ATTENTION_CAPACITY {
+        return Ok(MtpAttentionRoute::Short);
+    }
+
+    let required = maximum_length.div_ceil(LONG_CONTEXT_GQA_PARTITION_SIZE);
+    let (index, partitions) = LONG_CONTEXT_GQA_PARTITION_BUCKETS
+        .iter()
+        .copied()
+        .skip(LONG_MTP_ATTENTION_FIRST_BUCKET_INDEX)
+        .enumerate()
+        .find(|&(_, partitions)| partitions >= required)
+        .ok_or_else(|| {
+            EngineError::route(format!(
+                "resident MTP maximum cache length {maximum_length} has no split-KV graph"
+            ))
+        })?;
+    Ok(MtpAttentionRoute::Long {
+        index,
+        maximum_length: (partitions * LONG_CONTEXT_GQA_PARTITION_SIZE)
+            .min(LONG_CONTEXT_GQA_MAX_TOKENS),
+    })
 }
 
 fn prompt_index(rows: usize) -> Option<usize> {
@@ -2491,7 +2832,10 @@ fn elapsed_ns(phase: &str, started: Instant) -> EngineResult<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PROMPT_ROUTES, REALIGN_ROUTES, prompt_index, require_batch, require_realign};
+    use super::{
+        MtpAttentionRoute, PROMPT_ROUTES, REALIGN_ROUTES, prompt_index, require_batch,
+        require_realign, select_mtp_attention_route,
+    };
 
     #[test]
     fn resident_mtp_route_inventory_is_exact() {
@@ -2510,5 +2854,31 @@ mod tests {
         assert!(require_realign(0).is_err());
         assert!(require_realign(5).is_err());
         assert_eq!(prompt_index(31), None);
+    }
+
+    #[test]
+    fn resident_mtp_attention_selector_pins_every_context_boundary() {
+        assert_eq!(
+            select_mtp_attention_route(&[0, 1_791]).unwrap(),
+            MtpAttentionRoute::Short
+        );
+        for (length, index, maximum_length) in [
+            (1_793, 0, 4_096),
+            (4_097, 1, 16_384),
+            (16_385, 2, 65_536),
+            (65_537, 3, 131_072),
+            (131_073, 4, 220_000),
+            (220_000, 4, 220_000),
+        ] {
+            assert_eq!(
+                select_mtp_attention_route(&[length - 1]).unwrap(),
+                MtpAttentionRoute::Long {
+                    index,
+                    maximum_length,
+                }
+            );
+        }
+        assert!(select_mtp_attention_route(&[]).is_err());
+        assert!(select_mtp_attention_route(&[220_000]).is_err());
     }
 }

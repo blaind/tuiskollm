@@ -10,6 +10,7 @@ mod mtp_bf16_mlp;
 mod mtp_bf16_paged_gqa;
 mod mtp_bf16_qk_prepare;
 mod mtp_bf16_qkv;
+mod mtp_bf16_split_kv_paged_gqa;
 
 pub use mtp_bf16_attention_output::{
     MtpAttentionOutputEntries, MtpAttentionOutputRoute, MtpBf16AttentionOutputOp,
@@ -38,6 +39,9 @@ pub use mtp_bf16_qkv::{
     MtpBf16QkvOp, MtpQkvEntries, MtpQkvRoute, Qwen35MtpBf16QkvOp, Qwen35MtpQkvEntries,
     Qwen36MtpBf16QkvOp, Qwen36MtpQkvEntries, Qwen38MtpQkvEntries, UnadmittedQkvRoute,
 };
+pub use mtp_bf16_split_kv_paged_gqa::{
+    MTP_BF16_SPLIT_KV_WORKSPACE_BYTES_PER_TOKEN, MtpBf16SplitKvPagedGqaOp,
+};
 
 /// Semantic inventory of every entry this family emits.
 pub fn kernel_ptx_names() -> Vec<&'static str> {
@@ -60,6 +64,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .chain(mtp_bf16_qk_prepare::qwen35_mtp_bf16_qk_prepare_ptx_names())
         .chain(mtp_bf16_paged_gqa::mtp_bf16_paged_gqa_ptx_names())
         .chain(mtp_bf16_paged_gqa::qwen35_mtp_bf16_paged_gqa_ptx_names())
+        .chain(mtp_bf16_split_kv_paged_gqa::mtp_bf16_split_kv_paged_gqa_ptx_names())
         .collect()
 }
 
@@ -106,6 +111,8 @@ mod tests {
                 ("mtp_bf16_qk_prepare_prefill", 4),
                 ("mtp_bf16_qkv", 8),
                 ("mtp_bf16_qkv_prefill", 4),
+                ("mtp_bf16_split_kv_paged_gqa_partial", 8),
+                ("mtp_bf16_split_kv_paged_gqa_reduce", 8),
                 ("mtp_bf16_swiglu", 8),
                 ("qwen35_mtp_bf16_attention_gate", 8),
                 ("qwen35_mtp_bf16_attention_output", 8),
@@ -126,6 +133,6 @@ mod tests {
                 ("qwen36_mtp_bf16_qkv_prefill", 3),
             ]
         );
-        assert_eq!(counts.values().sum::<usize>(), 187);
+        assert_eq!(counts.values().sum::<usize>(), 203);
     }
 }
