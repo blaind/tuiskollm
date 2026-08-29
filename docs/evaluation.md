@@ -268,6 +268,21 @@ device-memory growth remained zero. The report is
 `target/benchmarks/prompt-scoring-shared-normalizer-samples-3.json`; three samples remain diagnostic
 and are not baseline authority.
 
+## Rejected B-wide suffix replay
+
+A 2026-08-29 hypothesis copied one shared target KV/GDN boundary device-to-device into distinct
+slots, then replayed answer suffixes through the existing B=2..8 target decode graphs. The exact
+source-backed gate rejected the implementation at its first B=2 case after 5.63 seconds. Prompt
+zero's greedy completion token remained 47, but its observable logprob changed from `-2.4796324`
+under independent B=1 scoring to `-2.6441836` under the B=2 replay.
+
+Prompt zero was the unchanged source slot, so the mismatch does not originate in the copied KV or
+recurrent state. It demonstrates that the existing B=2 target graph is numerically qualified for
+its own route but does not reproduce B=1 scoring bits. The implementation was reverted before any
+benchmark. A future parallel scorer needs a B-wide route that preserves B=1 accumulation semantics,
+or an explicit API-numerics change followed by scoring and quality requalification. The rejected
+evidence is stored at `target/benchmarks/prompt-scoring-parallel-suffix-rejected.json`.
+
 ## Rejected device-side normalizer
 
 A second 2026-08-29 hypothesis proposed replacing full-vocabulary downloads and the host FP64
