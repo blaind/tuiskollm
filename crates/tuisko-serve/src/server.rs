@@ -488,9 +488,12 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(config.address).await?;
         let output = render_startup(&ready, startup_start.elapsed(), config.address, color);
-        let mut stdout = stdout.lock();
-        stdout.write_all(output.as_bytes())?;
-        stdout.flush()?;
+        {
+            // The engine worker owns interactive progress writes while the listener is serving.
+            let mut stdout = stdout.lock();
+            stdout.write_all(output.as_bytes())?;
+            stdout.flush()?;
+        }
         serve_until_worker_failure(listener, router(state), worker_failure, interactive, color)
             .await
     })
