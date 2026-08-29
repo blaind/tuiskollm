@@ -22,9 +22,6 @@ const PREFILL_K_SUBTILES: usize = 4;
 const PREFILL_BLOCK_ROWS: usize = 32;
 const PREFILL_THREADS: u32 = 64;
 const PREFILL_SHARED_BYTES: u32 = 16 * 1_024;
-const MACRO_BLOCK_ROWS: usize = 64;
-const MACRO_THREADS: u32 = 128;
-const MACRO_SHARED_BYTES: u32 = 24 * 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteClass {
@@ -589,8 +586,8 @@ pub(crate) fn attention_output_ptx_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MACRO_SHARED_BYTES, MACRO_THREADS, PREFILL_SHARED_BYTES, PREFILL_THREADS, RouteClass,
-        THREADS, attention_output_ptx_names, route_class,
+        PREFILL_SHARED_BYTES, PREFILL_THREADS, RouteClass, THREADS, attention_output_ptx_names,
+        route_class,
     };
     use std::collections::BTreeSet;
 
@@ -611,7 +608,6 @@ mod tests {
         }
         assert_eq!(THREADS, 256);
         assert_eq!((PREFILL_THREADS, PREFILL_SHARED_BYTES), (64, 16_384));
-        assert_eq!((MACRO_THREADS, MACRO_SHARED_BYTES), (128, 24_576));
         let names = attention_output_ptx_names();
         assert_eq!(names.len(), 12);
         assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 12);
