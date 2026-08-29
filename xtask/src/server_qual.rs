@@ -318,14 +318,21 @@ fn validate_health_response(response: &[u8], route: &str) -> Result<(), Box<dyn 
 }
 
 pub(super) fn validate_request_log(log: &str) -> Result<(), Box<dyn Error>> {
-    const REQUIRED: [&str; 10] = [
+    const REQUIRED: [&str; 17] = [
         " ms (+",
         "), prompt ",
         " tok, cached ",
-        " tok, gen ",
+        "%), input ",
+        " tok, queue ",
+        " ms, prefill B=",
+        " tok/s), gen ",
         " tok, ttft ",
         " ms, decode ",
-        " tok/s, route ",
+        " tok/s, verify ",
+        " (K=",
+        " wall ms/v, ",
+        " tok/v, mtp accept ",
+        "%), route ",
         ", render ",
         ", encode ",
         ", bpe-tail ",
@@ -387,7 +394,7 @@ mod tests {
     #[test]
     fn production_log_requires_one_complete_request_timing_line() {
         validate_request_log(
-            "startup\nTuiskoLLM request 4: 12 ms (+120.0 ms), prompt 10 tok, cached 5 tok (50.0%), input 5 tok, gen 3 tok, ttft 80.0 ms, decode 50.0 tok/s, route mtp-draft-3, render 1.0 ms, encode 2.0 ms, bpe-tail 4 tok, finish length\n",
+            "startup\nTuiskoLLM request 4: 12 ms (+120.0 ms), prompt 10 tok, cached 5 tok (50.0%), input 5 tok, queue 1.0 ms, prefill B=1 5 tok/2.0 ms (2500.0 tok/s), gen 3 tok, ttft 80.0 ms, decode 50.0 tok/s, verify 1 (K=0/0/0/1), 40.0 wall ms/v, 3.00 tok/v, mtp accept 2/3 (66.7%), route mtp-draft-3, render 1.0 ms, encode 2.0 ms, bpe-tail 4 tok, finish length\n",
         )
         .unwrap();
         let error = validate_request_log("startup only\n").unwrap_err();

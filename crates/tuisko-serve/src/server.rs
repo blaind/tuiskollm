@@ -29,7 +29,8 @@ use tuisko_engine::{
     EngineError, EngineErrorCode, GenerationStep, MAX_BATCH, ParkedQwen38Generator,
     QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, Qwen35ResidentMtpBatchGenerator,
     Qwen36ResidentBatchGenerator, Qwen38FlashNextMtpResidentGenerator, ResidentBatchAdmission,
-    ResidentLoadPhase, ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentRequestId,
+    ResidentLoadPhase, ResidentLoadProgress, ResidentMtpBatchGenerator, ResidentMtpGenerationStats,
+    ResidentRequestId,
 };
 use tuisko_frontend::GenerationDefaults;
 use tuisko_model::{
@@ -241,7 +242,7 @@ struct InferenceProgress {
     elapsed: Duration,
     ttft: Option<Duration>,
     last_prefill: Option<(usize, Duration)>,
-    mtp_acceptance: Option<(usize, usize)>,
+    mtp_stats: Option<ResidentMtpGenerationStats>,
 }
 
 struct InferenceDisplay {
@@ -264,7 +265,7 @@ struct InferenceDisplayState {
     rounds: usize,
     output_tokens: usize,
     last_prefill: Option<(usize, Duration)>,
-    mtp_by_request: HashMap<ResidentRequestId, (usize, usize)>,
+    mtp_by_request: HashMap<ResidentRequestId, ResidentMtpGenerationStats>,
     session_active: bool,
 }
 
@@ -355,17 +356,16 @@ impl InferenceDisplay {
         state.output_tokens = state.output_tokens.saturating_add(outputs);
     }
 
-    fn observe_mtp_acceptance(
+    fn observe_mtp_stats(
         &mut self,
         request_id: ResidentRequestId,
-        accepted: usize,
-        proposed: usize,
+        stats: ResidentMtpGenerationStats,
     ) {
         self.state
             .lock()
             .expect("display mutex poisoned")
             .mtp_by_request
-            .insert(request_id, (accepted, proposed));
+            .insert(request_id, stats);
     }
 
     fn clear(&mut self) {
@@ -463,11 +463,7 @@ fn render_inference_state(state: &mut InferenceDisplayState) -> Option<(u64, Str
     }
     let phase = state.phase?;
     let now = Instant::now();
-    let mtp_acceptance = state
-        .mtp_by_request
-        .values()
-        .copied()
-        .reduce(|left, right| (left.0 + right.0, left.1 + right.1));
+    let mtp_stats = aggregate_mtp_stats(state.mtp_by_request.values().copied());
     let line = render_inference_progress(
         InferenceProgress {
             phase,
@@ -482,12 +478,32 @@ fn render_inference_state(state: &mut InferenceDisplayState) -> Option<(u64, Str
                 .first_output
                 .map(|first| first.saturating_duration_since(state.session_started)),
             last_prefill: state.last_prefill,
-            mtp_acceptance,
+            mtp_stats,
         },
         state.color,
     );
     state.spinner_tick = state.spinner_tick.wrapping_add(1);
     Some((state.phase_epoch, line))
+}
+
+fn aggregate_mtp_stats(
+    stats: impl IntoIterator<Item = ResidentMtpGenerationStats>,
+) -> Option<ResidentMtpGenerationStats> {
+    stats.into_iter().reduce(|mut total, stats| {
+        for (total, current) in total
+            .verification_routes
+            .iter_mut()
+            .zip(stats.verification_routes)
+        {
+            *total = total.saturating_add(current);
+        }
+        total.draft_proposals = total.draft_proposals.saturating_add(stats.draft_proposals);
+        total.accepted_drafts = total.accepted_drafts.saturating_add(stats.accepted_drafts);
+        total.verified_outputs = total
+            .verified_outputs
+            .saturating_add(stats.verified_outputs);
+        total
+    })
 }
 
 trait ReloadableGenerator: TextGenerator + Sized {
@@ -1158,12 +1174,12 @@ fn serve_requests<G: TextGenerator>(
         }
         for event in events.iter() {
             let request_id = event.request_id();
-            if let Some((accepted, proposed)) = event.mtp_acceptance() {
-                display.observe_mtp_acceptance(request_id, accepted, proposed);
+            if let Some(stats) = event.mtp_stats() {
+                display.observe_mtp_stats(request_id, stats);
             }
             let failed = replies.get_mut(&request_id).is_some_and(|reply| {
-                if let Some((accepted, proposed)) = event.mtp_acceptance() {
-                    reply.log.observe_mtp_acceptance(accepted, proposed);
+                if let Some(stats) = event.mtp_stats() {
+                    reply.log.observe_mtp_stats(stats);
                 }
                 if event.steps().any(|step| step.delta.is_some()) {
                     reply.log.observe_output();
@@ -1474,12 +1490,12 @@ fn serve_reloadable<G: ReloadableGenerator>(
         }
         for event in events.iter() {
             let request_id = event.request_id();
-            if let Some((accepted, proposed)) = event.mtp_acceptance() {
-                display.observe_mtp_acceptance(request_id, accepted, proposed);
+            if let Some(stats) = event.mtp_stats() {
+                display.observe_mtp_stats(request_id, stats);
             }
             let failed = replies.get_mut(&request_id).is_some_and(|reply| {
-                if let Some((accepted, proposed)) = event.mtp_acceptance() {
-                    reply.log.observe_mtp_acceptance(accepted, proposed);
+                if let Some(stats) = event.mtp_stats() {
+                    reply.log.observe_mtp_stats(stats);
                 }
                 if event.steps().any(|step| step.delta.is_some()) {
                     reply.log.observe_output();
@@ -1643,24 +1659,45 @@ fn render_inference_progress(progress: InferenceProgress, color: bool) -> String
                     };
                     format!(" · prefill {speed:.1} tok/s")
                 });
-            let mtp = progress
-                .mtp_acceptance
-                .map_or_else(String::new, |(accepted, proposed)| {
-                    let percent = if proposed == 0 {
-                        0.0
-                    } else {
-                        100.0 * accepted as f64 / proposed as f64
-                    };
-                    format!(" · MTP {accepted}/{proposed} ({percent:.1}%)")
-                });
+            let rounds = if progress.mtp_stats.is_none() {
+                format!(" · {} rounds", progress.rounds)
+            } else {
+                String::new()
+            };
+            let mtp = progress.mtp_stats.map_or_else(String::new, |stats| {
+                let verifications = stats.verification_routes.iter().sum::<usize>();
+                let milliseconds_per_verification = if verifications == 0 {
+                    0.0
+                } else {
+                    decode_elapsed.as_secs_f64() * 1_000.0 / verifications as f64
+                };
+                let outputs_per_verification = if verifications == 0 {
+                    0.0
+                } else {
+                    stats.verified_outputs as f64 / verifications as f64
+                };
+                let percent = if stats.draft_proposals == 0 {
+                    0.0
+                } else {
+                    100.0 * stats.accepted_drafts as f64 / stats.draft_proposals as f64
+                };
+                format!(
+                    " · lane-V={verifications} {milliseconds_per_verification:.1} wall-ms/lane-v {outputs_per_verification:.2} tok/lane-v K={}/{}/{}/{} · MTP {}/{} ({percent:.1}%)",
+                    stats.verification_routes[0],
+                    stats.verification_routes[1],
+                    stats.verification_routes[2],
+                    stats.verification_routes[3],
+                    stats.accepted_drafts,
+                    stats.draft_proposals,
+                )
+            });
             (
                 "DECODE",
                 format!(
-                    "B={} · elapsed {:.1} s · {ttft} · decode {:.1} s · {} rounds · {} tok · {speed:.1} tok/s{prefill}{mtp}",
+                    "B={} · elapsed {:.1} s · {ttft} · decode {:.1} s{rounds} · {} tok · {speed:.1} tok/s{prefill}{mtp}",
                     progress.active,
                     progress.elapsed.as_secs_f64(),
                     decode_elapsed.as_secs_f64(),
-                    progress.rounds,
                     progress.output_tokens,
                 ),
             )
@@ -1783,12 +1820,13 @@ fn admit_group<G: TextGenerator>(
     waiting: &mut Vec<ChatJob>,
     display: &mut InferenceDisplay,
 ) {
+    let batch = waiting.len();
     let accepted = waiting
         .iter()
         .map(|job| job.log.accepted())
         .min()
         .unwrap_or_else(Instant::now);
-    display.prefill(waiting.len(), accepted);
+    display.prefill(batch, accepted);
     let prefill_started = Instant::now();
     let requests = waiting.iter().map(|job| &job.request).collect::<Vec<_>>();
     let admissions = generator.admit_batch(&requests);
@@ -1801,7 +1839,10 @@ fn admit_group<G: TextGenerator>(
     display.observe_prefill(prefill_tokens, prefill_elapsed);
     display.clear();
     debug_assert_eq!(admissions.len(), waiting.len());
-    for (job, admission) in waiting.drain(..).zip(admissions) {
+    for (mut job, admission) in waiting.drain(..).zip(admissions) {
+        let queue = prefill_started.saturating_duration_since(job.log.accepted());
+        job.log
+            .observe_prefill(batch, prefill_tokens, queue, prefill_elapsed);
         record_admission(replies, job, admission);
     }
 }
@@ -2511,7 +2552,7 @@ mod tests {
     use tuisko_engine::{
         ChatGenerationRequest, EngineError, EngineErrorCode, FinishReason, GeneratedText,
         GenerationStep, MAX_BATCH, QWEN38_FLASH_NEXT_MTP_SERVING_SLOTS, ResidentBatchAdmission,
-        ResidentCancellation, ResidentLoadPhase, ResidentRequestId,
+        ResidentCancellation, ResidentLoadPhase, ResidentMtpGenerationStats, ResidentRequestId,
     };
     use tuisko_frontend::{ChatMessage, GenerationDefaults};
     use tuisko_model::{Arch, Qwen35_9B, Qwen36Moe35B, Qwen38_27B, Qwen38FlashNext};
@@ -2969,7 +3010,7 @@ mod tests {
                 elapsed: Duration::from_millis(1_250),
                 ttft: None,
                 last_prefill: None,
-                mtp_acceptance: None,
+                mtp_stats: None,
             },
             false,
         );
@@ -2987,14 +3028,21 @@ mod tests {
                 elapsed: Duration::from_secs(5),
                 ttft: Some(Duration::from_secs(1)),
                 last_prefill: Some((2_000, Duration::from_secs(2))),
-                mtp_acceptance: Some((23, 30)),
+                mtp_stats: Some(ResidentMtpGenerationStats {
+                    verification_routes: [0, 0, 0, 10],
+                    draft_proposals: 30,
+                    accepted_drafts: 23,
+                    verified_outputs: 29,
+                }),
             },
             true,
         );
         assert!(decode.starts_with("\r\x1b[2K\x1b[1;36mDECODE\x1b[0m ⠙"));
         assert!(decode.contains("B=3 · elapsed 5.0 s · ttft 1.0 s · decode 4.0 s"));
-        assert!(decode.contains("17 rounds · 41 tok · 10.0 tok/s"));
-        assert!(decode.ends_with("prefill 1000.0 tok/s · MTP 23/30 (76.7%)…"));
+        assert!(decode.contains("41 tok · 10.0 tok/s"));
+        assert!(decode.ends_with(
+            "prefill 1000.0 tok/s · lane-V=10 400.0 wall-ms/lane-v 2.90 tok/lane-v K=0/0/0/10 · MTP 23/30 (76.7%)…"
+        ));
 
         let daemon = render_shutdown(false, false);
         assert_eq!(

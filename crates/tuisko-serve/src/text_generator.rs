@@ -15,7 +15,7 @@ use tuisko_engine::{
     Qwen36ResidentBatchGenerator, Qwen38FlashNextMtpResidentGenerator,
     Qwen38FlashNextResidentBatchGenerator, ResidentBatchAdmission, ResidentBatchEvent,
     ResidentBatchEvents, ResidentCancellation, ResidentMtpBatchEvent, ResidentMtpBatchEvents,
-    ResidentMtpBatchGenerator, ResidentRequestId,
+    ResidentMtpBatchGenerator, ResidentMtpGenerationStats, ResidentRequestId,
 };
 
 /// One request's committed steps and terminal output from a scheduler round.
@@ -29,8 +29,8 @@ pub(crate) trait GenerationEvent {
     /// Complete output when this round terminated the request.
     fn completed(&self) -> Option<&GeneratedText>;
 
-    /// Cumulative accepted and proposed MTP draft counts, when exposed by this target.
-    fn mtp_acceptance(&self) -> Option<(usize, usize)> {
+    /// Cumulative exact MTP route, output, and acceptance counters, when exposed by this target.
+    fn mtp_stats(&self) -> Option<ResidentMtpGenerationStats> {
         None
     }
 }
@@ -95,8 +95,8 @@ impl GenerationEvent for ResidentMtpBatchEvent {
         self.completed.as_ref()
     }
 
-    fn mtp_acceptance(&self) -> Option<(usize, usize)> {
-        Some((self.stats.accepted_drafts, self.stats.draft_proposals))
+    fn mtp_stats(&self) -> Option<ResidentMtpGenerationStats> {
+        Some(self.stats)
     }
 }
 
