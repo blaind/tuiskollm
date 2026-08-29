@@ -14,6 +14,7 @@ use tuisko_gpu::{
 use tuisko_kernels_sm120::{
     ATTENTION_PAGE_SIZE, PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT,
     PAGED_GQA_PREFILL_MACRO_PARTIAL_BYTES, PAGED_GQA_PREFILL_MACRO_TOKENS, PagedGqaOp,
+    paged_gqa_prefill_partitions,
 };
 use tuisko_model::{Arch, Qwen38_27B};
 
@@ -478,7 +479,8 @@ fn launch(
 
                 op.launch_prefill_partitioned(
                     stream,
-                    context_tokens,
+                    TAIL_TOKENS,
+                    paged_gqa_prefill_partitions(context_tokens)?,
                     addresses.query,
                     addresses.key_pages,
                     addresses.value_pages,

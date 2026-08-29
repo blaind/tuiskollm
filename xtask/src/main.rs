@@ -1522,6 +1522,7 @@ const SUBCOMMANDS: &[Subcommand] = &[
     forwarded("bench-gdn-output", bench_gdn_output),
     forwarded("bench-attention-qk-prepare", bench_attention_qk_prepare),
     forwarded("bench-paged-gqa", bench_paged_gqa),
+    forwarded("bench-paged-gqa-deep-prefill", bench_paged_gqa_deep_prefill),
     forwarded("bench-qwen35-paged-gqa", bench_qwen35_paged_gqa),
     forwarded("bench-qwen36-paged-gqa", bench_qwen36_paged_gqa),
     forwarded("bench-qwen36-fp8-paged-gqa", bench_qwen36_fp8_paged_gqa),
@@ -4435,6 +4436,13 @@ fn bench_attention_qk_prepare(
 
 fn bench_paged_gqa(root: &Path, arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::PagedGqa, arguments)
+}
+
+fn bench_paged_gqa_deep_prefill(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "paged-gqa-deep-prefill", arguments)
 }
 
 fn bench_qwen35_paged_gqa(
@@ -10409,11 +10417,11 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>();
     require_count("paged GQA", attention.len(), 8)?;
     require_count("shared prefill paged GQA", prefill.len(), 3)?;
-    require_count("partitioned prefill paged GQA", prefill_partials.len(), 2)?;
+    require_count("partitioned prefill paged GQA", prefill_partials.len(), 6)?;
     require_count(
         "partitioned prefill paged GQA reduction",
         prefill_reductions.len(),
-        2,
+        6,
     )?;
     require_count(
         "macro prefill paged GQA partition",
@@ -10663,7 +10671,7 @@ fn gate_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "paged GQA gate passed: 8 decode + 3 shared + 2 flash partition + 2 reduction + 1 macro flash + 5 macro reduction entries, REG {:?} / {:?} / {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, DECODE SHARED {:?}, SHARED {:?}, FP8-QMMA/F16-HMMA/E4M3/SHFL/EX2/LDGSTS present",
+        "paged GQA gate passed: 8 decode + 3 shared + 6 flash partition + 6 reduction + 1 macro flash + 5 macro reduction entries, REG {:?} / {:?} / {:?} / {:?} / {:?} / {:?}, STACK:0 LOCAL:0, DECODE SHARED {:?}, SHARED {:?}, FP8-QMMA/F16-HMMA/E4M3/SHFL/EX2/LDGSTS present",
         registers,
         prefill_registers,
         prefill_partial_registers,

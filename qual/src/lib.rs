@@ -134,6 +134,8 @@ mod paged_gqa;
 #[cfg(feature = "device")]
 mod paged_gqa_benchmark;
 #[cfg(feature = "device")]
+mod paged_gqa_deep_prefill_benchmark;
+#[cfg(feature = "device")]
 mod paged_gqa_macro_prefill;
 #[cfg(feature = "device")]
 mod paged_gqa_partitioned_prefill;
@@ -584,6 +586,8 @@ pub use paged_gqa::{
 };
 #[cfg(feature = "device")]
 pub use paged_gqa_benchmark::benchmark_paged_gqa;
+#[cfg(feature = "device")]
+pub use paged_gqa_deep_prefill_benchmark::benchmark_paged_gqa_deep_prefill;
 #[cfg(feature = "device")]
 pub use paged_gqa_macro_prefill::{
     PagedGqaMacroPrefillQualification, PagedGqaMacroPrefillQualificationError,

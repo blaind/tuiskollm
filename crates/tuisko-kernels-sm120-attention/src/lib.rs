@@ -110,10 +110,10 @@ mod tests {
                 ("long_context_paged_gqa_reduce_exact", 8),
                 ("paged_gqa_exact", 8),
                 ("paged_gqa_prefill_flash_macro_exact", 1),
-                ("paged_gqa_prefill_flash_p16_exact", 1),
-                ("paged_gqa_prefill_flash_p8_exact", 1),
+                ("paged_gqa_prefill_flash_p16_exact", 3),
+                ("paged_gqa_prefill_flash_p8_exact", 3),
                 ("paged_gqa_prefill_macro_reduce_exact", 5),
-                ("paged_gqa_prefill_partitioned_reduce_exact", 2),
+                ("paged_gqa_prefill_partitioned_reduce_exact", 6),
                 ("paged_gqa_prefill_shared_exact", 3),
                 ("qwen35_attention_qk_prepare_exact", 8),
                 ("qwen35_attention_qk_prepare_prefill_exact", 4),
@@ -141,6 +141,6 @@ mod tests {
                 ("qwen38_flash_next_paged_gqa_selected_exact", 8),
             ]
         );
-        assert_eq!(counts.values().sum::<usize>(), 212);
+        assert_eq!(counts.values().sum::<usize>(), 220);
     }
 }

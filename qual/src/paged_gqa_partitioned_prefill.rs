@@ -1,4 +1,4 @@
-//! Deep-context qualification for partitioned T=128 paged GQA.
+//! Deep-context qualification for exact T=32/64/128 partitioned paged GQA.
 
 use crate::fp8_projection_oracle::{
     BYTE_SENTINEL, F32_SENTINEL_BITS, decode_e4m3fn, encode_e4m3fn, f16_to_f32, f32_to_f16,
@@ -12,14 +12,12 @@ use tuisko_gpu::{
 };
 use tuisko_kernels_sm120::{
     ATTENTION_PAGE_SIZE, PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PagedGqaOp,
-    paged_gqa_prefill_partitions,
 };
 use tuisko_model::{Arch, Qwen38_27B};
 
-const TOKENS: usize = 128;
-const SHORT_CONTEXT: usize = 257;
-const LONG_CONTEXT: usize = PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT;
-const PHYSICAL_PAGES: usize = LONG_CONTEXT.div_ceil(ATTENTION_PAGE_SIZE);
+const MAX_TOKENS: usize = 128;
+const MAX_CONTEXT: usize = 220_000;
+const PHYSICAL_PAGES: usize = MAX_CONTEXT.div_ceil(ATTENTION_PAGE_SIZE);
 const TABLE_STRIDE: usize = PHYSICAL_PAGES;
 const ALIGNMENT: usize = 256;
 const KEY_SCALE: f32 = 0.03125;
@@ -27,14 +25,65 @@ const VALUE_SCALE: f32 = 0.0625;
 const PARTIAL_VALUES: usize = Qwen38_27B::HEAD_DIM + 2;
 const MAX_PARTITIONS: usize = 16;
 const PARTIAL_FLOATS: usize =
-    TOKENS * Qwen38_27B::NUM_ATTENTION_HEADS * MAX_PARTITIONS * PARTIAL_VALUES;
+    MAX_TOKENS * Qwen38_27B::NUM_ATTENTION_HEADS * MAX_PARTITIONS * PARTIAL_VALUES;
 const QUERY_PATTERN: [f32; 8] = [
     0.5, -0.375, 0.25, -0.1875, 0.125, -0.09375, 0.0625, -0.03125,
 ];
 const KEY_CODES: [u8; 8] = [0x28, 0x38, 0x48, 0x58, 0xa8, 0xb8, 0xc8, 0xd8];
 const VALUE_CODES: [u8; 8] = [0x58, 0xc8, 0x38, 0xa8, 0x48, 0xd8, 0x28, 0xb8];
 
-/// Failure of partitioned T=128 paged-GQA qualification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RouteCase {
+    tokens: usize,
+    context_tokens: usize,
+    partitions: usize,
+}
+
+fn qualification_cases() -> Vec<RouteCase> {
+    let mut cases = Vec::new();
+    let contexts = [
+        8_191,
+        8_192,
+        8_193,
+        32_767,
+        32_768,
+        32_769,
+        65_535,
+        65_536,
+        65_537,
+        98_303,
+        98_304,
+        98_305,
+        108_095,
+        131_072,
+        131_073,
+        MAX_CONTEXT,
+    ];
+    for tokens in [32, 64] {
+        for partitions in [8, 16] {
+            cases.extend(contexts.into_iter().map(|context_tokens| RouteCase {
+                tokens,
+                context_tokens,
+                partitions,
+            }));
+        }
+    }
+    cases.extend([
+        RouteCase {
+            tokens: 128,
+            context_tokens: 257,
+            partitions: 8,
+        },
+        RouteCase {
+            tokens: 128,
+            context_tokens: PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT,
+            partitions: 16,
+        },
+    ]);
+    cases
+}
+
+/// Failure of exact partitioned paged-GQA prefill qualification.
 #[derive(Debug, thiserror::Error)]
 pub enum PagedGqaPartitionedPrefillQualificationError {
     /// GPU ownership, launch, or driver failure.
@@ -57,10 +106,14 @@ pub struct PagedGqaPartitionedPrefillQualification {
     pub partial_values: usize,
     /// Inactive maximum-workspace words proved untouched.
     pub untouched_partial_values: usize,
+    /// Inactive maximum-output words proved untouched.
+    pub untouched_output_values: usize,
     /// Read-only inputs proved unchanged.
     pub immutable_input_values: usize,
     /// Output and partial words reproduced exactly by CUDA Graph replay.
     pub graph_replay_values: usize,
+    /// Output and partial words reproduced exactly by a second eager launch.
+    pub deterministic_replay_values: usize,
     /// Exact bytes in the one-allocation qualification arena.
     pub arena_bytes: usize,
     /// Alignment padding bytes in that arena.
@@ -78,8 +131,7 @@ struct Regions {
     value_pages: ArenaRegion<u8>,
     block_tables: ArenaRegion<u32>,
     table_rows: ArenaRegion<u32>,
-    short_lengths: ArenaRegion<u32>,
-    long_lengths: ArenaRegion<u32>,
+    lengths: ArenaRegion<u32>,
     partials: ArenaRegion<f32>,
     output: ArenaRegion<f32>,
 }
@@ -91,8 +143,7 @@ impl Regions {
             + self.value_pages.byte_len()
             + self.block_tables.byte_len()
             + self.table_rows.byte_len()
-            + self.short_lengths.byte_len()
-            + self.long_lengths.byte_len()
+            + self.lengths.byte_len()
             + self.partials.byte_len()
             + self.output.byte_len()
     }
@@ -104,13 +155,12 @@ struct Fixture {
     value_pages: Vec<u8>,
     block_tables: Vec<u32>,
     table_rows: Vec<u32>,
-    short_lengths: Vec<u32>,
-    long_lengths: Vec<u32>,
 }
 
 struct Oracle {
     output: Vec<f32>,
     partials: Vec<f32>,
+    active_output: usize,
     active_partials: usize,
 }
 
@@ -177,55 +227,70 @@ pub fn qualify_paged_gqa_partitioned_prefill()
         output_values: 0,
         partial_values: 0,
         untouched_partial_values: 0,
+        untouched_output_values: 0,
         immutable_input_values: 0,
         graph_replay_values: 0,
+        deterministic_replay_values: 0,
         arena_bytes: layout.byte_len(),
         padding_bytes: layout.byte_len() - regions.payload_bytes(),
         maximum_absolute_error: 0.0,
         maximum_partial_absolute_error: 0.0,
     };
 
-    for context_tokens in [SHORT_CONTEXT, LONG_CONTEXT] {
+    for case in qualification_cases() {
+        let lengths = route_lengths(case);
+        arena.copy_from_host(&stream, regions.lengths, &lengths)?;
         reset_outputs(&arena, &stream, regions)?;
-        launch(&op, &arena, &stream, regions, context_tokens)?;
+        launch(&op, &arena, &stream, regions, case)?;
         let eager_output = arena.copy_to_host(&stream, regions.output)?;
         let eager_partials = arena.copy_to_host(&stream, regions.partials)?;
-        let expected = oracle(context_tokens, &fixture)?;
-        verify_oracle(
-            context_tokens,
+        let expected = oracle(case, &lengths, &fixture)?;
+        verify_oracle(case, &eager_output, &eager_partials, &expected, &mut report)?;
+        verify_lengths(&arena, &stream, regions, &lengths, &mut report)?;
+
+        reset_outputs(&arena, &stream, regions)?;
+        launch(&op, &arena, &stream, regions, case)?;
+        let deterministic_output = arena.copy_to_host(&stream, regions.output)?;
+        let deterministic_partials = arena.copy_to_host(&stream, regions.partials)?;
+        verify_exact_replay(
+            case,
+            "second eager",
             &eager_output,
             &eager_partials,
-            &expected,
-            &mut report,
+            &deterministic_output,
+            &deterministic_partials,
         )?;
-        verify_inputs(&arena, &stream, regions, &fixture, &mut report)?;
+        report.deterministic_replay_values +=
+            deterministic_output.len() + deterministic_partials.len();
+        verify_lengths(&arena, &stream, regions, &lengths, &mut report)?;
 
         reset_outputs(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || {
-            launch(&op, &arena, &stream, regions, context_tokens)
-        })?;
+        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, case))?;
         // SAFETY: every allocation this graph captured is owned by this scope or
         // its caller and outlives the replays and the synchronize that follows.
         unsafe { graph.launch(&stream) }?;
         let replay_output = arena.copy_to_host(&stream, regions.output)?;
         let replay_partials = arena.copy_to_host(&stream, regions.partials)?;
-        verify_replay(
-            context_tokens,
+        verify_exact_replay(
+            case,
+            "graph",
             &eager_output,
             &eager_partials,
             &replay_output,
             &replay_partials,
-            &mut report,
         )?;
-        verify_inputs(&arena, &stream, regions, &fixture, &mut report)?;
+        report.graph_replay_values += replay_output.len() + replay_partials.len();
+        verify_lengths(&arena, &stream, regions, &lengths, &mut report)?;
 
         if addresses(&arena, regions)? != stable_addresses {
             return Err(PagedGqaPartitionedPrefillQualificationError::Mismatch(
-                format!("device addresses changed at context={context_tokens}"),
+                format!("device addresses changed at {case:?}"),
             ));
         }
     }
+
+    verify_static_inputs(&arena, &stream, regions, &fixture, &mut report)?;
 
     verify_no_post_warmup_allocation(&context, &op, &arena, &stream, regions)?;
     device_benchmark::require_current_process_exclusive()?;
@@ -235,17 +300,16 @@ pub fn qualify_paged_gqa_partitioned_prefill()
 
 fn layout() -> GpuResult<(ArenaLayout, Regions)> {
     let mut layout = ArenaLayout::new();
-    let query = layout.reserve(TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let query = layout.reserve(MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
     let plane_bytes =
         PHYSICAL_PAGES * Qwen38_27B::NUM_KV_HEADS * ATTENTION_PAGE_SIZE * Qwen38_27B::HEAD_DIM;
     let key_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
     let value_pages = layout.reserve(plane_bytes, ALIGNMENT)?;
     let block_tables = layout.reserve(TABLE_STRIDE, ALIGNMENT)?;
-    let table_rows = layout.reserve(TOKENS, ALIGNMENT)?;
-    let short_lengths = layout.reserve(TOKENS, ALIGNMENT)?;
-    let long_lengths = layout.reserve(TOKENS, ALIGNMENT)?;
+    let table_rows = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
+    let lengths = layout.reserve(MAX_TOKENS, ALIGNMENT)?;
     let partials = layout.reserve(PARTIAL_FLOATS, ALIGNMENT)?;
-    let output = layout.reserve(TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
+    let output = layout.reserve(MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS, ALIGNMENT)?;
 
     Ok((
         layout,
@@ -255,8 +319,7 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
             value_pages,
             block_tables,
             table_rows,
-            short_lengths,
-            long_lengths,
+            lengths,
             partials,
             output,
         },
@@ -264,7 +327,7 @@ fn layout() -> GpuResult<(ArenaLayout, Regions)> {
 }
 
 fn fixture() -> Fixture {
-    let query = (0..TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
+    let query = (0..MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS)
         .map(|index| QUERY_PATTERN[(index + index / Qwen38_27B::HEAD_DIM) & 7])
         .collect::<Vec<_>>();
     let plane_bytes =
@@ -287,15 +350,7 @@ fn fixture() -> Fixture {
     let block_tables = (0..PHYSICAL_PAGES)
         .map(|page| ((page * 17) % PHYSICAL_PAGES) as u32)
         .collect::<Vec<_>>();
-    let table_rows = vec![0u32; TOKENS];
-    let short_first = SHORT_CONTEXT - TOKENS + 1;
-    let long_first = LONG_CONTEXT - TOKENS + 1;
-    let short_lengths = (0..TOKENS)
-        .map(|token| (short_first + token) as u32)
-        .collect();
-    let long_lengths = (0..TOKENS)
-        .map(|token| (long_first + token) as u32)
-        .collect();
+    let table_rows = vec![0u32; MAX_TOKENS];
 
     Fixture {
         query,
@@ -303,9 +358,14 @@ fn fixture() -> Fixture {
         value_pages,
         block_tables,
         table_rows,
-        short_lengths,
-        long_lengths,
     }
+}
+
+fn route_lengths(case: RouteCase) -> Vec<u32> {
+    let first = case.context_tokens - case.tokens + 1;
+    (0..MAX_TOKENS)
+        .map(|token| (first + token.min(case.tokens - 1)) as u32)
+        .collect()
 }
 
 fn load_fixture(
@@ -318,9 +378,7 @@ fn load_fixture(
     arena.copy_from_host(stream, regions.key_pages, &fixture.key_pages)?;
     arena.copy_from_host(stream, regions.value_pages, &fixture.value_pages)?;
     arena.copy_from_host(stream, regions.block_tables, &fixture.block_tables)?;
-    arena.copy_from_host(stream, regions.table_rows, &fixture.table_rows)?;
-    arena.copy_from_host(stream, regions.short_lengths, &fixture.short_lengths)?;
-    arena.copy_from_host(stream, regions.long_lengths, &fixture.long_lengths)
+    arena.copy_from_host(stream, regions.table_rows, &fixture.table_rows)
 }
 
 fn reset_outputs(
@@ -332,15 +390,14 @@ fn reset_outputs(
     arena.fill(stream, regions.output, BYTE_SENTINEL)
 }
 
-fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 9]> {
+fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 8]> {
     Ok([
         arena.address(regions.query)?.addr(),
         arena.address(regions.key_pages)?.addr(),
         arena.address(regions.value_pages)?.addr(),
         arena.address(regions.block_tables)?.addr(),
         arena.address(regions.table_rows)?.addr(),
-        arena.address(regions.short_lengths)?.addr(),
-        arena.address(regions.long_lengths)?.addr(),
+        arena.address(regions.lengths)?.addr(),
         arena.address(regions.partials)?.addr(),
         arena.address(regions.output)?.addr(),
     ])
@@ -351,25 +408,21 @@ fn launch(
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
-    context_tokens: usize,
+    case: RouteCase,
 ) -> GpuResult<()> {
-    let lengths = if context_tokens == SHORT_CONTEXT {
-        regions.short_lengths
-    } else {
-        regions.long_lengths
-    };
-    // SAFETY: the maximum arena owns all 513 pages and the P=16 workspace.
+    // SAFETY: the maximum arena owns all 3,438 pages and the T128/P16 workspace.
     unsafe {
         op.launch_prefill_partitioned(
             stream,
-            context_tokens,
+            case.tokens,
+            case.partitions,
             arena.address(regions.query)?,
             arena.address(regions.key_pages)?,
             arena.address(regions.value_pages)?,
             arena.address(regions.block_tables)?,
             arena.address(regions.table_rows)?,
             TABLE_STRIDE,
-            arena.address(lengths)?,
+            arena.address(regions.lengths)?,
             arena.address(regions.partials)?,
             arena.address(regions.output)?,
             KEY_SCALE,
@@ -379,39 +432,39 @@ fn launch(
 }
 
 fn oracle(
-    context_tokens: usize,
+    case: RouteCase,
+    lengths: &[u32],
     fixture: &Fixture,
 ) -> Result<Oracle, PagedGqaPartitionedPrefillQualificationError> {
-    let partitions = paged_gqa_prefill_partitions(context_tokens)?;
-    let lengths = if context_tokens == SHORT_CONTEXT {
-        &fixture.short_lengths
-    } else {
-        &fixture.long_lengths
-    };
-    let active_partials = TOKENS * Qwen38_27B::NUM_ATTENTION_HEADS * partitions * PARTIAL_VALUES;
+    let active_output = case.tokens * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS;
+    let active_partials =
+        case.tokens * Qwen38_27B::NUM_ATTENTION_HEADS * case.partitions * PARTIAL_VALUES;
     let mut partials = vec![f32::from_bits(F32_SENTINEL_BITS); PARTIAL_FLOATS];
-    let mut output = vec![0.0f32; TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS];
-    let histograms = prefix_histograms(context_tokens, lengths, partitions, fixture)?;
+    let mut output =
+        vec![f32::from_bits(F32_SENTINEL_BITS); MAX_TOKENS * Qwen38_27B::ATTENTION_OUTPUT_COLUMNS];
+    let histograms = prefix_histograms(case, lengths, fixture)?;
     let scores = score_classes(fixture)?;
     let values = value_classes();
 
-    for token in 0..TOKENS {
+    for token in 0..case.tokens {
         let length = lengths[token] as usize;
-        for query_head in 0..Qwen38_27B::NUM_ATTENTION_HEADS {
+        for (query_head, query_scores) in scores.iter().enumerate() {
             let kv_head = query_head / (Qwen38_27B::NUM_ATTENTION_HEADS / Qwen38_27B::NUM_KV_HEADS);
             let final_counts = histograms.interval(kv_head, 0, length);
-            let final_state = represented_state(&final_counts, &scores[query_head], &values);
+            let final_state = represented_state(&final_counts, query_scores, &values);
             let output_base =
                 (token * Qwen38_27B::NUM_ATTENTION_HEADS + query_head) * Qwen38_27B::HEAD_DIM;
             for dimension in 0..Qwen38_27B::HEAD_DIM {
                 output[output_base + dimension] = (final_state.2[dimension] / final_state.1) as f32;
             }
 
-            for partition in 0..partitions {
-                let (begin, end) = flash_partition_interval(token, lengths, partitions, partition);
+            for partition in 0..case.partitions {
+                let (begin, end) =
+                    flash_partition_interval(token, lengths, case.partitions, partition);
                 let counts = histograms.interval(kv_head, begin, end);
-                let state = represented_state(&counts, &scores[query_head], &values);
-                let base = ((token * Qwen38_27B::NUM_ATTENTION_HEADS + query_head) * partitions
+                let state = represented_state(&counts, query_scores, &values);
+                let base = ((token * Qwen38_27B::NUM_ATTENTION_HEADS + query_head)
+                    * case.partitions
                     + partition)
                     * PARTIAL_VALUES;
                 partials[base] = state.0 as f32;
@@ -426,22 +479,22 @@ fn oracle(
     Ok(Oracle {
         output,
         partials,
+        active_output,
         active_partials,
     })
 }
 
 fn prefix_histograms(
-    context_tokens: usize,
+    case: RouteCase,
     lengths: &[u32],
-    partitions: usize,
     fixture: &Fixture,
 ) -> Result<PrefixHistograms, PagedGqaPartitionedPrefillQualificationError> {
-    let mut boundaries = BTreeSet::from([0usize, context_tokens]);
-    for token in 0..TOKENS {
+    let mut boundaries = BTreeSet::from([0usize, case.context_tokens]);
+    for token in 0..case.tokens {
         let length = lengths[token] as usize;
         boundaries.insert(length);
-        for partition in 0..partitions {
-            let (begin, end) = flash_partition_interval(token, lengths, partitions, partition);
+        for partition in 0..case.partitions {
+            let (begin, end) = flash_partition_interval(token, lengths, case.partitions, partition);
             if begin < end {
                 boundaries.insert(begin);
                 boundaries.insert(end);
@@ -453,7 +506,7 @@ fn prefix_histograms(
     let mut snapshots = Vec::with_capacity(boundaries.len());
     let mut boundary = 0usize;
 
-    for position in 0..=context_tokens {
+    for position in 0..=case.context_tokens {
         if boundaries[boundary] == position {
             snapshots.push(counts);
             boundary += 1;
@@ -464,11 +517,11 @@ fn prefix_histograms(
 
         let physical = fixture.block_tables[position / ATTENTION_PAGE_SIZE] as usize;
         let page_offset = position & (ATTENTION_PAGE_SIZE - 1);
-        for kv_head in 0..Qwen38_27B::NUM_KV_HEADS {
+        for (kv_head, head_counts) in counts.iter_mut().enumerate() {
             let offset = cache_offset(physical, kv_head, page_offset, 0);
             let key = code_class(&KEY_CODES, fixture.key_pages[offset], "key")?;
             let value = code_class(&VALUE_CODES, fixture.value_pages[offset], "value")?;
-            counts[kv_head][key * 8 + value] += 1;
+            head_counts[key * 8 + value] += 1;
         }
     }
 
@@ -580,20 +633,24 @@ fn represented_state(
 }
 
 fn verify_oracle(
-    context_tokens: usize,
+    case: RouteCase,
     output: &[f32],
     partials: &[f32],
     expected: &Oracle,
     report: &mut PagedGqaPartitionedPrefillQualification,
 ) -> Result<(), PagedGqaPartitionedPrefillQualificationError> {
-    for (index, (&actual, &truth)) in output.iter().zip(&expected.output).enumerate() {
+    for (index, (&actual, &truth)) in output[..expected.active_output]
+        .iter()
+        .zip(&expected.output[..expected.active_output])
+        .enumerate()
+    {
         let error = (actual - truth).abs();
         report.maximum_absolute_error = report.maximum_absolute_error.max(error);
         let tolerance = 0.003f32.max(truth.abs() * 0.005);
         if !actual.is_finite() || error > tolerance {
             return Err(PagedGqaPartitionedPrefillQualificationError::Mismatch(
                 format!(
-                    "output at context={context_tokens}, index={index}: device={actual}, oracle={truth}, tolerance={tolerance}"
+                    "output at {case:?}, index={index}: device={actual}, oracle={truth}, tolerance={tolerance}"
                 ),
             ));
         }
@@ -609,7 +666,7 @@ fn verify_oracle(
         if !actual.is_finite() || error > tolerance {
             return Err(PagedGqaPartitionedPrefillQualificationError::Mismatch(
                 format!(
-                    "partial at context={context_tokens}, index={index}: device={actual}, oracle={truth}, tolerance={tolerance}"
+                    "partial at {case:?}, index={index}: device={actual}, oracle={truth}, tolerance={tolerance}"
                 ),
             ));
         }
@@ -618,20 +675,49 @@ fn verify_oracle(
         if value.to_bits() != F32_SENTINEL_BITS {
             return Err(PagedGqaPartitionedPrefillQualificationError::Mismatch(
                 format!(
-                    "context={context_tokens} modified inactive partial word {}",
+                    "{case:?} modified inactive partial word {}",
                     expected.active_partials + index
                 ),
             ));
         }
     }
 
-    report.output_values += output.len();
+    for (index, value) in output[expected.active_output..].iter().enumerate() {
+        if value.to_bits() != F32_SENTINEL_BITS {
+            return Err(PagedGqaPartitionedPrefillQualificationError::Mismatch(
+                format!(
+                    "{case:?} modified inactive output word {}",
+                    expected.active_output + index
+                ),
+            ));
+        }
+    }
+
+    report.output_values += expected.active_output;
+    report.untouched_output_values += output.len() - expected.active_output;
     report.partial_values += expected.active_partials;
     report.untouched_partial_values += partials.len() - expected.active_partials;
     Ok(())
 }
 
-fn verify_inputs(
+fn verify_lengths(
+    arena: &DeviceArena,
+    stream: &tuisko_gpu::CudaStream,
+    regions: Regions,
+    lengths: &[u32],
+    report: &mut PagedGqaPartitionedPrefillQualification,
+) -> Result<(), PagedGqaPartitionedPrefillQualificationError> {
+    let actual = arena.copy_to_host(stream, regions.lengths)?;
+    if let Some(index) = actual.iter().zip(lengths).position(|(a, e)| a != e) {
+        return Err(PagedGqaPartitionedPrefillQualificationError::Mismatch(
+            format!("read-only lengths changed at index {index}"),
+        ));
+    }
+    report.immutable_input_values += actual.len();
+    Ok(())
+}
+
+fn verify_static_inputs(
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
@@ -655,22 +741,16 @@ fn verify_inputs(
     check!(regions.value_pages, &fixture.value_pages, "value cache");
     check!(regions.block_tables, &fixture.block_tables, "block tables");
     check!(regions.table_rows, &fixture.table_rows, "table rows");
-    check!(
-        regions.short_lengths,
-        &fixture.short_lengths,
-        "short lengths"
-    );
-    check!(regions.long_lengths, &fixture.long_lengths, "long lengths");
     Ok(())
 }
 
-fn verify_replay(
-    context_tokens: usize,
+fn verify_exact_replay(
+    case: RouteCase,
+    label: &str,
     eager_output: &[f32],
     eager_partials: &[f32],
     replay_output: &[f32],
     replay_partials: &[f32],
-    report: &mut PagedGqaPartitionedPrefillQualification,
 ) -> Result<(), PagedGqaPartitionedPrefillQualificationError> {
     let mismatch = replay_output
         .iter()
@@ -685,10 +765,9 @@ fn verify_replay(
         .position(|(actual, expected)| actual != expected);
     if let Some(index) = mismatch {
         return Err(PagedGqaPartitionedPrefillQualificationError::Mismatch(
-            format!("context={context_tokens} graph word {index} differs from eager"),
+            format!("{case:?} {label} word {index} differs from first eager"),
         ));
     }
-    report.graph_replay_values += replay_output.len() + replay_partials.len();
     Ok(())
 }
 
@@ -705,28 +784,22 @@ fn verify_no_post_warmup_allocation(
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
 ) -> Result<(), PagedGqaPartitionedPrefillQualificationError> {
-    let graphs = [SHORT_CONTEXT, LONG_CONTEXT]
-        .into_iter()
-        .map(|context_tokens| {
-            CudaGraph::capture(stream, || {
-                launch(op, arena, stream, regions, context_tokens)
-            })
-        })
-        .collect::<GpuResult<Vec<_>>>()?;
-    for graph in &graphs {
-        // SAFETY: every allocation this graph captured is owned by this scope or
-        // its caller and outlives the replays and the synchronize that follows.
-        unsafe { graph.launch(stream) }?;
-    }
+    let case = RouteCase {
+        tokens: 64,
+        context_tokens: MAX_CONTEXT,
+        partitions: 16,
+    };
+    arena.copy_from_host(stream, regions.lengths, &route_lengths(case))?;
+    let graph = CudaGraph::capture(stream, || launch(op, arena, stream, regions, case))?;
+    // SAFETY: every allocation this graph captured is owned by this scope or
+    // its caller and outlives the replays and the synchronize that follows.
+    unsafe { graph.launch(stream) }?;
     stream.synchronize().map_err(GpuError::from)?;
     let before = device_memory_info(context)?;
     for _ in 0..4 {
         // SAFETY: every allocation this graph captured is owned by this scope or
         // its caller and outlives the replays and the synchronize that follows.
-        unsafe { graphs[1].launch(stream) }?;
-        // SAFETY: every allocation this graph captured is owned by this scope or
-        // its caller and outlives the replays and the synchronize that follows.
-        unsafe { graphs[0].launch(stream) }?;
+        unsafe { graph.launch(stream) }?;
     }
     stream.synchronize().map_err(GpuError::from)?;
     let after = device_memory_info(context)?;
@@ -741,43 +814,34 @@ fn verify_no_post_warmup_allocation(
 #[cfg(test)]
 mod tests {
     use super::{
-        LONG_CONTEXT, MAX_PARTITIONS, PARTIAL_FLOATS, PARTIAL_VALUES, SHORT_CONTEXT, TOKENS,
-        decode_e4m3fn, encode_e4m3fn, f16_to_f32, f32_to_f16, fixture, flash_partition_interval,
-        layout, qualify_paged_gqa_partitioned_prefill,
+        MAX_PARTITIONS, MAX_TOKENS, PARTIAL_FLOATS, PARTIAL_VALUES, RouteCase, decode_e4m3fn,
+        encode_e4m3fn, f16_to_f32, f32_to_f16, flash_partition_interval, layout,
+        qualification_cases, qualify_paged_gqa_partitioned_prefill, route_lengths,
     };
-    use tuisko_kernels_sm120::{PAGED_GQA_PREFILL_PARTIAL_BYTES, paged_gqa_prefill_partitions};
+    use tuisko_kernels_sm120::PAGED_GQA_PREFILL_PARTIAL_BYTES;
 
     #[test]
     fn paged_gqa_suite_flash_partition_boundaries_follow_exact_query_groups_and_key_tiles() {
-        let fixture = fixture();
+        let short = route_lengths(RouteCase {
+            tokens: 32,
+            context_tokens: 161,
+            partitions: 8,
+        });
+        let long = route_lengths(RouteCase {
+            tokens: 32,
+            context_tokens: 32_673,
+            partitions: 16,
+        });
 
-        assert_eq!(
-            flash_partition_interval(0, &fixture.short_lengths, 8, 0),
-            (0, 64)
-        );
-        assert_eq!(
-            flash_partition_interval(0, &fixture.short_lengths, 8, 2),
-            (128, 130)
-        );
-        assert_eq!(
-            flash_partition_interval(31, &fixture.short_lengths, 8, 2),
-            (128, 161)
-        );
-        assert_eq!(
-            flash_partition_interval(31, &fixture.short_lengths, 8, 3),
-            (192, 161)
-        );
+        assert_eq!(flash_partition_interval(0, &short, 8, 0), (0, 64));
+        assert_eq!(flash_partition_interval(0, &short, 8, 2), (128, 130));
+        assert_eq!(flash_partition_interval(31, &short, 8, 2), (128, 161));
+        assert_eq!(flash_partition_interval(31, &short, 8, 3), (192, 161));
 
+        assert_eq!(flash_partition_interval(0, &long, 16, 0), (0, 2_048));
+        assert_eq!(flash_partition_interval(0, &long, 16, 15), (30_720, 32_642));
         assert_eq!(
-            flash_partition_interval(0, &fixture.long_lengths, 16, 0),
-            (0, 2_048)
-        );
-        assert_eq!(
-            flash_partition_interval(0, &fixture.long_lengths, 16, 15),
-            (30_720, 32_642)
-        );
-        assert_eq!(
-            flash_partition_interval(31, &fixture.long_lengths, 16, 15),
+            flash_partition_interval(31, &long, 16, 15),
             (30_720, 32_673)
         );
     }
@@ -799,20 +863,28 @@ mod tests {
     fn paged_gqa_suite_partitioned_prefill_matches_complete_oracles_and_graph_replay()
     -> Result<(), super::PagedGqaPartitionedPrefillQualificationError> {
         let report = qualify_paged_gqa_partitioned_prefill()?;
-        let output_values = TOKENS * 6_144;
-        let active = [SHORT_CONTEXT, LONG_CONTEXT]
-            .into_iter()
-            .map(|context| {
-                TOKENS * 24 * paged_gqa_prefill_partitions(context).unwrap() * PARTIAL_VALUES
-            })
+        let cases = qualification_cases();
+        let output_values = cases.iter().map(|case| case.tokens * 6_144).sum::<usize>();
+        let untouched_output = cases.len() * MAX_TOKENS * 6_144 - output_values;
+        let active = cases
+            .iter()
+            .map(|case| case.tokens * 24 * case.partitions * PARTIAL_VALUES)
             .sum::<usize>();
 
-        assert_eq!(report.output_values, 2 * output_values);
+        assert_eq!(report.output_values, output_values);
+        assert_eq!(report.untouched_output_values, untouched_output);
         assert_eq!(report.partial_values, active);
-        assert_eq!(report.untouched_partial_values, 2 * PARTIAL_FLOATS - active);
+        assert_eq!(
+            report.untouched_partial_values,
+            cases.len() * PARTIAL_FLOATS - active
+        );
         assert_eq!(
             report.graph_replay_values,
-            2 * (output_values + PARTIAL_FLOATS)
+            cases.len() * (MAX_TOKENS * 6_144 + PARTIAL_FLOATS)
+        );
+        assert_eq!(
+            report.deterministic_replay_values,
+            cases.len() * (MAX_TOKENS * 6_144 + PARTIAL_FLOATS)
         );
         assert!(report.maximum_absolute_error <= 0.003);
         assert!(report.maximum_partial_absolute_error <= 0.01);

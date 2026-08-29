@@ -6274,7 +6274,8 @@ fn launch_prefill_mixer(
                         debug_assert_eq!(partitions, route.partition_capacity().unwrap());
                         ops.paged_gqa.launch_prefill_partitioned(
                             stream,
-                            route.context_tokens,
+                            rows,
+                            partitions,
                             workspace.query,
                             p.key_pages,
                             p.value_pages,
