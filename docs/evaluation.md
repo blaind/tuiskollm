@@ -55,6 +55,19 @@ with `--limit 10`, then `--limit 100`, before scheduling a full suite.
 Generation-only tasks continue to use `local-chat-completions` and
 `http://127.0.0.1:8000/v1/chat/completions`.
 
+Every admitted scoring request emits a content-free terminal log after success or failure. The
+line reports the request ID, batch size, total prompt and output-token counts, prompt-length range,
+common-prefix length, queue and scoring durations, scoring throughput, total latency, and route.
+It never includes prompt text, token IDs, or answer contents. For example:
+
+```text
+REQUEST 11      B4 · 244 prompt · 4 output · 0.6s · length
+                accepted +5.2s · queue 0.1ms · score 0.6s (386 tok/s) · lengths 61..61 · common 60/61 (98.4%) · route prompt-scoring
+```
+
+`common` describes the request shape, not proof that reuse was admitted; the route restrictions
+below still decide whether shared-prefix replay is safe.
+
 ## Scoring implementation
 
 Normal serving prefill projects only its final row through the LM head. Scoring preserves that

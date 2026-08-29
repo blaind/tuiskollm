@@ -1,6 +1,6 @@
 //! Concrete HTTP server and resident scheduler worker.
 
-use crate::request_log::RequestLog;
+use crate::request_log::{RequestLog, ScoringRequestLog};
 use crate::response::{
     ClientStatus, blocking_response_with_constraint, connected_streaming_response,
     connected_streaming_response_with_constraint, overloaded_response,
@@ -112,6 +112,7 @@ struct ChatJob {
 struct ScoreJob {
     prompts: Vec<Vec<u32>>,
     reply: oneshot::Sender<Result<Vec<PromptLogprobs>, ScoreFailure>>,
+    log: ScoringRequestLog,
 }
 
 #[derive(Debug)]
@@ -2172,13 +2173,23 @@ fn fail_all(replies: &mut HashMap<ResidentRequestId, ActiveReply>, message: Stri
 }
 
 fn run_score_job<G: TextGenerator>(generator: &mut G, job: ScoreJob) {
+    let ScoreJob {
+        prompts,
+        reply,
+        log,
+    } = job;
+    let scoring_started = Instant::now();
     let result = generator
-        .score_prompts(&job.prompts)
+        .score_prompts(&prompts)
         .map_err(|error| ScoreFailure {
             code: error.code(),
             message: error.to_string(),
         });
-    let _ = job.reply.send(result);
+    match &result {
+        Ok(_) => log.finish(Some(scoring_started), "length", None),
+        Err(error) => log.finish(Some(scoring_started), "error", Some(&error.message)),
+    }
+    let _ = reply.send(result);
 }
 
 fn reject_busy_score(job: ScoreJob) {
@@ -2190,6 +2201,7 @@ fn reject_busy_score(job: ScoreJob) {
 }
 
 fn fail_score_job(job: ScoreJob, code: Option<EngineErrorCode>, message: String) {
+    job.log.finish(None, "error", Some(&message));
     let _ = job.reply.send(Err(ScoreFailure { code, message }));
 }
 
@@ -2640,8 +2652,17 @@ async fn completions(
         }
     };
     let numeric_id = state.request_ids.fetch_add(1, Ordering::Relaxed);
+    let accepted = Instant::now();
     let (reply, receiver) = oneshot::channel();
-    if let Err(error) = enqueue_score_job(&state, ScoreJob { prompts, reply }) {
+    let log = ScoringRequestLog::new(numeric_id, accepted, state.server_started, &prompts);
+    if let Err(error) = enqueue_score_job(
+        &state,
+        ScoreJob {
+            prompts,
+            reply,
+            log,
+        },
+    ) {
         return enqueue_error_response(error);
     }
     match receiver.await {
@@ -2834,20 +2855,26 @@ fn enqueue_score_job(state: &AppState, job: ScoreJob) -> Result<(), EnqueueError
             LifecycleState::Loaded | LifecycleState::Loading | LifecycleState::Resuming
         )
     {
+        let message = format!("model lifecycle is {}", lifecycle.as_str());
+        job.log.finish(None, "error", Some(&message));
         return Err(EnqueueError::Transition(*lifecycle));
     }
     match state.jobs.try_send(Job::Score(job)) {
         Ok(()) => Ok(()),
-        Err(TrySendError::Full(Job::Score(_))) => {
+        Err(TrySendError::Full(Job::Score(job))) => {
             if let Some(previous) = rollback {
                 *lifecycle = previous;
             }
+            job.log
+                .finish(None, "error", Some("resident inference queue is full"));
             Err(EnqueueError::Full)
         }
-        Err(TrySendError::Closed(Job::Score(_))) => {
+        Err(TrySendError::Closed(Job::Score(job))) => {
             if let Some(previous) = rollback {
                 *lifecycle = previous;
             }
+            job.log
+                .finish(None, "error", Some("resident engine worker is unavailable"));
             Err(EnqueueError::Closed)
         }
         Err(
