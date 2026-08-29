@@ -1737,6 +1737,100 @@ impl ResidentModelProgram {
         Ok(())
     }
 
+    /// Copies one exact processed target prefix into another reserved slot on device.
+    pub(crate) fn copy_target_slot_prefix(
+        &self,
+        stream: &CudaStream,
+        source_slot: usize,
+        destination_slot: usize,
+        token_count: usize,
+    ) -> EngineResult<()> {
+        require_slot(source_slot)?;
+        require_slot(destination_slot)?;
+        if source_slot == destination_slot {
+            return Err(EngineError::route(
+                "resident target prefix copy requires distinct slots",
+            ));
+        }
+        for (label, slot) in [("source", source_slot), ("destination", destination_slot)] {
+            let reserved = self.mtp_kv_token_count(slot)?;
+            if token_count > reserved {
+                return Err(EngineError::route(format!(
+                    "resident target prefix copy requires {token_count} tokens but {label} slot {slot} owns {reserved}"
+                )));
+            }
+        }
+
+        for layer in &self.layout.layers {
+            let super::resident_model_layout::PersistentState::Gdn(persistent) = layer.persistent
+            else {
+                continue;
+            };
+            let history_values = persistent.history.len() / MAX_BATCH;
+            let state_values = persistent.state.len() / MAX_BATCH;
+            // SAFETY: distinct physical slot rows cannot overlap. Every consumer is ordered after
+            // these represented-value copies on the same stream.
+            unsafe {
+                self.arena.copy_slice_from_arena_async(
+                    stream,
+                    persistent.history,
+                    destination_slot * history_values,
+                    &self.arena,
+                    persistent.history,
+                    source_slot * history_values,
+                    history_values,
+                )?;
+                self.arena.copy_slice_from_arena_async(
+                    stream,
+                    persistent.state,
+                    destination_slot * state_values,
+                    &self.arena,
+                    persistent.state,
+                    source_slot * state_values,
+                    state_values,
+                )?;
+            }
+        }
+
+        let page_values = cache_values(1)?;
+        for logical_page in 0..token_count.div_ceil(ATTENTION_PAGE_SIZE) {
+            let source_page = self.mtp_kv_physical_page(source_slot, logical_page)?;
+            let destination_page = self.mtp_kv_physical_page(destination_slot, logical_page)?;
+            if source_page == destination_page {
+                return Err(EngineError::layout(format!(
+                    "resident target prefix slots share physical page {source_page}"
+                )));
+            }
+            let source_start = cache_values(source_page)?;
+            let destination_start = cache_values(destination_page)?;
+            for cache in self.layout.kv_layout.layers() {
+                // SAFETY: the paged owner assigns distinct physical pages to distinct active
+                // slots. The complete represented FP8 page is copied without conversion.
+                unsafe {
+                    self.kv_arena.copy_slice_from_arena_async(
+                        stream,
+                        cache.key.data,
+                        destination_start,
+                        &self.kv_arena,
+                        cache.key.data,
+                        source_start,
+                        page_values,
+                    )?;
+                    self.kv_arena.copy_slice_from_arena_async(
+                        stream,
+                        cache.value.data,
+                        destination_start,
+                        &self.kv_arena,
+                        cache.value.data,
+                        source_start,
+                        page_values,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn park_cache_page_values(&self) -> EngineResult<usize> {
         product(
             "resident park target cache-page values",

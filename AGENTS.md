@@ -80,6 +80,9 @@ Matching route widths or rounded allocation counts is not sufficient when exact 
 differ.
 Do not replace a sequential numerical contract with a parallel reduction based only on benign real
 fixtures. First test adversarial represented values, including terms below half an accumulator ULP.
+For a prompt-scoring batch optimization, compare the production batch response with complete
+independent `score_prompt` responses for every admitted `B` route and suffix boundary. A limited
+lm-eval run is an integration and timing check, not the numerical oracle or a quality estimate.
 The runner must refuse a busy device or incomparable clocks; it never changes clock or power state.
 After owner warmup, validate clocks under sustained production-graph load before starting a long
 timing matrix. A failed loaded-clock probe ends the run early. If clocks drift only after that

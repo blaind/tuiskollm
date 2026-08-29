@@ -28,6 +28,7 @@ const TARGET_DOWNLOAD_ROWS: usize = MAX_BATCH * VERIFY_ROWS;
 const TARGET_LOGIT_ROWS: usize = MAX_BATCH + TARGET_DOWNLOAD_ROWS;
 const DRAFT_LOGIT_ROWS: usize = 2 * MAX_BATCH;
 const DRAFT_HIDDEN_ROWS: usize = 2 * MAX_BATCH;
+const PARALLEL_SCORING_SUFFIX_TOKENS: usize = 32;
 
 fn disconnected_prefill() -> EngineError {
     EngineError::generation("client disconnected during prompt prefill")
@@ -416,6 +417,20 @@ impl ResidentMtpBatchGenerator {
                 .collect();
         }
 
+        if parallel_prompt_scoring_admitted(&plan, prompts.len())
+            && self.parallel_scoring_has_capacity(prompts.len(), plan.required_positions)?
+        {
+            return self.score_prompts_with_parallel_suffixes(prompts, &plan);
+        }
+
+        self.score_prompts_with_sequential_suffixes(prompts, &plan)
+    }
+
+    fn score_prompts_with_sequential_suffixes(
+        &mut self,
+        prompts: &[Vec<u32>],
+        plan: &PromptScoringBatchPlan,
+    ) -> EngineResult<Vec<PromptLogprobs>> {
         let slot = 0;
         self.prepare_kv_slot(slot, true, plan.required_positions)?;
         self.program.activate_kv_slot(slot)?;
@@ -435,7 +450,7 @@ impl ResidentMtpBatchGenerator {
             return Err(error);
         }
 
-        let scored = self.score_prompts_with_common_prefix(prompts, &plan, slot);
+        let scored = self.score_prompts_with_common_prefix(prompts, plan, slot);
         let recycled = self.program.recycle_kv_slot(&self.stream, slot);
         self.retained[slot] = None;
         self.message_boundary_valid[slot] = false;
@@ -444,6 +459,198 @@ impl ResidentMtpBatchGenerator {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
         }
+    }
+
+    fn score_prompts_with_parallel_suffixes(
+        &mut self,
+        prompts: &[Vec<u32>],
+        plan: &PromptScoringBatchPlan,
+    ) -> EngineResult<Vec<PromptLogprobs>> {
+        let slots = self.select_scoring_slots(prompts.len());
+        let mut activated = Vec::with_capacity(slots.len());
+        for &slot in &slots {
+            if let Err(error) = self.prepare_kv_slot(slot, true, plan.required_positions) {
+                let _ = self.recycle_scoring_slots(&activated);
+                return Err(error);
+            }
+            if let Err(error) = self.program.activate_kv_slot(slot) {
+                let _ = self.recycle_scoring_slots(&activated);
+                return Err(error);
+            }
+            activated.push(slot);
+            if let Err(error) =
+                self.program
+                    .reserve_kv_slot_tokens(&self.stream, slot, plan.required_positions)
+            {
+                let _ = self.recycle_scoring_slots(&activated);
+                return Err(error);
+            }
+        }
+
+        let scored = self.score_prompts_in_parallel_slots(prompts, plan, &slots);
+        let recycled = self.recycle_scoring_slots(&activated);
+        match (scored, recycled) {
+            (Ok(scored), Ok(_)) => Ok(scored),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn score_prompts_in_parallel_slots(
+        &mut self,
+        prompts: &[Vec<u32>],
+        plan: &PromptScoringBatchPlan,
+        slots: &[usize],
+    ) -> EngineResult<Vec<PromptLogprobs>> {
+        let common = plan.shared_boundary;
+        let source_slot = slots[0];
+        self.program
+            .target()
+            .load_slot_routes(&self.stream, &[source_slot])?;
+        let (common_scores, boundary_scores) = self.score_shared_prefix_in_slot(
+            &prompts[0][..common],
+            prompts,
+            &plan.shared_routes,
+            source_slot,
+        )?;
+        for &destination_slot in &slots[1..] {
+            self.program.target().copy_target_slot_prefix(
+                &self.stream,
+                source_slot,
+                destination_slot,
+                common,
+            )?;
+        }
+        self.program
+            .target()
+            .load_slot_routes(&self.stream, slots)?;
+
+        let mut prompt_scores = boundary_scores
+            .into_iter()
+            .map(|boundary_score| {
+                let mut scores = common_scores.clone();
+                scores.push(Some(boundary_score));
+                scores.resize(plan.required_positions, None);
+                scores
+            })
+            .collect::<Vec<_>>();
+        let mut completions = vec![None; prompts.len()];
+        let primed = plan.required_positions - 1;
+        for cursor in common..=primed {
+            self.replay_prompt_scoring_batch(prompts, slots, cursor)?;
+            self.program.target().read_logits_into(
+                &self.stream,
+                prompts.len(),
+                &mut self.target_logits[target_download_logits(prompts.len())],
+            )?;
+            for lane in 0..prompts.len() {
+                let row = &self.target_logits[target_download_row(lane)];
+                if cursor < primed {
+                    prompt_scores[lane][cursor + 1] =
+                        Some(score_logit_row(row, prompts[lane][cursor + 1])?);
+                } else {
+                    completions[lane] = Some(score_greedy_row(row)?);
+                }
+            }
+        }
+
+        prompts
+            .iter()
+            .zip(prompt_scores)
+            .zip(completions)
+            .map(|((prompt, scores), completion)| {
+                finish_prompt_logprobs(
+                    &self.frontend,
+                    prompt,
+                    scores,
+                    completion.ok_or_else(|| {
+                        EngineError::generation("parallel prompt scoring produced no completion")
+                    })?,
+                )
+            })
+            .collect()
+    }
+
+    fn replay_prompt_scoring_batch(
+        &mut self,
+        prompts: &[Vec<u32>],
+        slots: &[usize],
+        cursor: usize,
+    ) -> EngineResult<()> {
+        if prompts.len() != slots.len() {
+            return Err(EngineError::layout(
+                "parallel prompt scoring prompt and slot batches differ",
+            ));
+        }
+        let batch = prompts.len();
+        let position = u32::try_from(cursor)
+            .map_err(|_| EngineError::generation("prompt scoring position exceeds u32"))?;
+        let (cosine, sine) = text_rope(position);
+        let mut tokens = [0u32; MAX_BATCH];
+        let positions = [position; MAX_BATCH];
+        let mut rope_cos = [0.0f32; MAX_BATCH * ROTARY_PAIRS];
+        let mut rope_sin = [0.0f32; MAX_BATCH * ROTARY_PAIRS];
+        for lane in 0..batch {
+            tokens[lane] = prompts[lane][cursor];
+            let begin = lane * ROTARY_PAIRS;
+            rope_cos[begin..begin + ROTARY_PAIRS].copy_from_slice(&cosine);
+            rope_sin[begin..begin + ROTARY_PAIRS].copy_from_slice(&sine);
+        }
+
+        self.program
+            .target_mut()
+            .stage_embeddings(&self.stream, &tokens[..batch])?;
+        let route = self.program.target().load_decode_state(
+            &self.stream,
+            batch,
+            &positions[..batch],
+            &rope_cos[..batch * ROTARY_PAIRS],
+            &rope_sin[..batch * ROTARY_PAIRS],
+        )?;
+        self.program.target().replay(&self.stream, route)
+    }
+
+    fn parallel_scoring_has_capacity(
+        &self,
+        batch: usize,
+        required_positions: usize,
+    ) -> EngineResult<bool> {
+        let required_pages = required_positions
+            .div_ceil(ATTENTION_PAGE_SIZE)
+            .checked_mul(batch)
+            .ok_or_else(|| EngineError::generation("parallel scoring KV pages overflow"))?;
+        let mut available_pages = self.program.kv_free_pages();
+        for slot in 0..MAX_BATCH {
+            available_pages = available_pages
+                .checked_add(self.program.kv_slot_pages(slot)?)
+                .ok_or_else(|| EngineError::generation("parallel scoring KV pages overflow"))?;
+        }
+        Ok(required_pages <= available_pages)
+    }
+
+    fn select_scoring_slots(&self, batch: usize) -> Vec<usize> {
+        let mut slots = (0..MAX_BATCH).collect::<Vec<_>>();
+        slots.sort_by_key(|&slot| {
+            self.retained[slot]
+                .as_ref()
+                .map_or((0, 0, slot), |retained| (1, retained.last_used, slot))
+        });
+        slots.truncate(batch);
+        slots
+    }
+
+    fn recycle_scoring_slots(&mut self, slots: &[usize]) -> EngineResult<()> {
+        let mut first_error = None;
+        for &slot in slots {
+            if let Err(error) = self.program.recycle_kv_slot(&self.stream, slot)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            self.retained[slot] = None;
+            self.message_boundary_valid[slot] = false;
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn score_prompts_with_common_prefix(
@@ -2526,6 +2733,13 @@ fn plan_prompt_scoring_batch<T: AsRef<[u32]>>(prompts: &[T]) -> PromptScoringBat
     }
 }
 
+fn parallel_prompt_scoring_admitted(plan: &PromptScoringBatchPlan, batch: usize) -> bool {
+    let suffix_tokens = plan.required_positions.saturating_sub(plan.shared_boundary);
+    (2..=MAX_BATCH).contains(&batch)
+        && plan.shared_boundary != 0
+        && (1..=PARALLEL_SCORING_SUFFIX_TOKENS).contains(&suffix_tokens)
+}
+
 fn prompt_scoring_routes(prompt_tokens: usize) -> Vec<usize> {
     let primed = prompt_tokens - 1;
     let mut routes = Vec::new();
@@ -2681,8 +2895,9 @@ fn compact_hidden_row(row_index: usize) -> std::ops::Range<usize> {
 mod tests {
     use super::{
         ATTENTION_PAGE_SIZE, DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, NormalizedLogitRow,
-        RetainedMtpSlot, RetainedReuse, TARGET_LOGIT_ROWS, best_retained_prefix,
-        longest_common_token_prefix, plan_prompt_scoring_batch, prompt_scoring_routes,
+        PARALLEL_SCORING_SUFFIX_TOKENS, PromptScoringBatchPlan, RetainedMtpSlot, RetainedReuse,
+        TARGET_LOGIT_ROWS, best_retained_prefix, longest_common_token_prefix,
+        parallel_prompt_scoring_admitted, plan_prompt_scoring_batch, prompt_scoring_routes,
         score_greedy_row, score_logit_row, target_download_logits, target_download_row,
         validate_prompt_scoring_batch,
     };
@@ -2753,6 +2968,32 @@ mod tests {
                 .common_prefix,
             2
         );
+    }
+
+    #[test]
+    fn parallel_prompt_scoring_inventory_is_exact_for_short_suffixes() {
+        let admitted = PromptScoringBatchPlan {
+            common_prefix: 32,
+            shared_boundary: 32,
+            shared_routes: vec![32],
+            required_positions: 32 + PARALLEL_SCORING_SUFFIX_TOKENS,
+        };
+        assert!(!parallel_prompt_scoring_admitted(&admitted, 1));
+        for batch in 2..=MAX_BATCH {
+            assert!(parallel_prompt_scoring_admitted(&admitted, batch));
+        }
+        assert!(!parallel_prompt_scoring_admitted(&admitted, MAX_BATCH + 1));
+
+        let long_suffix = PromptScoringBatchPlan {
+            required_positions: admitted.required_positions + 1,
+            ..admitted
+        };
+        assert!(!parallel_prompt_scoring_admitted(&long_suffix, 4));
+        let no_shared_boundary = PromptScoringBatchPlan {
+            shared_boundary: 0,
+            ..long_suffix
+        };
+        assert!(!parallel_prompt_scoring_admitted(&no_shared_boundary, 4));
     }
 
     #[test]

@@ -26,8 +26,9 @@ server returns one indexed choice per prompt. Each choice contains prompt-aligne
 token has a null logprob because it has no causal predecessor. Unsupported completions modes are
 rejected rather than silently mapped to chat generation.
 
-The route requires an idle generation scheduler. It evicts retained prefix slot zero for scratch
-ownership. Other inactive prefixes survive when the shared KV pool has enough free pages; the
+The route requires an idle generation scheduler. Short equal-length batches select vacant slots
+before the oldest retained prefixes and may use one slot per choice. The sequential fallback uses
+slot zero. Other inactive prefixes survive when the shared KV pool has enough free pages; the
 normal inactive-prefix eviction policy applies under page pressure. A scoring request received
 during active generation returns a retryable capacity error.
 
@@ -78,21 +79,31 @@ workspace:
 2. Project retained normalized rows through the existing exact LM-head B=1..8 routes.
 3. Compute the selected-token and greedy-token natural-log probabilities from represented BF16
    logits with a stable FP64 host reduction.
-4. Score the residual tail shorter than 32 tokens with existing B=1 decode graphs.
-5. Replay the final prompt token once and return its greedy next token as the one completion token
-   expected by lm-eval.
+4. For an equal-length B=2..8 batch with at most 32 suffix tokens, copy the exact target FP8 KV and
+   BF16/FP32 recurrent boundary on device into distinct reserved slots.
+5. Score each divergent token position, including the final completion row, with the existing
+   exact B=2..8 target decode graph. Other tails retain the existing native-prefill and B=1
+   fallback.
 
 No checkpoint tensor is converted and no new device kernel or generated symbol is introduced.
 The scoring path adds LM-head launches and device-to-host logit traffic only while evaluation is
 explicitly requested; it does not alter chat TTFT or decode.
 
 For an equal-length prompt batch, the resident scorer may replay the longest exact shared route
-prefix once, capture its recurrent state, and restore that state for each suffix. Reuse requires
-the complete prompt reservations and route segments to be identical, and stops before the final
-completion replay. Unequal lengths and batches whose shared route would include the T=1024 macro
-tile use independent scoring. This keeps the optimization on the qualified MMLU-sized route while
-the separate ignored `resident_mtp_batch_t1024_macro_scoring_repeatability_acceptance` documents
-the ordinary macro-scoring repeatability condition that remains open.
+prefix once. When the divergent suffix has 1..=32 tokens and the shared KV pool can reserve every
+lane, the scorer copies the exact target KV and recurrent boundary device-to-device, then replays
+the suffix through one B-wide decode transaction per token position. These graphs execute the same
+target layers and kernels as response generation, but scoring does not exercise the MTP draft or
+segmented verification scheduler. MTP cache state is therefore not part of this target-only
+boundary. No new device kernel or generated symbol is introduced.
+
+Reuse requires identical complete prompt reservations and route segments, and stops before the
+final completion replay. Longer suffixes keep the prefill-aware sequential restore path, and a
+batch that cannot fund every lane also falls back rather than losing the existing context
+capacity. Unequal lengths and batches whose shared route would include the T=1024 macro tile use
+independent scoring. The separate ignored
+`resident_mtp_batch_t1024_macro_scoring_repeatability_acceptance` documents the ordinary
+macro-scoring repeatability condition that remains open.
 
 ## Qualification before merge
 
@@ -102,9 +113,9 @@ row, compare the selected logprob, greedy token, and greedy logprob with an inde
 softmax over the production BF16 logits.
 
 Shared-prefix qualification separately compares the optimized batch with complete independent
-scoring at the admitted seams through a 1023-token common prefix. It includes equal-length
-multi-token suffixes and requires exact equality at every observable response field. The suite
-filter also selects its benchmark-accounting sibling:
+B=1 scoring at the admitted seams through a 1023-token common prefix. It covers the parallel
+suffix inventory B=2..8, includes equal-length multi-token suffixes, and requires exact equality at
+every observable response field. The suite filter also selects its benchmark-accounting sibling:
 
 ```bash
 cargo run -p xtask -- qualify-generation-mtp-batch "$SNAPSHOT"
