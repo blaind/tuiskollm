@@ -2461,6 +2461,23 @@ fn longest_common_token_prefix<T: AsRef<[u32]>>(prompts: &[T]) -> usize {
 
 fn plan_prompt_scoring_batch<T: AsRef<[u32]>>(prompts: &[T]) -> PromptScoringBatchPlan {
     let common_prefix = longest_common_token_prefix(prompts);
+    let required_positions = prompts
+        .iter()
+        .map(|prompt| prompt.as_ref().len())
+        .max()
+        .expect("validated prompt scoring batch is nonempty");
+    let reserved_pages = prompts[0].as_ref().len().div_ceil(ATTENTION_PAGE_SIZE);
+    if prompts
+        .iter()
+        .any(|prompt| prompt.as_ref().len().div_ceil(ATTENTION_PAGE_SIZE) != reserved_pages)
+    {
+        return PromptScoringBatchPlan {
+            common_prefix,
+            shared_boundary: 0,
+            shared_routes: Vec::new(),
+            required_positions,
+        };
+    }
     let routes = prompts
         .iter()
         .map(|prompt| prompt_scoring_routes(prompt.as_ref().len()))
@@ -2497,11 +2514,7 @@ fn plan_prompt_scoring_batch<T: AsRef<[u32]>>(prompts: &[T]) -> PromptScoringBat
         common_prefix,
         shared_boundary,
         shared_routes,
-        required_positions: prompts
-            .iter()
-            .map(|prompt| prompt.as_ref().len())
-            .max()
-            .expect("validated prompt scoring batch is nonempty"),
+        required_positions,
     }
 }
 
@@ -2741,6 +2754,21 @@ mod tests {
         assert_eq!(plan.required_positions, 1_025);
         assert_eq!(plan.shared_boundary.div_ceil(ATTENTION_PAGE_SIZE), 16);
         assert_eq!(plan.required_positions.div_ceil(ATTENTION_PAGE_SIZE), 17);
+    }
+
+    #[test]
+    fn prompt_scoring_batch_does_not_share_across_independent_page_counts() {
+        let shorter = vec![7; 129];
+        let longer = vec![7; 193];
+        assert_eq!(prompt_scoring_routes(shorter.len())[..1], [128]);
+        assert_eq!(prompt_scoring_routes(longer.len())[..1], [128]);
+
+        let plan = plan_prompt_scoring_batch(&[shorter, longer]);
+
+        assert_eq!(plan.common_prefix, 129);
+        assert_eq!(plan.shared_boundary, 0);
+        assert!(plan.shared_routes.is_empty());
+        assert_eq!(plan.required_positions, 193);
     }
 
     #[test]
