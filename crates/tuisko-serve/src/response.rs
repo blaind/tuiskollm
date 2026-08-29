@@ -15,6 +15,7 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc::{Receiver, channel};
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tuisko_engine::GeneratedText;
+use tuisko_frontend::ToolCallConstraintSpec;
 
 // Bounded so a connected-but-stalled client backpressures the pump instead of buffering
 // the whole generation in RAM.
@@ -108,12 +109,33 @@ struct PromptTokensDetails {
 
 /// Collects one generation channel into an OpenAI blocking response.
 pub async fn blocking_response(
+    replies: Receiver<GenerationReply>,
+    id: String,
+    created: u64,
+    model_id: &'static str,
+    split_reasoning: bool,
+    parse_tools: bool,
+) -> Response {
+    blocking_response_with_constraint(
+        replies,
+        id,
+        created,
+        model_id,
+        split_reasoning,
+        parse_tools,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn blocking_response_with_constraint(
     mut replies: Receiver<GenerationReply>,
     id: String,
     created: u64,
     model_id: &'static str,
     split_reasoning: bool,
     parse_tools: bool,
+    tool_constraint: Option<Arc<ToolCallConstraintSpec>>,
 ) -> Response {
     let mut text = String::new();
     while let Some(reply) = replies.recv().await {
@@ -124,7 +146,25 @@ pub async fn blocking_response(
                 cached_prompt_tokens,
             } => {
                 debug_assert_eq!(text, output.text, "streamed and terminal text diverged");
-                let parsed = crate::parse_assistant_output(&text, split_reasoning, parse_tools);
+                let parsed = match tool_constraint.clone() {
+                    Some(constraint) => crate::parse_assistant_output_constrained(
+                        &text,
+                        split_reasoning,
+                        constraint,
+                        output.finish_reason == tuisko_engine::FinishReason::Length,
+                    ),
+                    None => crate::parse_assistant_output(&text, split_reasoning, parse_tools),
+                };
+                if parsed.malformed_tool_call {
+                    eprintln!(
+                        "TuiskoLLM request {id}: generated tool call violated its admitted structural constraint"
+                    );
+                    return openai_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "generated tool call violated its admitted structural constraint".into(),
+                        "server_error",
+                    );
+                }
                 let mut message = json!({
                     "role": "assistant",
                     "content": if parsed.tool_calls.is_empty() || !parsed.content.is_empty() {
@@ -204,6 +244,7 @@ pub fn streaming_response(
         parse_tools,
         include_usage,
         connection,
+        None,
     )
 }
 
@@ -227,6 +268,31 @@ pub(crate) fn connected_streaming_response(
         parse_tools,
         include_usage,
         connection,
+        None,
+    )
+}
+
+pub(crate) fn connected_streaming_response_with_constraint(
+    replies: Receiver<GenerationReply>,
+    id: String,
+    created: u64,
+    model_id: &'static str,
+    split_reasoning: bool,
+    include_usage: bool,
+    connection: ClientConnection,
+    tool_constraint: Arc<ToolCallConstraintSpec>,
+) -> Response {
+    streaming_response_with_connection(
+        None,
+        replies,
+        id,
+        created,
+        model_id,
+        split_reasoning,
+        true,
+        include_usage,
+        connection,
+        Some(tool_constraint),
     )
 }
 
@@ -240,6 +306,7 @@ fn streaming_response_with_connection(
     parse_tools: bool,
     include_usage: bool,
     connection: ClientConnection,
+    tool_constraint: Option<Arc<ToolCallConstraintSpec>>,
 ) -> Response {
     let (events_tx, events_rx) = channel::<Result<Event, Infallible>>(STREAM_EVENT_BUFFER);
     tokio::spawn(async move {
@@ -261,7 +328,10 @@ fn streaming_response_with_connection(
             return;
         }
 
-        let mut parser = AssistantStreamParser::new(split_reasoning, parse_tools);
+        let mut parser = match tool_constraint {
+            Some(constraint) => AssistantStreamParser::with_constraint(split_reasoning, constraint),
+            None => AssistantStreamParser::new(split_reasoning, parse_tools),
+        };
         let mut terminal = false;
         let mut next = first;
         loop {
@@ -287,7 +357,24 @@ fn streaming_response_with_connection(
                     cached_prompt_tokens,
                 } => {
                     terminal = true;
-                    let parsed = parser.finish();
+                    let parsed = parser.finish_with_truncation(
+                        output.finish_reason == tuisko_engine::FinishReason::Length,
+                    );
+                    if parsed.malformed_tool_call {
+                        eprintln!(
+                            "TuiskoLLM request {id}: generated tool call violated its admitted structural constraint"
+                        );
+                        let event = json!({
+                            "error": {
+                                "message": "generated tool call violated its admitted structural constraint",
+                                "type": "server_error"
+                            }
+                        });
+                        let _ = events_tx
+                            .send(Ok(Event::default().data(event.to_string())))
+                            .await;
+                        return;
+                    }
                     if let Some(event) =
                         assistant_delta_event(&id, created, model_id, parsed.delta, include_usage)
                         && events_tx.send(Ok(event)).await.is_err()
@@ -543,15 +630,19 @@ fn stream_chunk(mut chunk: Value, include_usage: bool) -> Value {
 mod tests {
     use super::{
         ClientConnection, ClientStatus, GenerationReply, STREAM_EVENT_BUFFER, blocking_response,
-        connected_streaming_response, tool_call_id,
+        blocking_response_with_constraint, connected_streaming_response,
+        connected_streaming_response_with_constraint, tool_call_id,
     };
     use axum::body::to_bytes;
     use axum::http::{StatusCode, header};
     use serde_json::{Value, json};
+    use std::sync::Arc;
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::{channel, error::TrySendError};
     use tuisko_engine::{FinishReason, GeneratedText};
-    use tuisko_frontend::PromptEncoding;
+    use tuisko_frontend::{
+        PromptEncoding, ToolCallConstraintSpec, ToolConstraintSpec, ToolParameterSpec,
+    };
 
     const TEST_MODEL: &str = "test/exact-model";
 
@@ -572,6 +663,19 @@ mod tests {
 
     fn connection() -> ClientConnection {
         ClientStatus::connected().1
+    }
+
+    fn bash_constraint() -> Arc<ToolCallConstraintSpec> {
+        Arc::new(
+            ToolCallConstraintSpec::new(vec![
+                ToolConstraintSpec::new(
+                    "bash".into(),
+                    vec![ToolParameterSpec::new("command".into(), true).unwrap()],
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        )
     }
 
     async fn body(response: axum::response::Response) -> String {
@@ -636,6 +740,72 @@ mod tests {
                     "total_tokens": 5
                 })
             );
+        });
+    }
+
+    #[test]
+    fn blocking_constraint_discards_a_length_truncated_tool_span() {
+        runtime().block_on(async {
+            let text = "prefix<tool_call><function=bash><parameter=command>ls";
+            let (sender, receiver) = channel(8);
+            sender
+                .try_send(GenerationReply::Delta(text.into()))
+                .unwrap();
+            sender
+                .try_send(GenerationReply::Done {
+                    output: output(text, FinishReason::Length),
+                    cached_prompt_tokens: 2,
+                })
+                .unwrap();
+
+            let response = blocking_response_with_constraint(
+                receiver,
+                "id".into(),
+                1,
+                TEST_MODEL,
+                false,
+                true,
+                Some(bash_constraint()),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let value: Value = serde_json::from_str(&body(response).await).unwrap();
+            assert_eq!(value["choices"][0]["message"]["content"], "prefix");
+            assert!(value["choices"][0]["message"].get("tool_calls").is_none());
+            assert_eq!(value["choices"][0]["finish_reason"], "length");
+        });
+    }
+
+    #[test]
+    fn blocking_constraint_reports_malformed_output_as_server_error() {
+        runtime().block_on(async {
+            let text = "<tool_call><function=command></function></tool_call>";
+            let (sender, receiver) = channel(8);
+            sender
+                .try_send(GenerationReply::Delta(text.into()))
+                .unwrap();
+            sender
+                .try_send(GenerationReply::Done {
+                    output: output(text, FinishReason::Stop),
+                    cached_prompt_tokens: 2,
+                })
+                .unwrap();
+
+            let response = blocking_response_with_constraint(
+                receiver,
+                "id".into(),
+                1,
+                TEST_MODEL,
+                false,
+                true,
+                Some(bash_constraint()),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let value: Value = serde_json::from_str(&body(response).await).unwrap();
+            assert_eq!(value["error"]["type"], "server_error");
         });
     }
 
@@ -707,6 +877,39 @@ mod tests {
                 events[4]["usage"]["prompt_tokens_details"]["cached_tokens"],
                 2
             );
+        });
+    }
+
+    #[test]
+    fn streaming_constraint_discards_a_length_truncated_tool_span() {
+        runtime().block_on(async {
+            let text = "prefix<tool_call><function=bash><parameter=command>ls";
+            let (sender, receiver) = channel(8);
+            sender
+                .try_send(GenerationReply::Delta(text.into()))
+                .unwrap();
+            sender
+                .try_send(GenerationReply::Done {
+                    output: output(text, FinishReason::Length),
+                    cached_prompt_tokens: 2,
+                })
+                .unwrap();
+            let response = connected_streaming_response_with_constraint(
+                receiver,
+                "id".into(),
+                1,
+                TEST_MODEL,
+                false,
+                false,
+                connection(),
+                bash_constraint(),
+            );
+
+            let body = body(response).await;
+            assert!(body.contains(r#""content":"prefix""#), "{body}");
+            assert!(body.contains(r#""finish_reason":"length""#), "{body}");
+            assert!(!body.contains("<tool_call>"));
+            assert!(body.contains("data: [DONE]"));
         });
     }
 
