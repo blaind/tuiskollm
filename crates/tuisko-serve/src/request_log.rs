@@ -24,6 +24,17 @@ pub(crate) struct RequestLog {
     route: &'static str,
 }
 
+pub(crate) struct ScoringRequestLog {
+    id: u64,
+    accepted: Instant,
+    accepted_offset: Duration,
+    batch: usize,
+    prompt_tokens: usize,
+    min_prompt_tokens: usize,
+    max_prompt_tokens: usize,
+    common_prefix_tokens: usize,
+}
+
 impl RequestLog {
     pub(crate) fn new(
         id: u64,
@@ -238,6 +249,132 @@ impl RequestLog {
     }
 }
 
+impl ScoringRequestLog {
+    pub(crate) fn new(
+        id: u64,
+        accepted: Instant,
+        server_started: Instant,
+        prompts: &[Vec<u32>],
+    ) -> Self {
+        let prompt_tokens = prompts.iter().map(Vec::len).sum();
+        let min_prompt_tokens = prompts.iter().map(Vec::len).min().unwrap_or_default();
+        let max_prompt_tokens = prompts.iter().map(Vec::len).max().unwrap_or_default();
+        let common_prefix_tokens = prompts
+            .first()
+            .map_or(0, |first| {
+                first
+                    .iter()
+                    .enumerate()
+                    .take_while(|(index, token)| {
+                        prompts
+                            .iter()
+                            .skip(1)
+                            .all(|prompt| prompt.get(*index) == Some(*token))
+                    })
+                    .count()
+            })
+            .min(min_prompt_tokens);
+
+        Self {
+            id,
+            accepted,
+            accepted_offset: accepted.saturating_duration_since(server_started),
+            batch: prompts.len(),
+            prompt_tokens,
+            min_prompt_tokens,
+            max_prompt_tokens,
+            common_prefix_tokens,
+        }
+    }
+
+    pub(crate) fn finish(
+        self,
+        scoring_started: Option<Instant>,
+        finish_reason: &str,
+        error: Option<&str>,
+    ) {
+        let stderr = std::io::stderr();
+        let color = stderr.is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        let mut stderr = stderr.lock();
+        let _ = writeln!(
+            stderr,
+            "{}",
+            self.render_at(Instant::now(), scoring_started, finish_reason, error, color,)
+        );
+    }
+
+    fn render_at(
+        &self,
+        finished: Instant,
+        scoring_started: Option<Instant>,
+        finish_reason: &str,
+        error: Option<&str>,
+        color: bool,
+    ) -> String {
+        let total = finished.saturating_duration_since(self.accepted);
+        let queue = scoring_started
+            .unwrap_or(finished)
+            .saturating_duration_since(self.accepted);
+        let scoring = scoring_started.map(|started| finished.saturating_duration_since(started));
+        let outputs = usize::from(error.is_none()) * self.batch;
+        let (request_color, reset) = if color {
+            ("\x1b[1;36m", "\x1b[0m")
+        } else {
+            ("", "")
+        };
+        let mut details = vec![
+            format!(
+                "accepted +{}",
+                compact_seconds(self.accepted_offset.as_secs_f64() * 1_000.0)
+            ),
+            format!("queue {:.1}ms", queue.as_secs_f64() * 1_000.0),
+        ];
+        if let Some(scoring) = scoring {
+            let tokens_per_second = if scoring.is_zero() {
+                0.0
+            } else {
+                self.prompt_tokens as f64 / scoring.as_secs_f64()
+            };
+            details.push(format!(
+                "score {} ({} tok/s)",
+                compact_seconds(scoring.as_secs_f64() * 1_000.0),
+                compact_count(tokens_per_second.round() as usize),
+            ));
+        }
+        details.push(format!(
+            "lengths {}..{}",
+            compact_count(self.min_prompt_tokens),
+            compact_count(self.max_prompt_tokens),
+        ));
+        if self.batch > 1 {
+            let common_percent = if self.min_prompt_tokens == 0 {
+                0.0
+            } else {
+                100.0 * self.common_prefix_tokens as f64 / self.min_prompt_tokens as f64
+            };
+            details.push(format!(
+                "common {}/{} ({common_percent:.1}%)",
+                compact_count(self.common_prefix_tokens),
+                compact_count(self.min_prompt_tokens),
+            ));
+        }
+        details.push("route prompt-scoring".into());
+        if let Some(error) = error {
+            details.push(format!("error {}", error.replace(['\r', '\n'], " ")));
+        }
+
+        format!(
+            "{request_color}REQUEST{reset} {:<7} B{} · {} prompt · {} output · {} · {finish_reason}\n                {}",
+            self.id,
+            self.batch,
+            compact_count(self.prompt_tokens),
+            compact_count(outputs),
+            compact_seconds(total.as_secs_f64() * 1_000.0),
+            details.join(" · "),
+        )
+    }
+}
+
 fn compact_count(value: usize) -> String {
     if value >= 1_000_000 {
         format!("{:.1}M", value as f64 / 1_000_000.0)
@@ -254,7 +391,7 @@ fn compact_seconds(milliseconds: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::RequestLog;
+    use super::{RequestLog, ScoringRequestLog};
     use std::time::{Duration, Instant};
     use tuisko_engine::{FinishReason, GeneratedText, ResidentMtpGenerationStats};
     use tuisko_frontend::{PromptEncoding, PromptEncodingMetrics};
@@ -383,5 +520,47 @@ mod tests {
 
         assert!(line.contains("BPE tail 100 miss:cache-empty"));
         assert!(line.contains(" · stop\n"));
+    }
+
+    #[test]
+    fn scoring_line_reports_batch_prefix_queue_and_throughput_without_contents() {
+        let started = Instant::now();
+        let accepted = started + Duration::from_millis(125);
+        let scoring_started = accepted + Duration::from_millis(10);
+        let prompts = vec![vec![1, 2, 3, 4], vec![1, 2, 3, 5]];
+        let log = ScoringRequestLog::new(11, accepted, started, &prompts);
+        let line = log.render_at(
+            scoring_started + Duration::from_millis(40),
+            Some(scoring_started),
+            "length",
+            None,
+            false,
+        );
+
+        assert_eq!(
+            line,
+            "REQUEST 11      B2 · 8 prompt · 2 output · 0.1s · length\n                accepted +0.1s · queue 10.0ms · score 0.0s (200 tok/s) · lengths 4..4 · common 3/4 (75.0%) · route prompt-scoring"
+        );
+        assert!(!line.contains("[1, 2, 3"));
+    }
+
+    #[test]
+    fn rejected_scoring_line_sanitizes_errors_and_has_no_score_phase() {
+        let started = Instant::now();
+        let log = ScoringRequestLog::new(12, started, started, &[vec![7, 8]]);
+        let line = log.render_at(
+            started + Duration::from_millis(3),
+            None,
+            "error",
+            Some("capacity\nrefused"),
+            false,
+        );
+
+        assert!(line.contains("B1 · 2 prompt · 0 output · 0.0s · error"));
+        assert!(line.contains("queue 3.0ms · lengths 2..2 · route prompt-scoring"));
+        assert!(line.ends_with("error capacity refused"));
+        assert!(!line.contains("score "));
+        assert!(!line.contains("common"));
+        assert!(!line.contains('\r'));
     }
 }

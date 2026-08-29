@@ -72,7 +72,9 @@ targets, not fallback servers. Vision is not served yet.
   releasing all target/MTP arena backing. Resume reloads represented weights from the admitted
   snapshot at the retained graph addresses before restoring the mirror. Exact-model park/resume
   device qualification remains pending.
-- Request logs with queue-inclusive latency, TTFT, decode rate, cache reuse, and route identity.
+- Content-free request logs with route-specific timing: generation reports queue-inclusive latency,
+  TTFT, decode rate, and cache reuse; prompt scoring reports batch shape, common prefix, queue and
+  scoring time, and scoring throughput.
 
 ## Build from source
 
