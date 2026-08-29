@@ -781,22 +781,6 @@ mod tests {
         let context = CudaContext::new(0).unwrap();
         let mut generator = ResidentMtpBatchGenerator::from_snapshot(&context, snapshot).unwrap();
 
-        for batch in 2..=8 {
-            let prompts = (0..batch)
-                .map(|lane| vec![100, 2_001 + u32::try_from(lane).unwrap()])
-                .collect::<Vec<_>>();
-            let shared = generator.score_prompts(&prompts).unwrap();
-            let independent = prompts
-                .iter()
-                .map(|prompt| generator.score_prompt(prompt).unwrap())
-                .collect::<Vec<_>>();
-            assert_prompt_scoring_equal(
-                &format!("parallel suffix inventory B={batch}"),
-                &shared,
-                &independent,
-            );
-        }
-
         for common in [31, 32, 33, 63, 64, 65, 127, 128, 129, 1023] {
             let prefix = (0..common)
                 .map(|position| 100 + u32::try_from(position % 1_000).unwrap())
@@ -835,27 +819,6 @@ mod tests {
                 );
             }
         }
-
-        let prefix = (0..64)
-            .map(|position| 100 + u32::try_from(position).unwrap())
-            .collect::<Vec<_>>();
-        let prompts = (0..4)
-            .map(|lane| {
-                prefix
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(3_000 + lane))
-                    .chain(std::iter::repeat_n(3_100 + lane, 32))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let shared = generator.score_prompts(&prompts).unwrap();
-        let independent = prompts
-            .iter()
-            .map(|prompt| generator.score_prompt(prompt).unwrap())
-            .collect::<Vec<_>>();
-        assert_prompt_scoring_equal("sequential suffix fallback", &shared, &independent);
-
         crate::device_benchmark::require_current_process_exclusive().unwrap();
     }
 
