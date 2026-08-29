@@ -131,6 +131,16 @@ See `docs/performance.md` for commands and measurement semantics.
 
 ## Verification
 
+In a fresh checkout, bootstrap the pinned CUDA Oxide toolchain before building or checking the
+workspace:
+
+```bash
+cargo run -p xtask -- bootstrap-cuda-oxide
+```
+
+Use `cargo run -p xtask -- build-server` for a finalized server binary. A plain `cargo build` does
+not finalize the embedded device artifacts; see `README.md` for the complete build prerequisites.
+
 Run the host checks relevant to every change:
 
 ```bash
