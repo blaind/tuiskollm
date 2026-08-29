@@ -103,6 +103,25 @@ prompt lengths vary substantially, so reserve additional time and run the full g
 an exclusive GPU window. Pin `--num_fewshot 0` or `5` explicitly; otherwise a harness-default
 change can alter both the quality result and duration.
 
+MMLU time is prompt scoring, not a one-token generation loop. Each of a question's four choice
+prompts is scored independently. The engine replays native prefill tiles, uses B=1 target decode
+graphs only for the residual tail shorter than 32 tokens and the final greedy-token row, and then
+projects and downloads a full 248,320-entry BF16 logit row for every causal prompt position. Each
+download synchronizes the scoring stream, after which the host performs the stable FP64 softmax.
+
+Reconstructing the exact ten-question pilot prompts from the harness samples gives this diagnostic
+work inventory:
+
+| Setting | Mean tokens/choice | Prefill tiles/choice | Decode replays/choice | Downloaded logits | Host-softmax rows |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| zero-shot | 83.4 | 1.2 | 19.4 | 1.54 GiB | 3,336 |
+| five-shot | 369.4 | 3.6 | 17.4 | 6.83 GiB | 14,776 |
+
+The five-shot API phase increased from about 17 to 31 seconds while its residual decode count
+slightly decreased. The incremental cost is therefore tiled prefill plus the LM-head,
+device-to-host, and host-softmax scoring path. An exact percentage attribution still requires a
+directly instrumented scoring-owner benchmark; do not infer it from these request-level timings.
+
 Generation-only tasks continue to use `local-chat-completions` and
 `http://127.0.0.1:8000/v1/chat/completions`.
 
