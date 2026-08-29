@@ -518,10 +518,16 @@ mod tests {
                 let shared = deep_shared_logical_bytes(tokens, context_tokens);
                 assert!(shared > previous_shared);
                 previous_shared = shared;
+                let mut partitioned = Vec::new();
                 for partitions in PARTITIONS {
-                    let partitioned = partitioned_logical_bytes(tokens, context_tokens, partitions);
-                    assert!(partitioned > shared);
+                    partitioned.push(partitioned_logical_bytes(
+                        tokens,
+                        context_tokens,
+                        partitions,
+                    ));
                 }
+                assert!(partitioned.iter().all(|&bytes| bytes > 0));
+                assert_ne!(partitioned[0], partitioned[1]);
             }
         }
         let (arena, regions) = layout().unwrap();

@@ -522,6 +522,7 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
             NVFP4_DOWN_RESOURCE_BASELINE,
         ],
     ),
+    ("paged-gqa-deep-prefill", &[PAGED_GQA_RESOURCE_BASELINE]),
     ("qwen35-paged-gqa", &[QWEN35_PAGED_GQA_RESOURCE_BASELINE]),
     ("qwen36-paged-gqa", &[QWEN36_PAGED_GQA_RESOURCE_BASELINE]),
     (
