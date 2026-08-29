@@ -5,6 +5,6 @@ cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
 partial_registers=48,48,48,48,48,48,48,48
 reduction_registers=56,56,56,56,56,56,56,56
-mtp_partial_registers=96,111,111
+mtp_partial_registers=104,113,115
 mtp_reduction_registers=56,56,56
 shared_bytes=1024
