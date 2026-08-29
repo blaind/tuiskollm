@@ -1,6 +1,7 @@
 //! Exact full-attention operators for SM120.
 
 mod device;
+mod long_context_mtp_paged_gqa;
 mod long_context_paged_gqa;
 mod paged_gqa;
 mod qk_prepare;
@@ -18,6 +19,7 @@ pub mod shared_device {
     };
 }
 
+pub use long_context_mtp_paged_gqa::LongContextMtpPagedGqaOp;
 pub use long_context_paged_gqa::{
     LONG_CONTEXT_GQA_MAX_PARTITIONS, LONG_CONTEXT_GQA_MAX_TOKENS,
     LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE, LongContextPagedGqaOp,
@@ -62,6 +64,7 @@ pub fn kernel_ptx_names() -> Vec<&'static str> {
         .chain(paged_gqa::qwen36_fp8_paged_gqa_ptx_names())
         .chain(paged_gqa::qwen38_flash_next_paged_gqa_ptx_names())
         .chain(long_context_paged_gqa::long_context_paged_gqa_ptx_names())
+        .chain(long_context_mtp_paged_gqa::long_context_mtp_paged_gqa_ptx_names())
         .chain(qsa_selection::qwen38_flash_next_indexer_ptx_names())
         .collect()
 }
@@ -100,6 +103,8 @@ mod tests {
             vec![
                 ("attention_qk_prepare_exact", 8),
                 ("attention_qk_prepare_prefill_exact", 4),
+                ("long_context_mtp_paged_gqa_partial_exact", 3),
+                ("long_context_mtp_paged_gqa_reduce_exact", 3),
                 ("long_context_paged_gqa_partial_exact", 8),
                 ("long_context_paged_gqa_reduce_exact", 8),
                 ("paged_gqa_exact", 8),
@@ -135,6 +140,6 @@ mod tests {
                 ("qwen38_flash_next_paged_gqa_selected_exact", 8),
             ]
         );
-        assert_eq!(counts.values().sum::<usize>(), 206);
+        assert_eq!(counts.values().sum::<usize>(), 212);
     }
 }

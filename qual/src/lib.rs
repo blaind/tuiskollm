@@ -73,6 +73,10 @@ mod gdn_recurrence_benchmark;
 mod gdn_state_snapshot;
 mod harness;
 #[cfg(feature = "device")]
+mod long_context_mtp_paged_gqa;
+#[cfg(feature = "device")]
+mod long_context_mtp_paged_gqa_benchmark;
+#[cfg(feature = "device")]
 mod long_context_paged_gqa;
 #[cfg(feature = "device")]
 mod long_context_paged_gqa_benchmark;
@@ -480,6 +484,13 @@ pub use gdn_recurrence_benchmark::benchmark_gdn_recurrence;
 pub use gdn_state_snapshot::{
     GdnStateSnapshotQualification, GdnStateSnapshotQualificationError, qualify_gdn_state_snapshot,
 };
+#[cfg(feature = "device")]
+pub use long_context_mtp_paged_gqa::{
+    LongContextMtpPagedGqaQualification, LongContextMtpPagedGqaQualificationError,
+    qualify_long_context_mtp_paged_gqa,
+};
+#[cfg(feature = "device")]
+pub use long_context_mtp_paged_gqa_benchmark::benchmark_long_context_mtp_paged_gqa;
 #[cfg(feature = "device")]
 pub use long_context_paged_gqa::{
     LongContextPagedGqaQualification, LongContextPagedGqaQualificationError,

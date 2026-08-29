@@ -71,6 +71,10 @@ pub(crate) const LONG_CONTEXT_PARTITION_SIZE: usize = 256;
 pub(crate) const LONG_CONTEXT_MAX_TOKENS: usize = 220_000;
 pub(crate) const LONG_CONTEXT_MAX_PARTITIONS: usize =
     LONG_CONTEXT_MAX_TOKENS.div_ceil(LONG_CONTEXT_PARTITION_SIZE);
+pub(crate) const LONG_CONTEXT_MTP_THREADS: usize = 256;
+pub(crate) const LONG_CONTEXT_MTP_TILE: usize = PAGE_SIZE;
+pub(crate) const LONG_CONTEXT_MTP_SHARED_BYTES: usize = 2 * LONG_CONTEXT_MTP_TILE * 256;
+const LONG_CONTEXT_MTP_WARPS: usize = LONG_CONTEXT_MTP_THREADS / WARP_THREADS;
 
 #[inline(always)]
 unsafe fn load_e4m3x8(source: *const u8, scale: f32) -> [f32; VALUES_PER_LANE] {
@@ -2177,6 +2181,348 @@ pub(crate) unsafe fn long_context_paged_gqa_partial<A: Arch, const TOKENS: usize
     while element < VALUES_PER_LANE {
         unsafe { *numerator.add(element) = accumulator[element] };
         element += 1;
+    }
+}
+
+#[inline(always)]
+unsafe fn scan_long_context_mtp_tile(
+    query: &[f32; VALUES_PER_LANE],
+    shared: *const u8,
+    dimension: usize,
+    tile_position: usize,
+    tile_end: usize,
+    key_scale: f32,
+    value_scale: f32,
+    maximum: &mut f32,
+    denominator: &mut f32,
+    accumulator: &mut [f32; VALUES_PER_LANE],
+) {
+    let mut position = tile_position;
+    while position < tile_end {
+        let tile_element = (position - tile_position) * 256 + dimension;
+        let key = unsafe { load_e4m3x8(shared.add(tile_element), key_scale) };
+        let value = unsafe {
+            load_e4m3x8(
+                shared.add(LONG_CONTEXT_MTP_TILE * 256 + tile_element),
+                value_scale,
+            )
+        };
+        let mut score = 0.0f32;
+        let mut element = 0usize;
+        while element < VALUES_PER_LANE {
+            score = float::fma_rn_f32(query[element], key[element], score);
+            element += 1;
+        }
+        score = warp::reduce_sum_f32(score) * 0.0625;
+
+        if score > *maximum {
+            let old_scale = fast_exp(*maximum - score);
+            *denominator = *denominator * old_scale + 1.0;
+            *maximum = score;
+            element = 0;
+            while element < VALUES_PER_LANE {
+                accumulator[element] =
+                    float::fma_rn_f32(1.0, value[element], accumulator[element] * old_scale);
+                element += 1;
+            }
+        } else {
+            let weight = fast_exp(score - *maximum);
+            *denominator += weight;
+            element = 0;
+            while element < VALUES_PER_LANE {
+                accumulator[element] =
+                    float::fma_rn_f32(weight, value[element], accumulator[element]);
+                element += 1;
+            }
+        }
+        position += 1;
+    }
+}
+
+#[inline(always)]
+unsafe fn load_long_context_mtp_query<A: Arch>(
+    query: *const f32,
+    local_row: usize,
+    kv_head: usize,
+    dimension: usize,
+) -> [f32; VALUES_PER_LANE] {
+    let query_heads_per_kv = A::NUM_ATTENTION_HEADS / A::NUM_KV_HEADS;
+    let token = local_row / query_heads_per_kv;
+    let query_head = kv_head * query_heads_per_kv + local_row % query_heads_per_kv;
+    let source = unsafe {
+        query.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+    };
+
+    unsafe {
+        [
+            *source,
+            *source.add(1),
+            *source.add(2),
+            *source.add(3),
+            *source.add(4),
+            *source.add(5),
+            *source.add(6),
+            *source.add(7),
+        ]
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn store_long_context_mtp_partial<A: Arch>(
+    local_row: usize,
+    kv_head: usize,
+    partition: usize,
+    lane: usize,
+    dimension: usize,
+    maximum: f32,
+    denominator: f32,
+    accumulator: &[f32; VALUES_PER_LANE],
+    partial_maximum: *mut f32,
+    partial_denominator: *mut f32,
+    partial_numerator: *mut f32,
+) {
+    let query_heads_per_kv = A::NUM_ATTENTION_HEADS / A::NUM_KV_HEADS;
+    let token = local_row / query_heads_per_kv;
+    let query_head = kv_head * query_heads_per_kv + local_row % query_heads_per_kv;
+    let head_token = token * A::NUM_ATTENTION_HEADS + query_head;
+    let partial = head_token * LONG_CONTEXT_MAX_PARTITIONS + partition;
+    if lane == 0 {
+        unsafe {
+            *partial_maximum.add(partial) = maximum;
+            *partial_denominator.add(partial) = denominator;
+        }
+    }
+    let numerator = unsafe { partial_numerator.add(partial * A::HEAD_DIM + dimension) };
+    let mut element = 0usize;
+    while element < VALUES_PER_LANE {
+        unsafe { *numerator.add(element) = accumulator[element] };
+        element += 1;
+    }
+}
+
+/// Reuses one represented K/V tile across all provisional rows and six GQA heads.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: usize>(
+    query: *const f32,
+    key_pages: *const u8,
+    value_pages: *const u8,
+    block_tables: *const u32,
+    table_rows: *const u32,
+    table_stride: u32,
+    lengths: *const u32,
+    partial_maximum: *mut f32,
+    partial_denominator: *mut f32,
+    partial_numerator: *mut f32,
+    key_scale: f32,
+    value_scale: f32,
+    launched_partitions: u32,
+) {
+    let block = thread::blockIdx_x() as usize;
+    let launched_partitions = launched_partitions as usize;
+    let partition = block % launched_partitions;
+    let kv_head = block / launched_partitions;
+    if kv_head >= A::NUM_KV_HEADS {
+        return;
+    }
+
+    let mut maximum_length = 0usize;
+    let mut token = 0usize;
+    while token < TOKENS {
+        maximum_length = maximum_length.max(unsafe { *lengths.add(token) as usize });
+        token += 1;
+    }
+    let first_position = partition * LONG_CONTEXT_PARTITION_SIZE;
+    if first_position >= maximum_length {
+        return;
+    }
+
+    let tid = thread::threadIdx_x() as usize;
+    let warp_index = tid / WARP_THREADS;
+    let lane = tid & (WARP_THREADS - 1);
+    let dimension = lane * VALUES_PER_LANE;
+    let query_heads_per_kv = A::NUM_ATTENTION_HEADS / A::NUM_KV_HEADS;
+    let row_count = TOKENS * query_heads_per_kv;
+    let row0 = warp_index;
+    let row1 = warp_index + LONG_CONTEXT_MTP_WARPS;
+    let row2 = warp_index + 2 * LONG_CONTEXT_MTP_WARPS;
+
+    let query0 = unsafe { load_long_context_mtp_query::<A>(query, row0, kv_head, dimension) };
+    let query1 = if row1 < row_count {
+        unsafe { load_long_context_mtp_query::<A>(query, row1, kv_head, dimension) }
+    } else {
+        [0.0; VALUES_PER_LANE]
+    };
+    let query2 = if row2 < row_count {
+        unsafe { load_long_context_mtp_query::<A>(query, row2, kv_head, dimension) }
+    } else {
+        [0.0; VALUES_PER_LANE]
+    };
+    let length0 = unsafe { *lengths.add(row0 / query_heads_per_kv) as usize };
+    let length1 = if row1 < row_count {
+        unsafe { *lengths.add(row1 / query_heads_per_kv) as usize }
+    } else {
+        0
+    };
+    let length2 = if row2 < row_count {
+        unsafe { *lengths.add(row2 / query_heads_per_kv) as usize }
+    } else {
+        0
+    };
+
+    let mut accumulator0 = [0.0f32; VALUES_PER_LANE];
+    let mut accumulator1 = [0.0f32; VALUES_PER_LANE];
+    let mut accumulator2 = [0.0f32; VALUES_PER_LANE];
+    let mut maximum0 = -1.0e30f32;
+    let mut maximum1 = -1.0e30f32;
+    let mut maximum2 = -1.0e30f32;
+    let mut denominator0 = 0.0f32;
+    let mut denominator1 = 0.0f32;
+    let mut denominator2 = 0.0f32;
+
+    let table_row = unsafe { *table_rows as usize };
+    let block_table = unsafe { block_tables.add(table_row * table_stride as usize) };
+    let shared_words = DynamicSharedArray::<u32, 16>::get();
+    let shared = shared_words.cast::<u8>();
+    let plane_words = LONG_CONTEXT_MTP_TILE * A::HEAD_DIM / size_of::<u32>();
+    let chunks_per_plane = LONG_CONTEXT_MTP_TILE * (A::HEAD_DIM / 16);
+    let partition_end =
+        core::cmp::min(first_position + LONG_CONTEXT_PARTITION_SIZE, maximum_length);
+    let mut tile_position = first_position;
+
+    while tile_position < partition_end {
+        let physical_page = unsafe { *block_table.add(tile_position / PAGE_SIZE) as usize };
+        let mut task = tid;
+        while task < 2 * chunks_per_plane {
+            let plane = task / chunks_per_plane;
+            let within_plane = task - plane * chunks_per_plane;
+            let position_in_tile = within_plane / (A::HEAD_DIM / 16);
+            let dimension_segment = within_plane % (A::HEAD_DIM / 16);
+            let cache_element = A::HEAD_DIM
+                * (position_in_tile + PAGE_SIZE * (kv_head + A::NUM_KV_HEADS * physical_page))
+                + dimension_segment * 16;
+            let source = if plane == 0 { key_pages } else { value_pages };
+            let destination = plane * plane_words
+                + position_in_tile * (A::HEAD_DIM / size_of::<u32>())
+                + dimension_segment * (16 / size_of::<u32>());
+            unsafe {
+                cp_async_cg_16(
+                    shared_words.add(destination),
+                    source.add(cache_element).cast::<u32>(),
+                );
+            }
+            task += LONG_CONTEXT_MTP_THREADS;
+        }
+        unsafe {
+            cp_async_commit_group();
+            cp_async_wait_group(0);
+        }
+        thread::sync_threads();
+
+        let tile_limit = tile_position + LONG_CONTEXT_MTP_TILE;
+        if tile_position < length0 {
+            unsafe {
+                scan_long_context_mtp_tile(
+                    &query0,
+                    shared,
+                    dimension,
+                    tile_position,
+                    core::cmp::min(tile_limit, length0),
+                    key_scale,
+                    value_scale,
+                    &mut maximum0,
+                    &mut denominator0,
+                    &mut accumulator0,
+                );
+            }
+        }
+        if row1 < row_count && tile_position < length1 {
+            unsafe {
+                scan_long_context_mtp_tile(
+                    &query1,
+                    shared,
+                    dimension,
+                    tile_position,
+                    core::cmp::min(tile_limit, length1),
+                    key_scale,
+                    value_scale,
+                    &mut maximum1,
+                    &mut denominator1,
+                    &mut accumulator1,
+                );
+            }
+        }
+        if row2 < row_count && tile_position < length2 {
+            unsafe {
+                scan_long_context_mtp_tile(
+                    &query2,
+                    shared,
+                    dimension,
+                    tile_position,
+                    core::cmp::min(tile_limit, length2),
+                    key_scale,
+                    value_scale,
+                    &mut maximum2,
+                    &mut denominator2,
+                    &mut accumulator2,
+                );
+            }
+        }
+        thread::sync_threads();
+        tile_position += LONG_CONTEXT_MTP_TILE;
+    }
+
+    if first_position < length0 {
+        unsafe {
+            store_long_context_mtp_partial::<A>(
+                row0,
+                kv_head,
+                partition,
+                lane,
+                dimension,
+                maximum0,
+                denominator0,
+                &accumulator0,
+                partial_maximum,
+                partial_denominator,
+                partial_numerator,
+            );
+        }
+    }
+    if row1 < row_count && first_position < length1 {
+        unsafe {
+            store_long_context_mtp_partial::<A>(
+                row1,
+                kv_head,
+                partition,
+                lane,
+                dimension,
+                maximum1,
+                denominator1,
+                &accumulator1,
+                partial_maximum,
+                partial_denominator,
+                partial_numerator,
+            );
+        }
+    }
+    if row2 < row_count && first_position < length2 {
+        unsafe {
+            store_long_context_mtp_partial::<A>(
+                row2,
+                kv_head,
+                partition,
+                lane,
+                dimension,
+                maximum2,
+                denominator2,
+                &accumulator2,
+                partial_maximum,
+                partial_denominator,
+                partial_numerator,
+            );
+        }
     }
 }
 

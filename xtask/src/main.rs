@@ -529,6 +529,10 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
         &[QWEN36_FP8_PAGED_GQA_RESOURCE_BASELINE],
     ),
     (
+        "long-context-mtp-paged-gqa",
+        &[LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE],
+    ),
+    (
         "dense-fp8-mlp",
         &[
             RESIDUAL_NORM_RESOURCE_BASELINE,
@@ -1338,6 +1342,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
         "qualify-long-context-paged-gqa",
         qualify_long_context_paged_gqa,
     ),
+    no_args(
+        "qualify-long-context-mtp-paged-gqa",
+        qualify_long_context_mtp_paged_gqa,
+    ),
     no_args("qualify-attention-output", qualify_attention_output),
     forwarded("qualify-mtp-bf16-fusion", qualify_mtp_bf16_fusion),
     forwarded(
@@ -1514,6 +1522,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
     forwarded("bench-qwen36-paged-gqa", bench_qwen36_paged_gqa),
     forwarded("bench-qwen36-fp8-paged-gqa", bench_qwen36_fp8_paged_gqa),
     forwarded("bench-long-context-paged-gqa", bench_long_context_paged_gqa),
+    forwarded(
+        "bench-long-context-mtp-paged-gqa",
+        bench_long_context_mtp_paged_gqa,
+    ),
     forwarded("bench-attention-output", bench_attention_output),
     forwarded("bench-mtp-bf16-fusion", bench_mtp_bf16_fusion),
     forwarded(
@@ -3493,6 +3505,16 @@ fn qualify_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
     gate_long_context_paged_gqa(root)
 }
 
+fn qualify_long_context_mtp_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
+    run_qualification_test(
+        root,
+        "long_context_mtp_paged_gqa",
+        QUALIFICATION_IGNORED_FLAGS,
+        None,
+    )?;
+    gate_long_context_paged_gqa(root)
+}
+
 fn qualify_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
     run_qualification_test(
         root,
@@ -4433,6 +4455,13 @@ fn bench_long_context_paged_gqa(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::LongContextPagedGqa, arguments)
+}
+
+fn bench_long_context_mtp_paged_gqa(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "long-context-mtp-paged-gqa", arguments)
 }
 
 fn bench_attention_output(
@@ -10878,8 +10907,30 @@ fn gate_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
                 .starts_with("long_context_paged_gqa_reduce_exact_TID_")
         })
         .collect::<Vec<_>>();
+    let mtp_partials = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("long_context_mtp_paged_gqa_partial_exact_TID_")
+        })
+        .collect::<Vec<_>>();
+    let mtp_reductions = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("long_context_mtp_paged_gqa_reduce_exact_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("long-context paged GQA partial", partials.len(), 8)?;
     require_count("long-context paged GQA reduction", reductions.len(), 8)?;
+    require_count("long-context MTP paged GQA partial", mtp_partials.len(), 3)?;
+    require_count(
+        "long-context MTP paged GQA reduction",
+        mtp_reductions.len(),
+        3,
+    )?;
     for entry in partials.iter().chain(&reductions) {
         if !entry.body.contains(".reqntid 32, 1, 1") || !entry.body.contains(".minnctapersm 16") {
             return Err(format!(
@@ -10898,12 +10949,38 @@ fn gate_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
+    for entry in &mtp_partials {
+        if !entry.body.contains(".reqntid 256, 1, 1")
+            || !entry.body.contains(".minnctapersm 2")
+            || !entry.body.contains("__dynamic_smem__")
+        {
+            return Err(format!(
+                "entry `{}` lost its 256-thread/two-CTA dynamic-shared schedule",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &mtp_reductions {
+        if !entry.body.contains(".reqntid 32, 1, 1")
+            || !entry.body.contains(".minnctapersm 16")
+            || !entry.body.contains("__dynamic_smem__")
+        {
+            return Err(format!(
+                "entry `{}` lost its 32-thread/sixteen-CTA reduction schedule",
+                entry.name
+            )
+            .into());
+        }
+    }
 
     let artifact = sm120_gate_artifact(root)?;
     let resources = &artifact.resources;
     let sass = artifact.sass()?;
     let mut partial_registers = Vec::new();
     let mut reduction_registers = Vec::new();
+    let mut mtp_partial_registers = Vec::new();
+    let mut mtp_reduction_registers = Vec::new();
     let mut shared = Vec::new();
     for (entries, registers, instructions) in [
         (
@@ -10938,15 +11015,66 @@ fn gate_long_context_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    for (entries, registers, instructions) in [
+        (
+            &mtp_partials,
+            &mut mtp_partial_registers,
+            &[
+                "LDGSTS",
+                "F2FP.F16.E4M3.UNPACK_B",
+                "SHFL.BFLY",
+                "MUFU.EX2",
+                "BAR.SYNC",
+            ][..],
+        ),
+        (
+            &mtp_reductions,
+            &mut mtp_reduction_registers,
+            &["SHFL.BFLY", "MUFU.EX2", "STS", "LDS", "BAR.SYNC"][..],
+        ),
+    ] {
+        for entry in entries {
+            let resource = resources
+                .get(entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+            require_spill_free(entry.name, resource)?;
+            registers.push(resource.registers);
+            shared.push(resource.shared);
+
+            let body = sass_function_body(sass, entry.name)
+                .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+            for instruction in instructions {
+                if !body.contains(instruction) {
+                    return Err(format!(
+                        "entry `{}` lost required `{instruction}` SASS",
+                        entry.name
+                    )
+                    .into());
+                }
+            }
+        }
+    }
     partial_registers.sort_unstable();
     reduction_registers.sort_unstable();
+    mtp_partial_registers.sort_unstable();
+    mtp_reduction_registers.sort_unstable();
     require_registers(&baseline, "partial_registers", &partial_registers)?;
     require_registers(&baseline, "reduction_registers", &reduction_registers)?;
+    require_registers(&baseline, "mtp_partial_registers", &mtp_partial_registers)?;
+    require_registers(
+        &baseline,
+        "mtp_reduction_registers",
+        &mtp_reduction_registers,
+    )?;
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
 
     println!(
-        "long-context paged GQA gate passed: 8 partial + 8 reduction entries, REG partial {:?}, reduction {:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/SHFL/EX2/dynamic-shared present",
-        partial_registers, reduction_registers, shared
+        "long-context paged GQA gate passed: generic 8 partial + 8 reduction, MTP 3 partial + 3 reduction entries, REG generic {:?}/{:?}, MTP {:?}/{:?}, STACK:0 LOCAL:0, SHARED {:?}, E4M3/LDGSTS/SHFL/EX2/dynamic-shared present",
+        partial_registers,
+        reduction_registers,
+        mtp_partial_registers,
+        mtp_reduction_registers,
+        shared
     );
     Ok(())
 }
@@ -15979,6 +16107,7 @@ mod tests {
             "bench-attention-qk-prepare",
             "bench-paged-gqa",
             "bench-long-context-paged-gqa",
+            "bench-long-context-mtp-paged-gqa",
             "bench-attention-output",
             "bench-mtp-bf16-fusion",
             "bench-mtp-bf16-attention-output",
