@@ -34,9 +34,10 @@ pub use tuisko_kernels_sm120_fp8_mlp::{
     DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps,
 };
 pub use tuisko_kernels_sm120_fp8_projection::{
-    AttentionOutputOp, DenseFp8GdnInputTmaMaps, FullAttentionQkvOp, GdnInputProjectionOp,
-    GdnOutputProjectionOp, LmHeadOp, Qwen36AttentionOutputOp, Qwen36Fp8QkvOp, Qwen36GdnInputOp,
-    Qwen36GdnOutputOp, Qwen38FlashNextAttentionGateOp,
+    AttentionOutputOp, DenseFp8GdnInputTmaMaps, DenseFp8GdnOutputTmaMaps, DenseFp8QkvTmaMaps,
+    FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp, LmHeadOp,
+    Qwen36AttentionOutputOp, Qwen36Fp8QkvOp, Qwen36GdnInputOp, Qwen36GdnOutputOp,
+    Qwen38FlashNextAttentionGateOp,
 };
 pub use tuisko_kernels_sm120_gdn::{
     GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, Qwen35GdnPrepareOp, Qwen35GdnRecurrenceOp,

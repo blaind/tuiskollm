@@ -522,6 +522,47 @@ impl<A: Sm120Arch> DenseFp8SwiGluOp<A> {
                 .launch(stream, maps, activation_scales, weight_scales, output)
         }
     }
+    /// Dynamically quantizes and applies the T=128 tile of the TMA SwiGLU route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 128 rows.
+    /// `maps` was constructed for the same `activation_codes` and
+    /// `weight_codes` addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_t128_prefill(
+        &self,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8SwiGluTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != activation_codes.addr()
+            || maps.weight_codes() != weight_codes.addr()
+        {
+            return Err(GpuError::invalid_launch(
+                "dense-FP8 SwiGLU tensor maps do not match the launch addresses",
+            ));
+        }
+        self.module
+            .fp8_swiglu_quantize::<A>(
+                stream,
+                &self.routes.t128.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| GpuError::launch("launching dense-FP8 quantization", source))?;
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024
+                .launch_t128(stream, maps, activation_scales, weight_scales, output)
+        }
+    }
 }
 
 /// PTX symbols retained for quantization and every exact dense-FP8 SwiGLU route.

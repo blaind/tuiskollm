@@ -13,7 +13,7 @@ use crate::{DeviceBenchmarkError, device_benchmark};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
 };
-use tuisko_kernels_sm120::GdnOutputProjectionOp;
+use tuisko_kernels_sm120::{DenseFp8GdnOutputTmaMaps, GdnOutputProjectionOp};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const SENTINEL: SentinelPattern = SentinelPattern::new(0xa5);
@@ -130,6 +130,14 @@ pub fn qualify_gdn_output() -> Result<GdnOutputQualification, GdnOutputQualifica
         .map_err(GdnOutputQualificationError::Mismatch)?;
     load_fixture(&arena, &stream, regions, &fixture)?;
     let op = GdnOutputProjectionOp::new(&context)?;
+    // SAFETY: the arena owns exact stable T=1024 activation and source weight planes.
+    let maps = unsafe {
+        DenseFp8GdnOutputTmaMaps::new(
+            &stream,
+            arena.address(regions.codes)?,
+            arena.address(regions.weight_codes)?,
+        )?
+    };
     let stable = addresses(&arena, regions)?;
     let mut report = GdnOutputQualification {
         activation_codes: 0,
@@ -146,13 +154,15 @@ pub fn qualify_gdn_output() -> Result<GdnOutputQualification, GdnOutputQualifica
 
     for rows in EXACT_ROUTES {
         reset(&arena, &stream, regions)?;
-        launch(&op, &arena, &stream, regions, rows)?;
+        launch(&op, &maps, &arena, &stream, regions, rows)?;
         let eager = observe(&arena, &stream, regions)?;
         verify_eager(rows, &oracles, &fixture, &eager, &mut report)?;
 
         reset(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
+        let graph = CudaGraph::capture(&stream, || {
+            launch(&op, &maps, &arena, &stream, regions, rows)
+        })?;
         for replay_index in 1..=2 {
             reset(&arena, &stream, regions)?;
             // SAFETY: every allocation this graph captured is owned by this scope or
@@ -168,7 +178,7 @@ pub fn qualify_gdn_output() -> Result<GdnOutputQualification, GdnOutputQualifica
         }
     }
 
-    verify_no_post_warmup_allocation(&context, &op, &arena, &stream, regions)?;
+    verify_no_post_warmup_allocation(&context, &op, &maps, &arena, &stream, regions)?;
     device_benchmark::require_current_process_exclusive()?;
 
     Ok(report)
@@ -256,6 +266,7 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 6]> {
 
 fn launch(
     op: &GdnOutputProjectionOp,
+    maps: &DenseFp8GdnOutputTmaMaps,
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
@@ -263,16 +274,29 @@ fn launch(
 ) -> GpuResult<()> {
     // SAFETY: regions are aligned, non-overlapping, context-local, and cover T=1024.
     unsafe {
-        op.launch(
-            stream,
-            rows,
-            arena.address(regions.input)?,
-            arena.address(regions.codes)?,
-            arena.address(regions.scales)?,
-            arena.address(regions.weight_codes)?,
-            arena.address(regions.weight_scales)?,
-            arena.address(regions.output)?,
-        )
+        if rows == MAX_ROWS {
+            op.launch_macro_prefill(
+                stream,
+                arena.address(regions.input)?,
+                arena.address(regions.codes)?,
+                arena.address(regions.scales)?,
+                arena.address(regions.weight_codes)?,
+                arena.address(regions.weight_scales)?,
+                arena.address(regions.output)?,
+                maps,
+            )
+        } else {
+            op.launch(
+                stream,
+                rows,
+                arena.address(regions.input)?,
+                arena.address(regions.codes)?,
+                arena.address(regions.scales)?,
+                arena.address(regions.weight_codes)?,
+                arena.address(regions.weight_scales)?,
+                arena.address(regions.output)?,
+            )
+        }
     }
 }
 
@@ -412,13 +436,14 @@ fn verify_replay(
 fn verify_no_post_warmup_allocation(
     context: &CudaContext,
     op: &GdnOutputProjectionOp,
+    maps: &DenseFp8GdnOutputTmaMaps,
     arena: &DeviceArena,
     stream: &tuisko_gpu::CudaStream,
     regions: Regions,
 ) -> Result<(), GdnOutputQualificationError> {
     let graphs = EXACT_ROUTES
         .iter()
-        .map(|&rows| CudaGraph::capture(stream, || launch(op, arena, stream, regions, rows)))
+        .map(|&rows| CudaGraph::capture(stream, || launch(op, maps, arena, stream, regions, rows)))
         .collect::<GpuResult<Vec<_>>>()?;
     // SAFETY: every allocation these graphs captured is owned by this scope or
     // its caller and outlives the replays and the synchronize that follows.

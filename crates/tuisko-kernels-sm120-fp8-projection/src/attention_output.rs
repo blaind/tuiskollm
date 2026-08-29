@@ -1,6 +1,7 @@
 //! Gated activation, dynamic E4M3 quantization, and source-native output projection.
 
 use crate::device::fp8_projection::fp8_projection;
+use crate::gdn_output_tma::{DenseFp8GdnOutputTmaMaps, DenseFp8GdnOutputTmaRoute};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -138,46 +139,6 @@ mod kernels {
                 Qwen38_27B,
                 TOKENS,
                 PREFILL_BLOCK_ROWS,
-                PREFILL_OUTPUT_ROWS,
-                PREFILL_K_WORDS,
-                PREFILL_K_SUBTILES,
-            >(
-                activation_codes,
-                activation_scales,
-                weight_codes,
-                weight_scales,
-                output,
-                k_tiles,
-            );
-        }
-    }
-
-    /// Projects exactly 1,024 rows with native E4M3 MMA.
-    #[kernel]
-    #[launch_bounds(128, 4)]
-    #[launch_contract(
-        domain = 1,
-        coordinates = u32,
-        block = (128, 1, 1),
-        dynamic_shared = 24576,
-        min_compute_capability = (12, 0),
-    )]
-    pub fn attention_output_projection_mma_t1024(
-        activation_codes: *const u32,
-        activation_scales: *const f32,
-        weight_codes: *const u32,
-        weight_scales: *const u16,
-        output: *mut u16,
-        k_tiles: u32,
-    ) {
-        // A 64x32 tile doubles activation reuse while its four warps still own
-        // exact 16x32 MMA quadrants. The K=128 double buffer is exactly 24 KiB.
-        // SAFETY: the fixed grid covers all sixteen 64-token macro tiles.
-        unsafe {
-            attention_output_projection_mma::<
-                Qwen38_27B,
-                1_024,
-                MACRO_BLOCK_ROWS,
                 PREFILL_OUTPUT_ROWS,
                 PREFILL_K_WORDS,
                 PREFILL_K_SUBTILES,
@@ -345,17 +306,11 @@ impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
 
 struct PreparedMacroRoute<A: Arch> {
     quantize: PreparedLaunch<kernels::__attention_gate_quantize_exact_CudaKernel<A>>,
-    projection: PreparedLaunch<kernels::__attention_output_projection_mma_t1024_CudaKernel>,
+    projection: DenseFp8GdnOutputTmaRoute,
 }
 
 impl<A: Arch> PreparedMacroRoute<A> {
-    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let token_tiles = PREFILL_TOKENS[3] / MACRO_BLOCK_ROWS;
-        let projection_blocks = A::HIDDEN / PREFILL_OUTPUT_ROWS * token_tiles;
-        let projection_blocks = u32::try_from(projection_blocks).map_err(|_| {
-            GpuError::invalid_launch("attention-output macro-prefill grid exceeds CUDA width")
-        })?;
-
+    fn prepare(context: &Arc<CudaContext>, module: &kernels::LoadedModule) -> GpuResult<Self> {
         Ok(Self {
             quantize: module
                 .prepare_attention_gate_quantize_exact::<A>(LaunchConfig1D::new(
@@ -366,15 +321,9 @@ impl<A: Arch> PreparedMacroRoute<A> {
                 .map_err(|source| {
                     GpuError::launch("preparing attention-output macro gate quantization", source)
                 })?,
-            projection: module
-                .prepare_attention_output_projection_mma_t1024(LaunchConfig1D::new(
-                    projection_blocks,
-                    MACRO_THREADS,
-                    MACRO_SHARED_BYTES,
-                ))
-                .map_err(|source| {
-                    GpuError::launch("preparing attention-output macro projection", source)
-                })?,
+            // The attention-output macro tile shares the GDN output TMA
+            // geometry exactly: 6,144 K columns into 64-row hidden tiles.
+            projection: DenseFp8GdnOutputTmaRoute::new(context)?,
         })
     }
 
@@ -387,9 +336,9 @@ impl<A: Arch> PreparedMacroRoute<A> {
         qkv: *const u16,
         activation_codes: *mut u8,
         activation_scales: *mut f32,
-        weight_codes: *const u8,
         weight_scales: *const u16,
         output: *mut u16,
+        maps: &DenseFp8GdnOutputTmaMaps,
     ) -> GpuResult<()> {
         module
             .attention_gate_quantize_exact::<A>(
@@ -403,20 +352,11 @@ impl<A: Arch> PreparedMacroRoute<A> {
             .map_err(|source| {
                 GpuError::launch("launching attention-output macro gate quantization", source)
             })?;
-        module
-            .attention_output_projection_mma_t1024(
-                stream,
-                &self.projection,
-                activation_codes.cast::<u32>(),
-                activation_scales,
-                weight_codes.cast::<u32>(),
-                weight_scales,
-                output,
-                (A::ATTENTION_OUTPUT_COLUMNS / 4 / PREFILL_K_WORDS) as u32,
-            )
-            .map_err(|source| {
-                GpuError::launch("launching attention-output macro projection", source)
-            })
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.projection
+                .launch(stream, maps, activation_scales, weight_scales, output)
+        }
     }
 }
 
@@ -425,7 +365,7 @@ impl<A: Arch> PreparedMacroRoute<A> {
     module(kernels::LoadedModule),
     error(GpuError),
     dispatch(dispatch_attention_output),
-    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
     inventory(false)
 )]
 struct AttentionOutputRoutes<A: Sm120Arch> {
@@ -451,14 +391,13 @@ struct AttentionOutputRoutes<A: Sm120Arch> {
     t64: PreparedPrefillRoute<A, 64>,
     #[route(128)]
     t128: PreparedPrefillRoute<A, 128>,
-    #[route(1024)]
-    t1024: PreparedMacroRoute<A>,
 }
 
 /// Prepared gated FP8 attention-output routes for exact decode and prefill rows.
 pub struct AttentionOutputOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     routes: AttentionOutputRoutes<A>,
+    t1024: PreparedMacroRoute<A>,
 }
 
 impl<A: Sm120Arch> AttentionOutputOp<A> {
@@ -472,6 +411,7 @@ impl<A: Sm120Arch> AttentionOutputOp<A> {
 
         Ok(Self {
             routes: AttentionOutputRoutes::prepare(&module)?,
+            t1024: PreparedMacroRoute::prepare(context, &module)?,
             module,
         })
     }
@@ -501,6 +441,11 @@ impl<A: Sm120Arch> AttentionOutputOp<A> {
         weight_scales: *const u16,
         output: *mut u16,
     ) -> GpuResult<()> {
+        if rows == 1_024 {
+            return Err(GpuError::invalid_launch(
+                "attention-output T=1024 requires launch_macro_prefill with its tensor maps",
+            ));
+        }
         let Some(class) = route_class(rows) else {
             return Err(GpuError::invalid_launch(format!(
                 "attention output row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128,1024"
@@ -528,6 +473,99 @@ impl<A: Sm120Arch> AttentionOutputOp<A> {
         let _ = class;
         dispatch_attention_output!(&self.routes, rows, |route| launch!(route), else => unreachable!())
     }
+
+    /// Quantizes gated attention and applies the exact T=1024 TMA route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 1024 rows.
+    /// `maps` was constructed for the same `activation_codes` and
+    /// `weight_codes` addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_macro_prefill(
+        &self,
+        stream: &CudaStream,
+        attention: *mut f32,
+        qkv: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8GdnOutputTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != activation_codes.addr()
+            || maps.weight_codes() != weight_codes.addr()
+        {
+            return Err(GpuError::invalid_launch(
+                "attention-output tensor maps do not match the launch addresses",
+            ));
+        }
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024.launch(
+                &self.module,
+                stream,
+                attention,
+                qkv,
+                activation_codes,
+                activation_scales,
+                weight_scales,
+                output,
+                maps,
+            )
+        }
+    }
+    /// Quantizes gated attention and applies the T=128 tile of the TMA route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 128 rows.
+    /// `maps` was constructed for the same `activation_codes` and
+    /// `weight_codes` addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_t128_prefill(
+        &self,
+        stream: &CudaStream,
+        attention: *mut f32,
+        qkv: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8GdnOutputTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != activation_codes.addr()
+            || maps.weight_codes() != weight_codes.addr()
+        {
+            return Err(GpuError::invalid_launch(
+                "attention-output tensor maps do not match the launch addresses",
+            ));
+        }
+        self.module
+            .attention_gate_quantize_exact::<A>(
+                stream,
+                &self.routes.t128.quantize,
+                attention,
+                qkv,
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| {
+                GpuError::launch("launching attention-output gate quantization", source)
+            })?;
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024.projection.launch_t128(
+                stream,
+                maps,
+                activation_scales,
+                weight_scales,
+                output,
+            )
+        }
+    }
 }
 
 /// PTX symbols retained for gated quantization and every exact projection route.
@@ -545,7 +583,6 @@ pub(crate) fn attention_output_ptx_names() -> Vec<&'static str> {
         kernels::attention_output_projection_mma_exact_ptx_name::<32>(),
         kernels::attention_output_projection_mma_exact_ptx_name::<64>(),
         kernels::attention_output_projection_mma_exact_ptx_name::<128>(),
-        "attention_output_projection_mma_t1024",
     ]
 }
 
@@ -576,7 +613,7 @@ mod tests {
         assert_eq!((PREFILL_THREADS, PREFILL_SHARED_BYTES), (64, 16_384));
         assert_eq!((MACRO_THREADS, MACRO_SHARED_BYTES), (128, 24_576));
         let names = attention_output_ptx_names();
-        assert_eq!(names.len(), 13);
-        assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 13);
+        assert_eq!(names.len(), 12);
+        assert_eq!(names.iter().copied().collect::<BTreeSet<_>>().len(), 12);
     }
 }

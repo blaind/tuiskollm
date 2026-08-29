@@ -446,7 +446,13 @@ impl DenseFp8GdnInputTmaMaps {
 pub(super) struct DenseFp8GdnInputTmaRoute {
     module: kernels::LoadedModule,
     prepared: PreparedLaunch<kernels::__fp8_gdn_input_tma_t1024_CudaKernel>,
+    // The same entry serves T=128 with a one-token-tile grid; the height-1024
+    // tensor maps bound every coordinate the smaller grid can name.
+    prepared_t128: PreparedLaunch<kernels::__fp8_gdn_input_tma_t1024_CudaKernel>,
 }
+
+const _: () = assert!(T128_TOKENS == BLOCK_M);
+pub(super) const T128_TOKENS: usize = 128;
 
 impl DenseFp8GdnInputTmaRoute {
     pub(super) fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
@@ -461,12 +467,67 @@ impl DenseFp8GdnInputTmaRoute {
                 SHARED_BYTES as u32,
             ))
             .map_err(|source| GpuError::launch("preparing dense-FP8 GDN input T=1024", source))?;
+        let t128_blocks = ((T128_TOKENS / BLOCK_M) * (Qwen38_27B::GDN_INPUT_ROWS / BLOCK_N)) as u32;
+        let prepared_t128 = module
+            .prepare_fp8_gdn_input_tma_t1024(LaunchConfig1D::new(
+                t128_blocks,
+                THREADS as u32,
+                SHARED_BYTES as u32,
+            ))
+            .map_err(|source| GpuError::launch("preparing dense-FP8 GDN input T=128", source))?;
 
-        Ok(Self { module, prepared })
+        Ok(Self {
+            module,
+            prepared,
+            prepared_t128,
+        })
     }
 
     pub(super) unsafe fn launch(
         &self,
+        stream: &CudaStream,
+        maps: &DenseFp8GdnInputTmaMaps,
+        activation_scales: *const f32,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: the caller admits every pointer and map boundary.
+        unsafe {
+            self.launch_prepared(
+                &self.prepared,
+                stream,
+                maps,
+                activation_scales,
+                weight_scales,
+                output,
+            )
+        }
+    }
+
+    pub(super) unsafe fn launch_t128(
+        &self,
+        stream: &CudaStream,
+        maps: &DenseFp8GdnInputTmaMaps,
+        activation_scales: *const f32,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: the caller admits every pointer and map boundary.
+        unsafe {
+            self.launch_prepared(
+                &self.prepared_t128,
+                stream,
+                maps,
+                activation_scales,
+                weight_scales,
+                output,
+            )
+        }
+    }
+
+    unsafe fn launch_prepared(
+        &self,
+        prepared: &PreparedLaunch<kernels::__fp8_gdn_input_tma_t1024_CudaKernel>,
         stream: &CudaStream,
         maps: &DenseFp8GdnInputTmaMaps,
         activation_scales: *const f32,
@@ -483,14 +544,14 @@ impl DenseFp8GdnInputTmaRoute {
         self.module
             .fp8_gdn_input_tma_t1024(
                 stream,
-                &self.prepared,
+                prepared,
                 maps.activation_code_map.cu_deviceptr() as *const cuda_device::tma::TmaDescriptor,
                 maps.weight_code_map.cu_deviceptr() as *const cuda_device::tma::TmaDescriptor,
                 activation_scales,
                 weight_scales,
                 output,
             )
-            .map_err(|source| GpuError::launch("launching dense-FP8 GDN input T=1024", source))
+            .map_err(|source| GpuError::launch("launching dense-FP8 GDN input TMA", source))
     }
 }
 

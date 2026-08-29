@@ -1,4 +1,4 @@
-//! Private T=1024 TMA route for dense-FP8 gate/up SwiGLU.
+//! Private T=1024 TMA route for the dense-FP8 GDN output projection.
 
 use cuda_core::sys::{
     self as cuda_sys, CUtensorMap, CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_UINT8,
@@ -11,7 +11,7 @@ use cuda_device::{
     DynamicSharedArray, cuda_module, kernel, launch_bounds, launch_contract, ptx_asm, thread,
 };
 use std::ffi::c_void;
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, size_of};
 use std::sync::Arc;
 use tuisko_gpu::{
     CudaContext, CudaStream, DeviceBuffer, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch,
@@ -19,6 +19,7 @@ use tuisko_gpu::{
 use tuisko_model::{Arch, Qwen38_27B};
 
 pub(super) const TOKENS: usize = 1_024;
+const KDIM: usize = Qwen38_27B::GDN_VALUE_ROWS;
 const BLOCK_M: usize = 128;
 const BLOCK_N: usize = 64;
 const BLOCK_K: usize = 64;
@@ -32,23 +33,24 @@ const WARPS_N: usize = 2;
 const WARP_M: usize = BLOCK_M / WARPS_M;
 const WARP_N: usize = BLOCK_N / WARPS_N;
 const MMA_M: usize = WARP_M / 16;
-const MMA_N_PER_BRANCH: usize = WARP_N / 8;
-const MMA_N: usize = 2 * MMA_N_PER_BRANCH;
+const MMA_N: usize = WARP_N / 8;
 const K32_PER_STAGE: usize = BLOCK_K / 32;
-const K_TILES: usize = Qwen38_27B::HIDDEN / BLOCK_K;
+const K_TILES: usize = KDIM / BLOCK_K;
 const CODE_ROW_BYTES: usize = BLOCK_K;
 const OUTPUT_STRIDE: usize = BLOCK_N + 8;
 
 const A_CODE_OFFSET: usize = 0;
 const A_CODE_BYTES: usize = STAGES * BLOCK_M * CODE_ROW_BYTES;
-const GATE_CODE_OFFSET: usize = A_CODE_OFFSET + A_CODE_BYTES;
-const B_CODE_BYTES: usize = STAGES * BLOCK_N * CODE_ROW_BYTES;
-const UP_CODE_OFFSET: usize = GATE_CODE_OFFSET + B_CODE_BYTES;
-const FULL_BARRIER_OFFSET: usize = UP_CODE_OFFSET + B_CODE_BYTES;
+const WEIGHT_CODE_OFFSET: usize = A_CODE_OFFSET + A_CODE_BYTES;
+const WEIGHT_CODE_BYTES: usize = STAGES * BLOCK_N * CODE_ROW_BYTES;
+const FULL_BARRIER_OFFSET: usize = WEIGHT_CODE_OFFSET + WEIGHT_CODE_BYTES;
 const EMPTY_BARRIER_OFFSET: usize = FULL_BARRIER_OFFSET + STAGES * 8;
 const SHARED_BYTES: usize = EMPTY_BARRIER_OFFSET + STAGES * 8;
-const TRANSACTION_BYTES: u32 = (BLOCK_M * CODE_ROW_BYTES + 2 * BLOCK_N * CODE_ROW_BYTES) as u32;
-const _: () = assert!(SHARED_BYTES == 49_200);
+const TRANSACTION_BYTES: u32 = (BLOCK_M * CODE_ROW_BYTES + BLOCK_N * CODE_ROW_BYTES) as u32;
+const _: () = assert!(SHARED_BYTES == 36_912);
+const _: () = assert!(KDIM == 6_144);
+const _: () = assert!(KDIM.is_multiple_of(BLOCK_K));
+const _: () = assert!(Qwen38_27B::HIDDEN.is_multiple_of(BLOCK_N));
 
 #[cuda_module]
 mod kernels {
@@ -58,20 +60,11 @@ mod kernels {
         mbarrier_init, mbarrier_try_wait_parity,
     };
     use cuda_device::tma::TmaDescriptor;
-    use cuda_device::{float, tcgen05, wmma};
+    use cuda_device::{tcgen05, wmma};
 
     #[inline(always)]
     fn swizzled_byte(row: usize, logical_byte: usize) -> usize {
         (((logical_byte >> 4) ^ ((row >> 1) & 3)) << 4) + (logical_byte & 15)
-    }
-
-    #[inline(always)]
-    fn silu(value: f32) -> f32 {
-        let denominator = 1.0 + float::ex2_approx_f32(-value * core::f32::consts::LOG2_E);
-        let reciprocal = float::rcp_approx_ftz_f32(denominator);
-        // One Newton step retains BF16 epilogue accuracy without the stack-using
-        // out-of-line f32 division emitted inside this warp-specialized kernel.
-        value * reciprocal * (2.0 - denominator * reciprocal)
     }
 
     #[inline(always)]
@@ -82,9 +75,8 @@ mod kernels {
         coordinate1: i32,
         barrier: *mut Barrier,
     ) {
-        // This exact route launches no multi-CTA cluster. Converting directly
-        // to CTA shared addresses avoids the generic cluster-rank helper while
-        // retaining the same one-CTA TMA instruction and completion barrier.
+        // This exact route has no multi-CTA cluster. The CTA-shared form avoids
+        // the generic cluster-rank conversion and its out-of-line stack frame.
         unsafe {
             ptx_asm!(
                 "{\n\
@@ -105,35 +97,35 @@ mod kernels {
         }
     }
 
-    /// Applies the retained three-stage TMA route at exactly T=1024.
+    /// Applies the retained three-stage GDN output route at exactly T=1024.
     #[kernel]
     #[launch_bounds(288, 2)]
     #[launch_contract(
         domain = 1,
         coordinates = u32,
         block = (288, 1, 1),
-        dynamic_shared = 49200,
+        dynamic_shared = 36912,
         dynamic_shared_alignment = 128,
         min_compute_capability = (12, 0),
     )]
-    pub fn fp8_swiglu_tma_t1024(
+    pub fn fp8_gdn_output_tma_t1024(
         activation_code_map: *const TmaDescriptor,
         weight_code_map: *const TmaDescriptor,
         activation_scales: *const f32,
         weight_scales: *const u16,
         output: *mut u16,
     ) {
-        // One producer warp overlaps 64-wide TMA stages with eight consumer
-        // warps. The 128x64 tile keeps two CTAs resident in 49,200 shared bytes
-        // while preserving the m16n8k32 K order used by the smaller routes.
+        // One producer warp overlaps 64-wide K stages with eight consumer
+        // warps, identical to the down macro tile; the 96-tile K walk covers
+        // this exact 6,144-wide projection into every 64-row hidden tile.
         let shared = DynamicSharedArray::<u8, 128>::get();
-        // SAFETY: the launch reserves the two barrier arrays after all code stages.
+        // SAFETY: the launch reserves both barrier arrays after the code stages.
         let full = unsafe { shared.add(FULL_BARRIER_OFFSET).cast::<Barrier>() };
-        // SAFETY: the launch reserves the two barrier arrays after all code stages.
+        // SAFETY: the launch reserves both barrier arrays after the code stages.
         let empty = unsafe { shared.add(EMPTY_BARRIER_OFFSET).cast::<Barrier>() };
         let tid = thread::threadIdx_x() as usize;
         let block = thread::blockIdx_x() as usize;
-        let output_tiles = Qwen38_27B::INTERMEDIATE / BLOCK_N;
+        let output_tiles = Qwen38_27B::HIDDEN / BLOCK_N;
         let token_tile = block / output_tiles;
         let output_tile = block - token_tile * output_tiles;
         let token_begin = token_tile * BLOCK_M;
@@ -160,7 +152,7 @@ mod kernels {
                 while k_tile < K_TILES {
                     let stage = k_tile % STAGES;
                     let empty_phase = 1 ^ ((k_tile / STAGES) & 1);
-                    // SAFETY: descriptors, barrier phases, and exact tiles are admitted.
+                    // SAFETY: descriptors, phases, and exact tiles are admitted.
                     unsafe {
                         while !mbarrier_try_wait_parity(empty.add(stage), empty_phase as u32) {}
                         let barrier = full.add(stage);
@@ -172,17 +164,10 @@ mod kernels {
                             barrier,
                         );
                         cp_async_bulk_tensor_2d_g2s_cta(
-                            shared.add(GATE_CODE_OFFSET + stage * BLOCK_N * CODE_ROW_BYTES),
+                            shared.add(WEIGHT_CODE_OFFSET + stage * BLOCK_N * CODE_ROW_BYTES),
                             weight_code_map,
                             (k_tile * CODE_ROW_BYTES) as i32,
                             row_begin as i32,
-                            barrier,
-                        );
-                        cp_async_bulk_tensor_2d_g2s_cta(
-                            shared.add(UP_CODE_OFFSET + stage * BLOCK_N * CODE_ROW_BYTES),
-                            weight_code_map,
-                            (k_tile * CODE_ROW_BYTES) as i32,
-                            (Qwen38_27B::INTERMEDIATE + row_begin) as i32,
                             barrier,
                         );
                         mbarrier_arrive_expect_tx(barrier, 1, TRANSACTION_BYTES);
@@ -209,7 +194,7 @@ mod kernels {
         while k_tile < K_TILES {
             let stage = k_tile % STAGES;
             let full_phase = (k_tile / STAGES) & 1;
-            // SAFETY: each consumer waits for the current stage before reading it.
+            // SAFETY: every consumer waits for the current stage before reading.
             unsafe { while !mbarrier_try_wait_parity(full.add(stage), full_phase as u32) {} }
             let mut local_k32 = 0usize;
             #[unroll]
@@ -220,7 +205,7 @@ mod kernels {
                 while mma_m < MMA_M {
                     let row = warp_m * WARP_M + mma_m * 16 + a_row_offset;
                     let logical_byte = local_k32 * 32 + a_column_byte;
-                    // SAFETY: the swizzled address names one admitted m16k32 fragment.
+                    // SAFETY: the swizzled address names one m16k32 fragment.
                     a_fragments[mma_m] = unsafe {
                         wmma::ldmatrix_x4(
                             shared
@@ -240,21 +225,14 @@ mod kernels {
                 let mut mma_n = 0usize;
                 #[unroll]
                 while mma_n < MMA_N {
-                    let branch = mma_n / MMA_N_PER_BRANCH;
-                    let branch_n = mma_n - branch * MMA_N_PER_BRANCH;
-                    let row = warp_n * WARP_N + branch_n * 8 + b_row_offset;
+                    let row = warp_n * WARP_N + mma_n * 8 + b_row_offset;
                     let logical_byte = local_k32 * 32 + b_column_byte;
-                    let offset = if branch == 0 {
-                        GATE_CODE_OFFSET
-                    } else {
-                        UP_CODE_OFFSET
-                    };
-                    // SAFETY: the swizzled address names one admitted n8k32 fragment.
+                    // SAFETY: the swizzled address names one n8k32 fragment.
                     b_fragments[mma_n] = unsafe {
                         wmma::ldmatrix_x2(
                             shared
                                 .add(
-                                    offset
+                                    WEIGHT_CODE_OFFSET
                                         + stage * BLOCK_N * CODE_ROW_BYTES
                                         + row * CODE_ROW_BYTES
                                         + swizzled_byte(row, logical_byte),
@@ -294,7 +272,7 @@ mod kernels {
             k_tile += 1;
         }
 
-        // SAFETY: all consumers participate before reusing shared memory for output.
+        // SAFETY: all consumers participate before shared-memory output reuse.
         unsafe { ptx_asm!("bar.sync 1, 256;", clobber("memory")) };
         let output_shared = shared.cast::<u16>();
         let accumulator_row = lane >> 2;
@@ -304,45 +282,30 @@ mod kernels {
         while mma_m < MMA_M {
             let token0 = warp_m * WARP_M + mma_m * 16 + accumulator_row;
             let token1 = token0 + 8;
-            // SAFETY: the exact token tile owns both activation scale entries.
+            // SAFETY: the exact token tile owns both activation scales.
             let activation_scale0 = unsafe { *activation_scales.add(token_begin + token0) };
-            // SAFETY: the exact token tile owns both activation scale entries.
+            // SAFETY: the exact token tile owns both activation scales.
             let activation_scale1 = unsafe { *activation_scales.add(token_begin + token1) };
             let mut mma_n = 0usize;
             #[unroll]
-            while mma_n < MMA_N_PER_BRANCH {
+            while mma_n < MMA_N {
                 let row = warp_n * WARP_N + mma_n * 8 + accumulator_column;
-                // SAFETY: gate/up scale planes cover both adjacent output rows.
-                let gate_scale0 =
+                // SAFETY: the scale plane covers both adjacent output rows.
+                let weight_scale0 =
                     f32::from_bits((unsafe { *weight_scales.add(row_begin + row) } as u32) << 16);
-                let gate_scale1 = f32::from_bits(
+                let weight_scale1 = f32::from_bits(
                     (unsafe { *weight_scales.add(row_begin + row + 1) } as u32) << 16,
                 );
-                let up_scale0 = f32::from_bits(
-                    (unsafe { *weight_scales.add(Qwen38_27B::INTERMEDIATE + row_begin + row) }
-                        as u32)
-                        << 16,
-                );
-                let up_scale1 = f32::from_bits(
-                    (unsafe { *weight_scales.add(Qwen38_27B::INTERMEDIATE + row_begin + row + 1) }
-                        as u32)
-                        << 16,
-                );
-                let gate = accumulators[mma_m][mma_n];
-                let up = accumulators[mma_m][mma_n + MMA_N_PER_BRANCH];
-                let gate00 = gate[0] * activation_scale0 * gate_scale0;
-                let gate01 = gate[1] * activation_scale0 * gate_scale1;
-                let gate10 = gate[2] * activation_scale1 * gate_scale0;
-                let gate11 = gate[3] * activation_scale1 * gate_scale1;
+                let values = accumulators[mma_m][mma_n];
                 let packed0 = tcgen05::cvt_f32x2_bf16x2(
-                    silu(gate00) * (up[0] * activation_scale0 * up_scale0),
-                    silu(gate01) * (up[1] * activation_scale0 * up_scale1),
+                    values[0] * activation_scale0 * weight_scale0,
+                    values[1] * activation_scale0 * weight_scale1,
                 );
                 let packed1 = tcgen05::cvt_f32x2_bf16x2(
-                    silu(gate10) * (up[2] * activation_scale1 * up_scale0),
-                    silu(gate11) * (up[3] * activation_scale1 * up_scale1),
+                    values[2] * activation_scale1 * weight_scale0,
+                    values[3] * activation_scale1 * weight_scale1,
                 );
-                // SAFETY: each lane writes disjoint packed output pairs.
+                // SAFETY: each lane owns disjoint packed output pairs.
                 unsafe {
                     *output_shared
                         .add(token0 * OUTPUT_STRIDE + row)
@@ -355,7 +318,7 @@ mod kernels {
             }
             mma_m += 1;
         }
-        // SAFETY: all consumers finish shared output publication before copies.
+        // SAFETY: shared output publication completes before the global copies.
         unsafe { ptx_asm!("bar.sync 1, 256;", clobber("memory")) };
 
         let vectors_per_row = BLOCK_N / 8;
@@ -364,17 +327,13 @@ mod kernels {
         while task < output_vectors {
             let token = task / vectors_per_row;
             let row_vector = task - token * vectors_per_row;
-            // SAFETY: vector tasks partition both shared and global output planes.
+            // SAFETY: vector tasks partition shared and global output planes.
             unsafe {
                 let values = *output_shared
                     .add(token * OUTPUT_STRIDE + row_vector * 8)
                     .cast::<[u32; 4]>();
                 *output
-                    .add(
-                        (token_begin + token) * Qwen38_27B::INTERMEDIATE
-                            + row_begin
-                            + row_vector * 8,
-                    )
+                    .add((token_begin + token) * Qwen38_27B::HIDDEN + row_begin + row_vector * 8)
                     .cast::<[u32; 4]>() = values;
             }
             task += CONSUMER_THREADS;
@@ -382,15 +341,15 @@ mod kernels {
     }
 }
 
-/// Address-bound tensor maps for the exact dense-FP8 T=1024 route.
-pub struct DenseFp8SwiGluTmaMaps {
+/// Address-bound tensor maps for the exact dense-FP8 GDN output macro route.
+pub struct DenseFp8GdnOutputTmaMaps {
     activation_code_map: DeviceBuffer<u64>,
     weight_code_map: DeviceBuffer<u64>,
     activation_codes: usize,
     weight_codes: usize,
 }
 
-impl DenseFp8SwiGluTmaMaps {
+impl DenseFp8GdnOutputTmaMaps {
     /// Exact bytes in the two opaque CUDA tensor maps.
     pub const BYTE_LEN: usize = 2 * size_of::<CUtensorMap>();
 
@@ -398,10 +357,10 @@ impl DenseFp8SwiGluTmaMaps {
     ///
     /// # Safety
     ///
-    /// `activation_codes` covers `[1024, 5120]` E4M3 bytes and `weight_codes`
-    /// covers source-native `[34816, 5120]` E4M3 bytes. Both allocations belong
-    /// to `stream`'s context, remain at these addresses for this owner's life,
-    /// and are at least 16-byte aligned.
+    /// `activation_codes` covers `[1024, 6144]` E4M3 bytes and
+    /// `weight_codes` covers source-native `[HIDDEN, 6144]` E4M3
+    /// bytes. Both allocations belong to `stream`'s context, remain
+    /// address-stable for this owner's life, and are at least 16-byte aligned.
     pub unsafe fn new(
         stream: &CudaStream,
         activation_codes: *const u8,
@@ -409,17 +368,17 @@ impl DenseFp8SwiGluTmaMaps {
     ) -> GpuResult<Self> {
         let activation = create_map(
             activation_codes.cast_mut().cast::<c_void>(),
-            Qwen38_27B::HIDDEN as u64,
+            KDIM as u64,
             TOKENS as u64,
-            Qwen38_27B::HIDDEN as u64,
+            KDIM as u64,
             BLOCK_K as u32,
             BLOCK_M as u32,
         )?;
         let weight = create_map(
             weight_codes.cast_mut().cast::<c_void>(),
+            KDIM as u64,
             Qwen38_27B::HIDDEN as u64,
-            (2 * Qwen38_27B::INTERMEDIATE) as u64,
-            Qwen38_27B::HIDDEN as u64,
+            KDIM as u64,
             BLOCK_K as u32,
             BLOCK_N as u32,
         )?;
@@ -460,7 +419,7 @@ impl DenseFp8SwiGluTmaMaps {
             || !Arc::ptr_eq(stream.context(), self.weight_code_map.context())
         {
             return Err(GpuError::invalid_launch(
-                "dense-FP8 SwiGLU tensor maps belong to another CUDA context",
+                "dense-FP8 GDN output tensor maps belong to another CUDA context",
             ));
         }
         Ok([
@@ -473,44 +432,45 @@ impl DenseFp8SwiGluTmaMaps {
         ])
     }
 
-    pub(super) fn activation_codes(&self) -> usize {
+    pub(crate) fn activation_codes(&self) -> usize {
         self.activation_codes
     }
 
-    pub(super) fn weight_codes(&self) -> usize {
+    pub(crate) fn weight_codes(&self) -> usize {
         self.weight_codes
     }
 }
 
-pub(super) struct DenseFp8SwiGluTmaRoute {
+pub(crate) struct DenseFp8GdnOutputTmaRoute {
     module: kernels::LoadedModule,
-    prepared: PreparedLaunch<kernels::__fp8_swiglu_tma_t1024_CudaKernel>,
+    prepared: PreparedLaunch<kernels::__fp8_gdn_output_tma_t1024_CudaKernel>,
     // The same entry serves T=128 with a one-token-tile grid; the height-1024
     // tensor maps bound every coordinate the smaller grid can name.
-    prepared_t128: PreparedLaunch<kernels::__fp8_swiglu_tma_t1024_CudaKernel>,
+    prepared_t128: PreparedLaunch<kernels::__fp8_gdn_output_tma_t1024_CudaKernel>,
 }
 
-impl DenseFp8SwiGluTmaRoute {
-    pub(super) fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
+impl DenseFp8GdnOutputTmaRoute {
+    pub(crate) fn new(context: &Arc<CudaContext>) -> GpuResult<Self> {
         // SAFETY: this route owns one cuda-oxide module and embedded artifact.
-        let module = unsafe { kernels::load(context) }
-            .map_err(|source| GpuError::module("loading dense-FP8 SwiGLU TMA module", source))?;
-        let blocks = ((TOKENS / BLOCK_M) * (Qwen38_27B::INTERMEDIATE / BLOCK_N)) as u32;
+        let module = unsafe { kernels::load(context) }.map_err(|source| {
+            GpuError::module("loading dense-FP8 GDN output TMA module", source)
+        })?;
+        let blocks = ((TOKENS / BLOCK_M) * (Qwen38_27B::HIDDEN / BLOCK_N)) as u32;
         let prepared = module
-            .prepare_fp8_swiglu_tma_t1024(LaunchConfig1D::new(
+            .prepare_fp8_gdn_output_tma_t1024(LaunchConfig1D::new(
                 blocks,
                 THREADS as u32,
                 SHARED_BYTES as u32,
             ))
-            .map_err(|source| GpuError::launch("preparing dense-FP8 SwiGLU T=1024", source))?;
-        let t128_blocks = ((128 / BLOCK_M) * (Qwen38_27B::INTERMEDIATE / BLOCK_N)) as u32;
+            .map_err(|source| GpuError::launch("preparing dense-FP8 GDN output T=1024", source))?;
+        let t128_blocks = ((128 / BLOCK_M) * (Qwen38_27B::HIDDEN / BLOCK_N)) as u32;
         let prepared_t128 = module
-            .prepare_fp8_swiglu_tma_t1024(LaunchConfig1D::new(
+            .prepare_fp8_gdn_output_tma_t1024(LaunchConfig1D::new(
                 t128_blocks,
                 THREADS as u32,
                 SHARED_BYTES as u32,
             ))
-            .map_err(|source| GpuError::launch("preparing dense-FP8 SwiGLU T=128", source))?;
+            .map_err(|source| GpuError::launch("preparing dense-FP8 GDN output T=128", source))?;
 
         Ok(Self {
             module,
@@ -519,10 +479,10 @@ impl DenseFp8SwiGluTmaRoute {
         })
     }
 
-    pub(super) unsafe fn launch(
+    pub(crate) unsafe fn launch(
         &self,
         stream: &CudaStream,
-        maps: &DenseFp8SwiGluTmaMaps,
+        maps: &DenseFp8GdnOutputTmaMaps,
         activation_scales: *const f32,
         weight_scales: *const u16,
         output: *mut u16,
@@ -540,10 +500,10 @@ impl DenseFp8SwiGluTmaRoute {
         }
     }
 
-    pub(super) unsafe fn launch_t128(
+    pub(crate) unsafe fn launch_t128(
         &self,
         stream: &CudaStream,
-        maps: &DenseFp8SwiGluTmaMaps,
+        maps: &DenseFp8GdnOutputTmaMaps,
         activation_scales: *const f32,
         weight_scales: *const u16,
         output: *mut u16,
@@ -563,9 +523,9 @@ impl DenseFp8SwiGluTmaRoute {
 
     unsafe fn launch_prepared(
         &self,
-        prepared: &PreparedLaunch<kernels::__fp8_swiglu_tma_t1024_CudaKernel>,
+        prepared: &PreparedLaunch<kernels::__fp8_gdn_output_tma_t1024_CudaKernel>,
         stream: &CudaStream,
-        maps: &DenseFp8SwiGluTmaMaps,
+        maps: &DenseFp8GdnOutputTmaMaps,
         activation_scales: *const f32,
         weight_scales: *const u16,
         output: *mut u16,
@@ -574,11 +534,11 @@ impl DenseFp8SwiGluTmaRoute {
             || !Arc::ptr_eq(stream.context(), maps.weight_code_map.context())
         {
             return Err(GpuError::invalid_launch(
-                "dense-FP8 SwiGLU tensor maps belong to another CUDA context",
+                "dense-FP8 GDN output tensor maps belong to another CUDA context",
             ));
         }
         self.module
-            .fp8_swiglu_tma_t1024(
+            .fp8_gdn_output_tma_t1024(
                 stream,
                 prepared,
                 maps.activation_code_map.cu_deviceptr() as *const cuda_device::tma::TmaDescriptor,
@@ -587,12 +547,12 @@ impl DenseFp8SwiGluTmaRoute {
                 weight_scales,
                 output,
             )
-            .map_err(|source| GpuError::launch("launching dense-FP8 SwiGLU TMA", source))
+            .map_err(|source| GpuError::launch("launching dense-FP8 GDN output TMA", source))
     }
 }
 
 pub(super) fn ptx_name() -> &'static str {
-    "fp8_swiglu_tma_t1024"
+    "fp8_gdn_output_tma_t1024"
 }
 
 fn create_map(
@@ -608,8 +568,8 @@ fn create_map(
     let strides = [row_stride];
     let box_dimensions = [box_columns, box_rows];
     let element_strides = [1u32, 1];
-    // SAFETY: every pointer references fixed-size local metadata and the caller
-    // provides the exact live device allocation encoded by this descriptor.
+    // SAFETY: metadata has exact fixed sizes and the caller supplies the live
+    // address-stable allocation encoded by the descriptor.
     let result = unsafe {
         cuTensorMapEncodeTiled(
             descriptor.as_mut_ptr(),
@@ -628,26 +588,28 @@ fn create_map(
     };
     if result != cuda_sys::cudaError_enum_CUDA_SUCCESS {
         return Err(GpuError::invalid_launch(format!(
-            "encoding dense-FP8 SwiGLU tensor map failed: {result:?}"
+            "encoding dense-FP8 GDN output tensor map failed: {result:?}"
         )));
     }
 
-    // SAFETY: CUDA_SUCCESS initializes the complete opaque descriptor.
+    // SAFETY: CUDA_SUCCESS initializes the full opaque descriptor.
     Ok(unsafe { descriptor.assume_init() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCK_K, BLOCK_M, BLOCK_N, CONSUMER_WARPS, PRODUCER_THREADS, SHARED_BYTES, THREADS, TOKENS,
+        BLOCK_K, BLOCK_M, BLOCK_N, CONSUMER_WARPS, K_TILES, KDIM, PRODUCER_THREADS, SHARED_BYTES,
+        THREADS, TOKENS,
     };
 
     #[test]
-    fn exact_tma_geometry_preserves_the_retained_route() {
+    fn exact_tma_geometry_preserves_the_gdn_output_route() {
         assert_eq!(TOKENS, 1_024);
         assert_eq!((BLOCK_M, BLOCK_N, BLOCK_K), (128, 64, 64));
         assert_eq!(PRODUCER_THREADS + CONSUMER_WARPS * 32, THREADS);
         assert_eq!(THREADS, 288);
-        assert_eq!(SHARED_BYTES, 49_200);
+        assert_eq!(SHARED_BYTES, 36_912);
+        assert_eq!(K_TILES, KDIM / 64);
     }
 }

@@ -144,9 +144,9 @@ pub fn qualify_full_attention_layer(
     let stable_base = program.base_address();
     let stable_addresses = program.qualification_addresses()?;
     let stable_descriptors = program.qualification_descriptors(&stream)?;
-    if stable_addresses.len() != 51 {
+    if stable_addresses.len() != 55 {
         return Err(FullAttentionLayerQualificationError::Mismatch(format!(
-            "owner exposes {} addresses, expected 51",
+            "owner exposes {} addresses, expected 55",
             stable_addresses.len()
         )));
     }
@@ -155,7 +155,7 @@ pub fn qualify_full_attention_layer(
         || program.workspace_bytes() != 639_924_416
         || program.owner_bytes() != 1_015_465_152
         || program.arena_bytes() != 1_015_465_984
-        || program.descriptor_bytes() != 512
+        || program.descriptor_bytes() != 1_024
     {
         return Err(FullAttentionLayerQualificationError::Mismatch(
             "owner byte accounting differs from the admitted layout".to_string(),
@@ -1210,14 +1210,14 @@ mod tests {
         assert_eq!(report.metadata_values, 6_660_396);
         assert_eq!(report.graph_replay_values, 12 * observable_values());
         assert!(report.inactive_values > 0);
-        assert_eq!(report.immutable_descriptor_words, 768);
+        assert_eq!(report.immutable_descriptor_words, 1_536);
         assert_eq!(report.resident_weight_bytes, 372_395_008);
         assert_eq!(report.cache_bytes, 3_145_728);
         assert_eq!(report.workspace_bytes, 639_924_416);
         assert_eq!(report.owner_bytes, 1_015_465_152);
         assert_eq!(report.arena_bytes, 1_015_465_984);
         assert_eq!(report.padding_bytes, 832);
-        assert_eq!(report.descriptor_bytes, 512);
+        assert_eq!(report.descriptor_bytes, 1_024);
         assert!(report.maximum_absolute_error.is_finite());
         Ok(())
     }
