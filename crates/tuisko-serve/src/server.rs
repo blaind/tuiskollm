@@ -59,6 +59,8 @@ pub struct ServerConfig {
     pub address: SocketAddr,
     /// Environment variable containing the lifecycle-route bearer token.
     pub admin_token_env: Option<String>,
+    /// Emits live inference progress as newline-delimited snapshots.
+    pub progress_lines: bool,
 }
 
 /// Startup or listener failure from the concrete server.
@@ -212,12 +214,14 @@ struct WorkerControl {
     progress: Arc<ResidentLoadProgress>,
     interactive: bool,
     color: bool,
+    progress_lines: bool,
 }
 
 #[derive(Clone, Copy)]
 struct DisplayOptions {
     interactive: bool,
     color: bool,
+    progress_lines: bool,
 }
 
 struct WorkerRuntime {
@@ -255,6 +259,7 @@ struct InferenceDisplay {
 struct InferenceDisplayState {
     interactive: bool,
     color: bool,
+    progress_lines: bool,
     phase: Option<InferencePhase>,
     phase_epoch: u64,
     phase_started: Instant,
@@ -294,10 +299,11 @@ impl PrefillProgress {
 }
 
 impl InferenceDisplay {
-    fn new(interactive: bool, color: bool) -> Self {
+    fn new(interactive: bool, color: bool, progress_lines: bool) -> Self {
         let state = Arc::new(Mutex::new(InferenceDisplayState {
             interactive,
             color,
+            progress_lines,
             phase: None,
             phase_epoch: 0,
             phase_started: Instant::now(),
@@ -311,7 +317,7 @@ impl InferenceDisplay {
             mtp_by_request: HashMap::new(),
             session_active: false,
         }));
-        if !interactive {
+        if !interactive && !progress_lines {
             return Self {
                 state,
                 stop: None,
@@ -396,20 +402,23 @@ impl InferenceDisplay {
 
     fn clear(&mut self) {
         let mut state = self.state.lock().expect("display mutex poisoned");
-        if state.interactive && state.phase.take().is_some() {
+        if (state.interactive || state.progress_lines) && state.phase.take().is_some() {
             state.phase_epoch = state.phase_epoch.wrapping_add(1);
+            let redraw = state.interactive && !state.progress_lines;
             drop(state);
-            let mut stdout = std::io::stdout().lock();
-            let failed = stdout
-                .write_all(b"\r\x1b[2K")
-                .and_then(|_| stdout.flush())
-                .is_err();
-            drop(stdout);
-            if failed {
-                self.state
-                    .lock()
-                    .expect("display mutex poisoned")
-                    .interactive = false;
+            if redraw {
+                let mut stdout = std::io::stdout().lock();
+                let failed = stdout
+                    .write_all(b"\r\x1b[2K")
+                    .and_then(|_| stdout.flush())
+                    .is_err();
+                drop(stdout);
+                if failed {
+                    self.state
+                        .lock()
+                        .expect("display mutex poisoned")
+                        .interactive = false;
+                }
             }
         }
     }
@@ -452,9 +461,12 @@ fn inference_display_reporter(
     state: Arc<Mutex<InferenceDisplayState>>,
     stopped: std_mpsc::Receiver<()>,
 ) {
-    while let Err(std_mpsc::RecvTimeoutError::Timeout) =
-        stopped.recv_timeout(Duration::from_millis(100))
-    {
+    let interval = if state.lock().expect("display mutex poisoned").progress_lines {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_millis(100)
+    };
+    while let Err(std_mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(interval) {
         let rendered = {
             let mut state = state.lock().expect("display mutex poisoned");
             render_inference_state(&mut state)
@@ -463,7 +475,9 @@ fn inference_display_reporter(
             let mut stdout = std::io::stdout().lock();
             let current = {
                 let state = state.lock().expect("display mutex poisoned");
-                state.interactive && state.phase.is_some() && state.phase_epoch == epoch
+                (state.interactive || state.progress_lines)
+                    && state.phase.is_some()
+                    && state.phase_epoch == epoch
             };
             if current
                 && stdout
@@ -473,6 +487,7 @@ fn inference_display_reporter(
             {
                 let mut state = state.lock().expect("display mutex poisoned");
                 state.interactive = false;
+                state.progress_lines = false;
                 state.phase = None;
             }
         }
@@ -480,7 +495,7 @@ fn inference_display_reporter(
 }
 
 fn render_inference_state(state: &mut InferenceDisplayState) -> Option<(u64, String)> {
-    if !state.interactive {
+    if !state.interactive && !state.progress_lines {
         return None;
     }
     let phase = state.phase?;
@@ -502,6 +517,7 @@ fn render_inference_state(state: &mut InferenceDisplayState) -> Option<(u64, Str
             mtp_stats,
         },
         state.color,
+        state.progress_lines,
     );
     state.spinner_tick = state.spinner_tick.wrapping_add(1);
     Some((state.phase_epoch, line))
@@ -660,6 +676,7 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
     let stdout = std::io::stdout();
     let interactive = stdout.is_terminal();
     let color = interactive && std::env::var_os("NO_COLOR").is_none();
+    let progress_lines = config.progress_lines;
     let (state, ready, worker_failure) = {
         let mut stdout = stdout.lock();
         stdout.write_all(render_loading(target.model_id(), color, interactive).as_bytes())?;
@@ -670,6 +687,7 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
             &mut stdout,
             interactive,
             color,
+            progress_lines,
             startup_start,
             response_namespace,
             admin_token,
@@ -687,8 +705,15 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
             stdout.write_all(output.as_bytes())?;
             stdout.flush()?;
         }
-        serve_until_worker_failure(listener, router(state), worker_failure, interactive, color)
-            .await
+        serve_until_worker_failure(
+            listener,
+            router(state),
+            worker_failure,
+            interactive,
+            color,
+            progress_lines,
+        )
+        .await
     })
 }
 
@@ -698,9 +723,14 @@ async fn serve_until_worker_failure(
     worker_failure: oneshot::Receiver<String>,
     interactive: bool,
     color: bool,
+    progress_lines: bool,
 ) -> Result<(), ServerError> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    tokio::spawn(shutdown_signals(interactive, color, shutdown_tx));
+    tokio::spawn(shutdown_signals(
+        interactive && !progress_lines,
+        color,
+        shutdown_tx,
+    ));
     serve_until_worker_failure_or_shutdown(listener, router, worker_failure, async move {
         let _ = shutdown_rx.await;
     })
@@ -749,6 +779,7 @@ fn start_worker(
     output: &mut impl IoWrite,
     interactive: bool,
     color: bool,
+    progress_lines: bool,
     server_started: Instant,
     response_namespace: u128,
     admin_token: Option<String>,
@@ -778,6 +809,7 @@ fn start_worker(
                     progress: worker_progress,
                     interactive,
                     color,
+                    progress_lines,
                 },
             )
         })?;
@@ -865,6 +897,7 @@ fn engine_worker(
         display: DisplayOptions {
             interactive: control.interactive,
             color: control.color,
+            progress_lines: control.progress_lines,
         },
     };
     match target {
@@ -1089,6 +1122,7 @@ fn start_generator<G: TextGenerator>(
         failure,
         runtime.display.interactive,
         runtime.display.color,
+        runtime.display.progress_lines,
     );
 }
 
@@ -1121,6 +1155,7 @@ fn start_reloadable_qwen38(
         move || reload_qwen38(&snapshot).map(|(generator, _)| generator),
         runtime.display.interactive,
         runtime.display.color,
+        runtime.display.progress_lines,
     );
 }
 
@@ -1131,8 +1166,9 @@ fn serve_requests<G: TextGenerator>(
     failure: oneshot::Sender<String>,
     interactive: bool,
     color: bool,
+    progress_lines: bool,
 ) {
-    let mut display = InferenceDisplay::new(interactive, color);
+    let mut display = InferenceDisplay::new(interactive, color, progress_lines);
     let mut replies = HashMap::new();
     let mut jobs_open = true;
     let mut waiting = Vec::new();
@@ -1254,8 +1290,9 @@ fn serve_reloadable<G: ReloadableGenerator>(
     mut reload: impl FnMut() -> Result<G, String>,
     interactive: bool,
     color: bool,
+    progress_lines: bool,
 ) {
-    let mut display = InferenceDisplay::new(interactive, color);
+    let mut display = InferenceDisplay::new(interactive, color, progress_lines);
     let mut generator = Some(generator);
     let mut parked = None;
     let mut replies = HashMap::new();
@@ -1646,7 +1683,11 @@ fn render_weight_progress(
     )
 }
 
-fn render_inference_progress(progress: InferenceProgress, color: bool) -> String {
+fn render_inference_progress(
+    progress: InferenceProgress,
+    color: bool,
+    progress_lines: bool,
+) -> String {
     const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
     let frame = FRAMES[progress.spinner_tick % FRAMES.len()];
     let (label, detail) = match progress.phase {
@@ -1722,7 +1763,12 @@ fn render_inference_progress(progress: InferenceProgress, color: bool) -> String
     } else {
         ("", "")
     };
-    format!("\r\x1b[2K{active_color}{label}{reset} {frame}       {detail}…")
+    let (prefix, suffix) = if progress_lines {
+        ("", "\n")
+    } else {
+        ("\r\x1b[2K", "")
+    };
+    format!("{prefix}{active_color}{label}{reset} {frame}       {detail}…{suffix}")
 }
 
 fn compact_count(tokens: usize) -> String {
@@ -2924,6 +2970,7 @@ mod tests {
             snapshot: PathBuf::from("/snapshot/must/not/be/opened"),
             address: "0.0.0.0:8000".parse().unwrap(),
             admin_token_env: None,
+            progress_lines: false,
         })
         .unwrap_err();
 
@@ -3004,6 +3051,7 @@ mod tests {
                 failure_rx,
                 false,
                 false,
+                false,
             ));
             failure_tx.send("device launch failed".into()).unwrap();
             let error = serve.await.unwrap().unwrap_err();
@@ -3019,6 +3067,7 @@ mod tests {
                 listener,
                 router(state(jobs, true)),
                 failure_rx,
+                false,
                 false,
                 false,
             ));
@@ -3069,11 +3118,30 @@ mod tests {
                 mtp_stats: None,
             },
             false,
+            false,
         );
         assert_eq!(
             prefill,
             "\r\x1b[2KPREFILL ⠋       B2 32.8K/159.0K · left 126.3K · 5.3K tok/s · 6.2s…"
         );
+
+        let progress_line = render_inference_progress(
+            InferenceProgress {
+                phase: InferencePhase::Prefill,
+                active: 1,
+                output_tokens: 0,
+                first_output_tokens: 0,
+                spinner_tick: 0,
+                phase_elapsed: Duration::from_secs(2),
+                elapsed: Duration::from_secs(2),
+                ttft: None,
+                prefill_progress: None,
+                mtp_stats: None,
+            },
+            false,
+            true,
+        );
+        assert_eq!(progress_line, "PREFILL ⠋       1 request · 2.0 s…\n");
 
         let decode = render_inference_progress(
             InferenceProgress {
@@ -3094,6 +3162,7 @@ mod tests {
                 }),
             },
             true,
+            false,
         );
         assert!(decode.starts_with("\r\x1b[2K\x1b[1;36mDECODE\x1b[0m ⠙"));
         assert!(decode.ends_with("B3 · 41 tok · 10.0 tok/s · 4.0s · TTFT 1.0s · MTP 76.7%…"));
@@ -3224,6 +3293,7 @@ mod tests {
                         })
                     }
                 },
+                false,
                 false,
                 false,
             );
@@ -3413,6 +3483,7 @@ mod tests {
                 failure,
                 worker_lifecycle,
                 || unreachable!("park/resume fixture never reloads"),
+                false,
                 false,
                 false,
             );

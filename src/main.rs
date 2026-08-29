@@ -53,6 +53,9 @@ struct ServeArgs {
     /// Environment variable containing the lifecycle-route bearer token.
     #[arg(long, value_name = "ENV")]
     admin_token_env: Option<String>,
+    /// Prints live inference progress as newline-delimited snapshots instead of terminal redraws.
+    #[arg(long)]
+    progress_lines: bool,
 }
 
 fn main() -> ExitCode {
@@ -121,6 +124,7 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         snapshot: resolution.path,
         address: args.address,
         admin_token_env: args.admin_token_env,
+        progress_lines: args.progress_lines,
     })
     .map_err(|error| error.to_string())
 }
@@ -340,6 +344,7 @@ mod tests {
                     snapshot: None,
                     address: DEFAULT_ADDRESS.parse::<SocketAddr>().unwrap(),
                     admin_token_env: None,
+                    progress_lines: false,
                 })
             );
         }
@@ -380,9 +385,16 @@ mod tests {
                     snapshot: Some(PathBuf::from("/models/pinned")),
                     address: "0.0.0.0:9123".parse().unwrap(),
                     admin_token_env: Some("TUISKO_ADMIN_TOKEN".into()),
+                    progress_lines: false,
                 })
             );
         }
+    }
+
+    #[test]
+    fn serve_accepts_newline_delimited_progress() {
+        let Command::Serve(config) = parse(&["serve", QWEN38, "--progress-lines"]).unwrap();
+        assert!(config.progress_lines);
     }
 
     #[test]
