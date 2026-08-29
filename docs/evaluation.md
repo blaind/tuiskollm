@@ -85,7 +85,8 @@ jobs would contend for the one scoring scratch slot. Full MMLU and HellaSwag run
 thousands of alternative prompts and can take hours. A limited result proves plumbing only; its
 accuracy is not evaluation authority. On an exclusive GPU, establish a measured examples/second
 rate with `--limit 10`, then `--limit 100`, before scheduling a full suite. On a shared GPU, keep
-the cases sequential and bounded, then stop the server promptly to release resident memory.
+the cases sequential and bounded. Stop the server promptly when the evaluation runner owns its
+lifecycle; leave a reused server untouched unless its owner asks otherwise.
 
 ### MMLU planning estimate
 
@@ -146,6 +147,26 @@ target/lm-eval-venv/bin/lm_eval run \
 A complete single-subject result measures that domain but is not an aggregate MMLU score. Keep
 subjects, shot counts, and output paths separate rather than presenting a hand-selected subset as
 the official 57-subject metric.
+
+#### Measured complete-subject diagnostics
+
+On 2026-08-29, three complete 100-question subjects ran zero-shot against the pinned checkpoint on
+the exact RTX 5090 target. Each subject used `batch_size=4` and `num_concurrent=1`, so the server
+scored 400 answer choices sequentially per run:
+
+| Subject | Correct | Accuracy | Standard error | Wall time |
+| --- | ---: | ---: | ---: | ---: |
+| college computer science | 81/100 | 0.81 | 0.0394 | 194.22 s |
+| abstract algebra | 72/100 | 0.72 | 0.0451 | 158.66 s |
+| medical genetics | 92/100 | 0.92 | 0.0273 | 167.23 s |
+
+The hand-selected three-subject micro-average is 245/300, or 81.7%, and is diagnostic only. It is
+not the official MMLU aggregate because it omits 54 subjects and does not preserve the suite's
+subject weighting. The medical-genetics wall time includes one retry after a transient
+`model lifecycle is unloading` response; all 400 choices ultimately completed and the harness
+wrote the aggregate and per-sample results under `target/lm-eval/`. The reused server became
+unreachable after that run without the evaluation runner stopping or signaling it, so investigate
+the server lifecycle separately before relying on unattended multi-subject runs.
 
 Generation-only tasks continue to use `local-chat-completions` and
 `http://127.0.0.1:8000/v1/chat/completions`.
