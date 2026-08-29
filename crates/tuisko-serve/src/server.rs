@@ -1,11 +1,11 @@
 //! Concrete HTTP server and resident scheduler worker.
 
 use crate::request_log::RequestLog;
-use crate::response::{overloaded_response, resume_unavailable_response, unavailable_response};
+use crate::response::{ClientStatus, connected_streaming_response, overloaded_response};
 use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
 use crate::{
     ChatCompletionRequest, ChatRequestError, GenerationReply, PreparedChatRequest,
-    blocking_response, openai_error, streaming_response,
+    blocking_response, openai_error,
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, State};
@@ -100,6 +100,7 @@ struct AppState {
 struct ChatJob {
     request: tuisko_engine::ChatGenerationRequest,
     reply: Sender<GenerationReply>,
+    client: ClientStatus,
     log: RequestLog,
 }
 
@@ -173,6 +174,7 @@ impl LifecycleState {
 
 struct ActiveReply {
     sender: Option<Sender<GenerationReply>>,
+    client: ClientStatus,
     cached_prompt_tokens: usize,
     log: RequestLog,
 }
@@ -1848,7 +1850,7 @@ fn mebibytes(bytes: usize) -> f64 {
 }
 
 fn hold_job(waiting: &mut Vec<ChatJob>, job: ChatJob, display: &mut InferenceDisplay) {
-    if job.reply.is_closed() {
+    if job.client.is_disconnected() || job.reply.is_closed() {
         display.clear();
         job.log.finish(None, 0, 0, "cancelled", None);
         return;
@@ -1870,11 +1872,19 @@ fn admit_group<G: TextGenerator>(
         .unwrap_or_else(Instant::now);
     display.prefill(batch, accepted);
     let prefill_started = Instant::now();
+    let clients = waiting
+        .iter()
+        .map(|job| job.client.clone())
+        .collect::<Vec<_>>();
     let requests = waiting.iter().map(|job| &job.request).collect::<Vec<_>>();
     let progress = display.prefill_progress();
-    let admissions = generator.admit_batch_with_progress(&requests, &mut |completed, total| {
-        progress.observe(completed, total);
-    });
+    let admissions =
+        generator.admit_batch_with_progress(&requests, &mut |index, completed, total| {
+            progress.observe(completed, total);
+            clients
+                .get(index)
+                .is_some_and(|client| !client.is_disconnected())
+        });
     let prefill_elapsed = prefill_started.elapsed();
     let prefill_tokens = admissions
         .iter()
@@ -1896,7 +1906,12 @@ fn record_admission(
     job: ChatJob,
     admission: Result<ResidentBatchAdmission, EngineError>,
 ) {
-    let ChatJob { reply, mut log, .. } = job;
+    let ChatJob {
+        reply,
+        client,
+        mut log,
+        ..
+    } = job;
     match admission {
         Ok(admission) => {
             log.observe_prompt(admission.prompt_metrics);
@@ -1917,6 +1932,7 @@ fn record_admission(
                     admission.request_id,
                     ActiveReply {
                         sender: Some(reply),
+                        client,
                         cached_prompt_tokens: admission.device_reused_tokens,
                         log,
                     },
@@ -1926,6 +1942,10 @@ fn record_admission(
         }
         Err(error) => {
             let message = error.to_string();
+            if client.is_disconnected() {
+                log.finish(None, 0, 0, "cancelled", None);
+                return;
+            }
             let response = if error.code() == Some(EngineErrorCode::Capacity) {
                 GenerationReply::Overloaded(message.clone())
             } else {
@@ -1945,9 +1965,10 @@ fn cancel_disconnected<G: TextGenerator>(
     let cancelled = generator
         .active_request_ids()
         .filter(|request| {
-            replies
-                .get(request)
-                .is_none_or(|reply| reply.sender.as_ref().is_none_or(Sender::is_closed))
+            replies.get(request).is_none_or(|reply| {
+                reply.client.is_disconnected()
+                    || reply.sender.as_ref().is_none_or(Sender::is_closed)
+            })
         })
         .collect::<Vec<_>>();
     if !cancelled.is_empty() {
@@ -2412,12 +2433,14 @@ async fn chat_completions(
         }
     };
     let accepted = Instant::now();
-    let (reply_tx, mut reply_rx) = channel(GENERATION_REPLY_BUFFER);
+    let (client, connection) = ClientStatus::connected();
+    let (reply_tx, reply_rx) = channel(GENERATION_REPLY_BUFFER);
     if let Err(error) = enqueue_chat_job(
         &state,
         ChatJob {
             request: generation,
             reply: reply_tx,
+            client,
             log: RequestLog::new(
                 numeric_id,
                 accepted,
@@ -2435,33 +2458,18 @@ async fn chat_completions(
         .unwrap_or_default()
         .as_secs();
     if stream {
-        match reply_rx.recv().await {
-            Some(GenerationReply::Rejected(message)) => {
-                openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error")
-            }
-            Some(GenerationReply::Overloaded(message)) => overloaded_response(message),
-            Some(GenerationReply::Unavailable(message)) => unavailable_response(message),
-            Some(GenerationReply::ResumeUnavailable(message)) => {
-                resume_unavailable_response(message)
-            }
-            Some(first) => streaming_response(
-                first,
-                reply_rx,
-                id,
-                created,
-                state.model_id,
-                split_reasoning,
-                parse_tools,
-                include_usage,
-            ),
-            None => openai_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "resident engine worker disconnected".into(),
-                "server_error",
-            ),
-        }
+        connected_streaming_response(
+            reply_rx,
+            id,
+            created,
+            state.model_id,
+            split_reasoning,
+            parse_tools,
+            include_usage,
+            connection,
+        )
     } else {
-        blocking_response(
+        let response = blocking_response(
             reply_rx,
             id,
             created,
@@ -2469,7 +2477,9 @@ async fn chat_completions(
             split_reasoning,
             parse_tools,
         )
-        .await
+        .await;
+        drop(connection);
+        response
     }
 }
 
@@ -2568,13 +2578,14 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, ChatJob, EnqueueError, InferencePhase, InferenceProgress, Job, LifecycleState,
-        QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerConfig, ServerError, ServerModel,
-        chat_completions, completion_id, enqueue_chat_job, fail_queued, health, load, models,
-        readiness, record_admission, render_forced_shutdown, render_inference_progress,
-        render_load_progress, render_loading, render_shutdown, render_startup,
-        render_weight_progress, router, run, serve_reloadable, serve_until_worker_failure,
-        serve_until_worker_failure_or_shutdown, try_send_generation_steps, unload,
+        AppState, ChatJob, ClientStatus, EnqueueError, InferencePhase, InferenceProgress, Job,
+        LifecycleState, QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerConfig,
+        ServerError, ServerModel, chat_completions, completion_id, enqueue_chat_job, fail_queued,
+        health, load, models, readiness, record_admission, render_forced_shutdown,
+        render_inference_progress, render_load_progress, render_loading, render_shutdown,
+        render_startup, render_weight_progress, router, run, serve_reloadable,
+        serve_until_worker_failure, serve_until_worker_failure_or_shutdown,
+        try_send_generation_steps, unload,
     };
     use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
@@ -2607,11 +2618,13 @@ mod tests {
 
     fn job() -> (ChatJob, tokio::sync::mpsc::Receiver<GenerationReply>) {
         let (reply, receiver) = channel(8);
+        let client = ClientStatus::fixture_connected();
         let started = std::time::Instant::now();
         (
             ChatJob {
                 request: ChatGenerationRequest::new(vec![ChatMessage::new("user", "hello")]),
                 reply,
+                client,
                 log: crate::request_log::RequestLog::new(1, started, started, "mtp-draft-3"),
             },
             receiver,

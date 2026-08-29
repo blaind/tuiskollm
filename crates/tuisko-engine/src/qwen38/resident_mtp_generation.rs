@@ -489,7 +489,7 @@ pub(crate) fn prime_prompt(
         slot,
         processed_prefix,
         boundary_hidden,
-        &mut |_| {},
+        &mut |_| Ok(()),
     )
 }
 
@@ -500,7 +500,7 @@ pub(crate) fn prime_prompt_with_progress(
     slot: usize,
     processed_prefix: usize,
     boundary_hidden: Option<&[u16]>,
-    progress: &mut impl FnMut(usize),
+    progress: &mut impl FnMut(usize) -> EngineResult<()>,
 ) -> EngineResult<usize> {
     if token_ids.is_empty() {
         return Err(EngineError::generation(
@@ -562,7 +562,7 @@ pub(crate) fn prime_prompt_with_progress(
         program.replay_prompt(stream, route)?;
         cursor += tokens;
         native += tokens;
-        progress(cursor);
+        progress(cursor)?;
     }
     while cursor < primed {
         replay_target_token(program, stream, token_ids[cursor], cursor)?;
@@ -580,7 +580,7 @@ pub(crate) fn prime_prompt_with_progress(
         )?;
         program.replay_prompt(stream, route)?;
         cursor += 1;
-        progress(cursor);
+        progress(cursor)?;
     }
     replay_target_token(program, stream, token_ids[primed], primed)?;
     Ok(native)

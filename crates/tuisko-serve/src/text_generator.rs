@@ -70,7 +70,7 @@ pub(crate) trait TextGenerator {
         _progress: &mut P,
     ) -> Vec<Result<ResidentBatchAdmission, EngineError>>
     where
-        P: FnMut(usize, usize),
+        P: FnMut(usize, usize, usize) -> bool,
     {
         self.admit_batch(requests)
     }
@@ -136,13 +136,14 @@ impl TextGenerator for ResidentMtpBatchGenerator {
         progress: &mut P,
     ) -> Vec<Result<ResidentBatchAdmission, EngineError>>
     where
-        P: FnMut(usize, usize),
+        P: FnMut(usize, usize, usize) -> bool,
     {
         let mut completed_before = 0usize;
         let mut total_before = 0usize;
         requests
             .iter()
-            .map(|request| {
+            .enumerate()
+            .map(|(index, request)| {
                 let mut current_total = 0usize;
                 let admission = ResidentMtpBatchGenerator::admit_with_progress(
                     self,
@@ -150,9 +151,10 @@ impl TextGenerator for ResidentMtpBatchGenerator {
                     |completed, total| {
                         current_total = total;
                         progress(
+                            index,
                             completed_before.saturating_add(completed),
                             total_before.saturating_add(total),
-                        );
+                        )
                     },
                 );
                 completed_before = completed_before.saturating_add(current_total);
