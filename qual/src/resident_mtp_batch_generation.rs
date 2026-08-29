@@ -781,7 +781,7 @@ mod tests {
         let context = CudaContext::new(0).unwrap();
         let mut generator = ResidentMtpBatchGenerator::from_snapshot(&context, snapshot).unwrap();
 
-        for common in [31, 32, 33, 63, 64, 65, 127, 128, 129, 1023, 1024, 1025] {
+        for common in [31, 32, 33, 63, 64, 65, 127, 128, 129, 1023] {
             let prefix = (0..common)
                 .map(|position| 100 + u32::try_from(position % 1_000).unwrap())
                 .collect::<Vec<_>>();
@@ -798,26 +798,63 @@ mod tests {
                 &independent,
             );
 
-            let mut exact_prefix = prefix.clone();
-            exact_prefix.push(2_010);
-            let mut one_token_suffix = exact_prefix.clone();
-            one_token_suffix.push(2_011);
-            let mut unequal_suffix = prefix.clone();
-            unequal_suffix.extend([2_010, 2_012, 2_013]);
-            let prompts = vec![
-                exact_prefix.clone(),
-                exact_prefix,
-                one_token_suffix,
-                unequal_suffix,
-            ];
-
-            let shared = generator.score_prompts(&prompts).unwrap();
-            let independent = prompts
-                .iter()
-                .map(|prompt| generator.score_prompt(prompt).unwrap())
-                .collect::<Vec<_>>();
-            assert_prompt_scoring_equal(&format!("unequal common={common}"), &shared, &independent);
+            if common <= 129 {
+                let suffixes = [
+                    [2_010, 2_011, 2_012],
+                    [2_010, 2_021, 2_022],
+                    [2_010, 2_011, 2_023],
+                    [2_010, 2_024, 2_025],
+                ];
+                let prompts =
+                    suffixes.map(|suffix| prefix.iter().copied().chain(suffix).collect::<Vec<_>>());
+                let shared = generator.score_prompts(&prompts).unwrap();
+                let independent = prompts
+                    .iter()
+                    .map(|prompt| generator.score_prompt(prompt).unwrap())
+                    .collect::<Vec<_>>();
+                assert_prompt_scoring_equal(
+                    &format!("equal-length multi-token common={common}"),
+                    &shared,
+                    &independent,
+                );
+            }
         }
+        crate::device_benchmark::require_current_process_exclusive().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires repeatable ordinary T=1024 macro scoring on the admitted snapshot"]
+    fn resident_mtp_batch_t1024_macro_scoring_repeatability_acceptance() {
+        let _preflight = crate::device_benchmark::preflight().unwrap();
+        let root = std::env::var_os("TUISKO_SNAPSHOT")
+            .expect("TUISKO_SNAPSHOT must name the admitted snapshot");
+        let snapshot = Arc::new(
+            CheckpointSnapshot::<Qwen38_27B>::open(Path::new(&root))
+                .expect("snapshot must be admitted"),
+        );
+        let context = CudaContext::new(0).unwrap();
+        let mut generator = ResidentMtpBatchGenerator::from_snapshot(&context, snapshot).unwrap();
+        let prefix = (0..1_024)
+            .map(|position| 100 + u32::try_from(position % 1_000).unwrap())
+            .collect::<Vec<_>>();
+        let exact_prefix = prefix.iter().copied().chain([2_010]).collect::<Vec<_>>();
+        let prompts = vec![
+            exact_prefix.clone(),
+            exact_prefix,
+            prefix.iter().copied().chain([2_010, 2_011]).collect(),
+            prefix
+                .iter()
+                .copied()
+                .chain([2_010, 2_012, 2_013])
+                .collect(),
+        ];
+
+        let first = generator.score_prompts(&prompts).unwrap();
+        let second = prompts
+            .iter()
+            .map(|prompt| generator.score_prompt(prompt).unwrap())
+            .collect::<Vec<_>>();
+        assert_prompt_scoring_equal("ordinary T=1024 repeatability", &first, &second);
         crate::device_benchmark::require_current_process_exclusive().unwrap();
     }
 

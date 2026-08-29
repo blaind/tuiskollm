@@ -2501,6 +2501,9 @@ fn plan_prompt_scoring_batch<T: AsRef<[u32]>>(prompts: &[T]) -> PromptScoringBat
         {
             break;
         }
+        if next == MAX_NATIVE_PREFILL_TOKENS {
+            break;
+        }
         let Some(boundary) = shared_boundary.checked_add(next) else {
             break;
         };
@@ -2711,7 +2714,7 @@ mod tests {
 
     #[test]
     fn prompt_scoring_batch_reuses_only_exact_shared_route_boundaries() {
-        for boundary in [31, 32, 33, 63, 64, 65, 127, 128, 129, 1023, 1024, 1025] {
+        for boundary in [31, 32, 33, 63, 64, 65, 127, 128, 129, 1023] {
             let prefix = vec![7; boundary];
             let mut left = prefix.clone();
             left.push(8);
@@ -2725,6 +2728,20 @@ mod tests {
                 plan.shared_routes,
                 prompt_scoring_routes(boundary + 1)[..plan.shared_routes.len()]
             );
+        }
+
+        for boundary in [1024, 1025] {
+            let prefix = vec![7; boundary];
+            let prompts = [
+                prefix.iter().copied().chain([8]).collect::<Vec<_>>(),
+                prefix.iter().copied().chain([9]).collect::<Vec<_>>(),
+            ];
+            let plan = plan_prompt_scoring_batch(&prompts);
+
+            assert_eq!(plan.common_prefix, boundary);
+            assert_eq!(plan.shared_boundary, 0);
+            assert!(plan.shared_routes.is_empty());
+            assert_eq!(plan.required_positions, boundary + 1);
         }
 
         for seam in [32, 64, 128, 1024] {
@@ -2757,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_scoring_batch_reserves_the_independent_macro_context_before_reuse() {
+    fn prompt_scoring_batch_excludes_the_unstable_macro_route() {
         let prefix = vec![7; 1_024];
         let prompts = [
             prefix.iter().copied().chain([8]).collect::<Vec<_>>(),
@@ -2765,10 +2782,10 @@ mod tests {
         ];
         let plan = plan_prompt_scoring_batch(&prompts);
 
-        assert_eq!(plan.shared_routes, [1_024]);
-        assert_eq!(plan.shared_boundary, 1_024);
+        assert!(plan.shared_routes.is_empty());
+        assert_eq!(plan.shared_boundary, 0);
         assert_eq!(plan.required_positions, 1_025);
-        assert_eq!(plan.shared_boundary.div_ceil(ATTENTION_PAGE_SIZE), 16);
+        assert_eq!(prefix.len().div_ceil(ATTENTION_PAGE_SIZE), 16);
         assert_eq!(plan.required_positions.div_ceil(ATTENTION_PAGE_SIZE), 17);
     }
 
