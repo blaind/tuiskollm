@@ -59,8 +59,8 @@ pub use tuisko_kernels_sm120_moe::{
 };
 pub use tuisko_kernels_sm120_mtp::{
     MtpBf16AttentionOutputOp, MtpBf16FusionOp, MtpBf16MlpOp, MtpBf16PagedGqaOp, MtpBf16QkPrepareOp,
-    MtpBf16QkvOp, Qwen35MtpBf16AttentionOutputOp, Qwen35MtpBf16FusionOp, Qwen35MtpBf16MlpOp,
-    Qwen35MtpBf16PagedGqaOp, Qwen35MtpBf16QkPrepareOp, Qwen35MtpBf16QkvOp,
+    MtpBf16QkvOp, MtpBf16SplitKvPagedGqaOp, Qwen35MtpBf16AttentionOutputOp, Qwen35MtpBf16FusionOp,
+    Qwen35MtpBf16MlpOp, Qwen35MtpBf16PagedGqaOp, Qwen35MtpBf16QkPrepareOp, Qwen35MtpBf16QkvOp,
     Qwen36MtpBf16AttentionOutputOp, Qwen36MtpBf16FusionOp, Qwen36MtpBf16QkvOp,
 };
 pub use tuisko_kernels_sm120_norm::{Qwen35ResidualNormOp, Qwen36ResidualNormOp, ResidualNormOp};

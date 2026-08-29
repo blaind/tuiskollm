@@ -2235,6 +2235,126 @@ pub(crate) unsafe fn long_context_paged_gqa_partial<A: Arch, const TOKENS: usize
     }
 }
 
+/// Produces one stable online-softmax partial over represented-BF16 MTP K/V.
+///
+/// This preserves the scalar FP32 QK/PV arithmetic of the admitted MTP route;
+/// only the context partition is moved from one warp in a 24-CTA grid to one
+/// warp in a cross-CTA grid.
+///
+/// # Safety
+///
+/// All planes and metadata must satisfy the public split-KV launch contract,
+/// and the three partial planes must cover the maximum partition geometry.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn long_context_bf16_paged_gqa_partial<A: Arch, const TOKENS: usize>(
+    query: *const f32,
+    key_pages: *const u16,
+    value_pages: *const u16,
+    block_tables: *const u32,
+    table_rows: *const u32,
+    table_stride: u32,
+    lengths: *const u32,
+    partial_maximum: *mut f32,
+    partial_denominator: *mut f32,
+    partial_numerator: *mut f32,
+    launched_partitions: u32,
+) {
+    let block = thread::blockIdx_x() as usize;
+    let launched_partitions = launched_partitions as usize;
+    let partition = block % launched_partitions;
+    let head_token = block / launched_partitions;
+    let token = head_token / A::NUM_ATTENTION_HEADS;
+    if token >= TOKENS {
+        return;
+    }
+    let query_head = head_token - token * A::NUM_ATTENTION_HEADS;
+    let kv_head = query_head / (A::NUM_ATTENTION_HEADS / A::NUM_KV_HEADS);
+    let length = unsafe { *lengths.add(token) as usize };
+    let first_position = partition * LONG_CONTEXT_PARTITION_SIZE;
+    if first_position >= length {
+        return;
+    }
+
+    let lane = thread::threadIdx_x() as usize;
+    let dimension = lane * VALUES_PER_LANE;
+    let query = unsafe {
+        query.add((token * A::NUM_ATTENTION_HEADS + query_head) * A::HEAD_DIM + dimension)
+    };
+    let table_row = unsafe { *table_rows.add(token) as usize };
+    let block_table = unsafe { block_tables.add(table_row * table_stride as usize) };
+    let q = unsafe {
+        [
+            *query,
+            *query.add(1),
+            *query.add(2),
+            *query.add(3),
+            *query.add(4),
+            *query.add(5),
+            *query.add(6),
+            *query.add(7),
+        ]
+    };
+    let mut accumulator = [0.0f32; VALUES_PER_LANE];
+    let mut maximum = -1.0e30f32;
+    let mut denominator = 0.0f32;
+    let partition_end = core::cmp::min(first_position + LONG_CONTEXT_PARTITION_SIZE, length);
+    let mut position = first_position;
+
+    while position < partition_end {
+        let physical_page = unsafe { *block_table.add(position / PAGE_SIZE) as usize };
+        let page_offset = position & (PAGE_SIZE - 1);
+        let cache_element = A::HEAD_DIM
+            * (page_offset + PAGE_SIZE * (kv_head + A::NUM_KV_HEADS * physical_page))
+            + dimension;
+        let key = unsafe { load_bf16x8(key_pages.add(cache_element)) };
+        let value = unsafe { load_bf16x8(value_pages.add(cache_element)) };
+        let mut score = 0.0f32;
+        let mut element = 0usize;
+        while element < VALUES_PER_LANE {
+            score = float::fma_rn_f32(q[element], key[element], score);
+            element += 1;
+        }
+        score = warp::reduce_sum_f32(score) * 0.0625;
+
+        if score > maximum {
+            let old_scale = fast_exp(maximum - score);
+            denominator = denominator * old_scale + 1.0;
+            maximum = score;
+            element = 0;
+            while element < VALUES_PER_LANE {
+                accumulator[element] =
+                    float::fma_rn_f32(1.0, value[element], accumulator[element] * old_scale);
+                element += 1;
+            }
+        } else {
+            let weight = fast_exp(score - maximum);
+            denominator += weight;
+            element = 0;
+            while element < VALUES_PER_LANE {
+                accumulator[element] =
+                    float::fma_rn_f32(weight, value[element], accumulator[element]);
+                element += 1;
+            }
+        }
+        position += 1;
+    }
+
+    let partial = head_token * LONG_CONTEXT_MAX_PARTITIONS + partition;
+    if lane == 0 {
+        unsafe {
+            *partial_maximum.add(partial) = maximum;
+            *partial_denominator.add(partial) = denominator;
+        }
+    }
+    let numerator = unsafe { partial_numerator.add(partial * A::HEAD_DIM + dimension) };
+    let mut element = 0usize;
+    while element < VALUES_PER_LANE {
+        unsafe { *numerator.add(element) = accumulator[element] };
+        element += 1;
+    }
+}
+
 #[inline(always)]
 fn update_long_context_mtp_row(
     score: f32,
@@ -2714,7 +2834,13 @@ pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: u
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn long_context_paged_gqa_reduce<A: Arch, const TOKENS: usize>(
+/// Merges cross-CTA online-softmax statistics in ascending partition order.
+///
+/// # Safety
+///
+/// The partial planes must contain every active partition for the lengths,
+/// and output must cover every launched token and query head.
+pub unsafe fn long_context_paged_gqa_reduce<A: Arch, const TOKENS: usize>(
     lengths: *const u32,
     partial_maximum: *const f32,
     partial_denominator: *const f32,

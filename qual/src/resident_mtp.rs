@@ -47,6 +47,8 @@ pub struct ResidentMtpQualification {
     pub prompt_routes: usize,
     /// Exact compact draft routes checked eagerly and by graph replay.
     pub draft_routes: usize,
+    /// Long-context split-KV draft routes checked eagerly and by graph replay.
+    pub long_draft_routes: usize,
     /// Exact compact residual-continuation routes checked eagerly and by graph replay.
     pub continuation_routes: usize,
     /// Exact compact staged-hidden continuation routes checked eagerly and by graph replay.
@@ -109,7 +111,8 @@ pub fn qualify_resident_mtp(
     let stable_bases = (program.base_address(), program.cache_base_address());
     let stable_addresses = program.qualification_addresses()?;
     let stable_host_stagers = program.qualification_host_stager_addresses();
-    if stable_addresses.len() != 44
+    const EXPECTED_STABLE_ADDRESSES: usize = 47;
+    if stable_addresses.len() != EXPECTED_STABLE_ADDRESSES
         || stable_addresses
             .iter()
             .copied()
@@ -118,8 +121,8 @@ pub fn qualify_resident_mtp(
             != stable_addresses.len()
     {
         return Err(ResidentMtpQualificationError::Mismatch(format!(
-            "resident MTP exposes {} addresses, expected 44 unique addresses",
-            stable_addresses.len()
+            "resident MTP exposes {} addresses, expected {EXPECTED_STABLE_ADDRESSES} unique addresses",
+            stable_addresses.len(),
         )));
     }
     if stable_host_stagers
@@ -139,6 +142,7 @@ pub fn qualify_resident_mtp(
         source_oracle_suites: 2,
         prompt_routes: 0,
         draft_routes: 0,
+        long_draft_routes: 0,
         continuation_routes: 0,
         staged_continuation_routes: 0,
         prime_routes: 0,
@@ -195,8 +199,80 @@ pub fn qualify_resident_mtp(
     verify_scalar_tails(&mut program, &stream, &mut report)?;
     verify_lifecycle(&mut program, &stream, &mut report)?;
     verify_no_post_warmup_allocation(&context, &mut program, &stream)?;
+    verify_long_draft_routes(
+        &mut program,
+        &stream,
+        embedding,
+        stable_bases,
+        &stable_addresses,
+        &stable_host_stagers,
+        &mut report,
+    )?;
     device_benchmark::require_current_process_exclusive()?;
     Ok(report)
+}
+
+fn verify_long_draft_routes(
+    program: &mut ResidentMtpProgram,
+    stream: &CudaStream,
+    embedding: &[u8],
+    stable_bases: (u64, u64),
+    stable_addresses: &[usize],
+    stable_host_stagers: &[usize; 7],
+    report: &mut ResidentMtpQualification,
+) -> Result<(), ResidentMtpQualificationError> {
+    const LENGTHS: [usize; 6] = [1_793, 4_097, 16_385, 65_537, 131_073, 220_000];
+
+    for slot in 0..MAX_BATCH {
+        program.truncate_kv_slot_tokens(stream, slot, 0)?;
+    }
+    program.reserve_kv_slot_tokens(stream, 0, 220_000)?;
+
+    for (index, length) in LENGTHS.into_iter().enumerate() {
+        let position = u32::try_from(length - 1).expect("admitted long context fits u32");
+        let positions = [position];
+        let tokens = token_ids(20_000 + index, 1);
+        let hidden = hidden_fixture(1, 20_000 + index);
+        let (cosine, sine) = rope(&positions);
+        program.reset_slot(stream, 0)?;
+        program.target().load_residual(stream, 1, &hidden)?;
+        let route = program.stage_draft(stream, &[0], &positions, &tokens, &cosine, &sine)?;
+
+        program.qualification_reset_outputs(stream, 0xa5)?;
+        program.qualification_launch_eager_draft(stream, route)?;
+        let eager = program.qualification_observables(stream, 1, true)?;
+        let eager_cache = read_draft_cache(program, stream, &[0], &positions)?;
+        verify_inputs(
+            program,
+            stream,
+            embedding,
+            &tokens,
+            &hidden,
+            &[0],
+            &positions,
+            &cosine,
+            &sine,
+            &eager,
+        )?;
+
+        program.reset_slot(stream, 0)?;
+        program.qualification_reset_outputs(stream, 0xa5)?;
+        program.replay_draft(stream, route)?;
+        let replay = program.qualification_observables(stream, 1, true)?;
+        let replay_cache = read_draft_cache(program, stream, &[0], &positions)?;
+        compare_observables("long draft", 1, &eager, &replay, report)?;
+        compare_cache("long draft", 1, &eager_cache, &replay_cache)?;
+        verify_stable(
+            program,
+            stable_bases,
+            stable_addresses,
+            stable_host_stagers,
+            "long draft",
+            1,
+        )?;
+        report.long_draft_routes += 1;
+    }
+    Ok(())
 }
 
 fn run_source_oracles() -> Result<(), ResidentMtpQualificationError> {
@@ -258,11 +334,11 @@ fn run_source_oracles() -> Result<(), ResidentMtpQualificationError> {
 fn verify_owner(program: &ResidentMtpProgram) -> Result<(), ResidentMtpQualificationError> {
     if program.resident_weight_bytes() != 849_398_784
         || program.cache_bytes() != 901_251_072
-        || program.workspace_bytes() != 122_904_032
-        || program.owner_bytes() != 1_873_554_176
+        || program.workspace_bytes() != 293_307_872
+        || program.owner_bytes() != 2_043_958_016
         || program.padding_bytes() != 288
         || program.host_stager_bytes() != 10_842_112
-        || program.graph_count() != 37
+        || program.graph_count() != 177
     {
         return Err(ResidentMtpQualificationError::Mismatch(
             "resident MTP byte or graph accounting differs from the admitted layout".to_string(),
@@ -1184,20 +1260,21 @@ mod tests {
     use super::{PROMPT_ROUTES, REALIGN_ROUTES};
 
     #[test]
-    fn resident_mtp_suite_inventory_is_exact() {
+    fn qwen38_resident_mtp_suite_inventory_is_exact() {
         assert_eq!(PROMPT_ROUTES, [1, 32, 64, 128, 1_024]);
         assert_eq!(REALIGN_ROUTES, 4);
     }
 
     #[test]
     #[ignore = "requires the admitted source snapshot and an exclusive RTX 5090"]
-    fn resident_mtp_suite_source_values_match_every_route_and_lifecycle() {
+    fn qwen38_resident_mtp_suite_source_values_match_every_route_and_lifecycle() {
         let root = std::env::var_os("TUISKO_SNAPSHOT")
             .expect("TUISKO_SNAPSHOT must name the admitted snapshot");
         let report = super::qualify_resident_mtp(Path::new(&root)).unwrap();
         assert_eq!(report.source_oracle_suites, 2);
         assert_eq!(report.prompt_routes, 5);
         assert_eq!(report.draft_routes, 8);
+        assert_eq!(report.long_draft_routes, 6);
         assert_eq!(report.continuation_routes, 8);
         assert_eq!(report.staged_continuation_routes, 8);
         assert_eq!(report.prime_routes, 4);

@@ -15,7 +15,8 @@ pub mod shared_device {
     pub use crate::device::attention_qk_prepare::bf16_attention_qk_prepare;
     pub use crate::device::paged_gqa::{
         DECODE_RING_SHARED_BYTES, DECODE_SHARED_VALUES, DECODE_THREADS, bf16_paged_gqa,
-        bf16_paged_gqa_partitioned,
+        bf16_paged_gqa_partitioned, long_context_bf16_paged_gqa_partial,
+        long_context_paged_gqa_reduce,
     };
 }
 

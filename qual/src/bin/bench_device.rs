@@ -21,8 +21,8 @@ use tuisko_qual::{
     benchmark_gdn_prepare, benchmark_gdn_recurrence, benchmark_long_context_mtp_paged_gqa,
     benchmark_long_context_paged_gqa, benchmark_mtp_bf16_attention_output,
     benchmark_mtp_bf16_fusion, benchmark_mtp_bf16_mlp, benchmark_mtp_bf16_paged_gqa,
-    benchmark_mtp_bf16_qk_prepare, benchmark_mtp_bf16_qkv, benchmark_mtp_layer,
-    benchmark_mtp_prompt_prime, benchmark_nvfp4_mlp, benchmark_paged_gqa,
+    benchmark_mtp_bf16_qk_prepare, benchmark_mtp_bf16_qkv, benchmark_mtp_bf16_split_kv_paged_gqa,
+    benchmark_mtp_layer, benchmark_mtp_prompt_prime, benchmark_nvfp4_mlp, benchmark_paged_gqa,
     benchmark_qwen35_attention_qk_prepare, benchmark_qwen35_full_attention_layer,
     benchmark_qwen35_gdn_layer, benchmark_qwen35_gdn_prepare, benchmark_qwen35_gdn_recurrence,
     benchmark_qwen35_mtp_batch_generation, benchmark_qwen35_mtp_generation,
@@ -183,6 +183,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             let (options, json_path) =
                 parse_options(arguments, DeviceBenchmarkOptions::short_graph())?;
             (benchmark_mtp_bf16_paged_gqa(options)?, json_path)
+        }
+        #[cfg(feature = "device")]
+        "mtp-bf16-split-kv-paged-gqa" => {
+            let (options, json_path) =
+                parse_options(arguments, DeviceBenchmarkOptions::long_graph())?;
+            (benchmark_mtp_bf16_split_kv_paged_gqa(options)?, json_path)
         }
         #[cfg(feature = "device")]
         "mtp-bf16-attention-output" => {

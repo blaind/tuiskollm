@@ -3,7 +3,7 @@
 use crate::common::math::{product, sum};
 use crate::{EngineResult, LONG_CONTEXT_PHYSICAL_PAGES, LayerMemoryLayout, MAX_BATCH};
 use tuisko_gpu::{ArenaLayout, ArenaRegion};
-use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
+use tuisko_kernels_sm120::{ATTENTION_PAGE_SIZE, LONG_CONTEXT_GQA_MAX_PARTITIONS};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const ALIGNMENT: usize = 256;
@@ -38,6 +38,9 @@ pub(crate) struct ResidentMtpRegions {
     pub(crate) lengths: ArenaRegion<u32>,
     pub(crate) query: ArenaRegion<f32>,
     pub(crate) attention: ArenaRegion<f32>,
+    pub(crate) attention_partial_maximum: ArenaRegion<f32>,
+    pub(crate) attention_partial_denominator: ArenaRegion<f32>,
+    pub(crate) attention_partial_numerator: ArenaRegion<f32>,
     pub(crate) attention_activation: ArenaRegion<u16>,
     pub(crate) attention_branch: ArenaRegion<u16>,
     pub(crate) post_attention_residual: ArenaRegion<u16>,
@@ -89,6 +92,20 @@ impl ResidentMtpLayout {
             "resident MTP batch attention",
             MAX_BATCH,
             A::ATTENTION_OUTPUT_COLUMNS,
+        )?;
+        let batch_attention_partials = product(
+            "resident MTP batch attention partials",
+            product(
+                "resident MTP batch attention heads",
+                MAX_BATCH,
+                A::NUM_ATTENTION_HEADS,
+            )?,
+            LONG_CONTEXT_GQA_MAX_PARTITIONS,
+        )?;
+        let batch_attention_numerator = product(
+            "resident MTP batch attention numerator",
+            batch_attention_partials,
+            A::HEAD_DIM,
         )?;
         let batch_intermediate = product(
             "resident MTP batch intermediate",
@@ -147,6 +164,9 @@ impl ResidentMtpLayout {
             lengths: arena.reserve(MTP_PROMPT_ROWS, ALIGNMENT)?,
             query: arena.reserve(prompt_attention, ALIGNMENT)?,
             attention: arena.reserve(batch_attention, ALIGNMENT)?,
+            attention_partial_maximum: arena.reserve(batch_attention_partials, ALIGNMENT)?,
+            attention_partial_denominator: arena.reserve(batch_attention_partials, ALIGNMENT)?,
+            attention_partial_numerator: arena.reserve(batch_attention_numerator, ALIGNMENT)?,
             attention_activation: arena.reserve(batch_attention, ALIGNMENT)?,
             attention_branch: arena.reserve(batch_hidden, ALIGNMENT)?,
             post_attention_residual: arena.reserve(batch_hidden, ALIGNMENT)?,
@@ -224,6 +244,9 @@ impl ResidentMtpLayout {
                 regions.lengths.byte_len(),
                 regions.query.byte_len(),
                 regions.attention.byte_len(),
+                regions.attention_partial_maximum.byte_len(),
+                regions.attention_partial_denominator.byte_len(),
+                regions.attention_partial_numerator.byte_len(),
                 regions.attention_activation.byte_len(),
                 regions.attention_branch.byte_len(),
                 regions.post_attention_residual.byte_len(),
@@ -329,10 +352,10 @@ mod tests {
 
         assert_eq!(layout.resident_weight_bytes(), 849_398_784);
         assert_eq!(layout.cache_bytes(), 901_251_072);
-        assert_eq!(layout.workspace_bytes(), 122_904_032);
-        assert_eq!(layout.arena_bytes(), 972_303_104);
+        assert_eq!(layout.workspace_bytes(), 293_307_872);
+        assert_eq!(layout.arena_bytes(), 1_142_706_944);
         assert_eq!(layout.cache_arena_bytes(), 901_251_072);
-        assert_eq!(layout.owner_bytes(), 1_873_554_176);
+        assert_eq!(layout.owner_bytes(), 2_043_958_016);
         assert_eq!(layout.padding_bytes(), 288);
     }
 
@@ -368,6 +391,9 @@ mod tests {
             span(regions.lengths),
             span(regions.query),
             span(regions.attention),
+            span(regions.attention_partial_maximum),
+            span(regions.attention_partial_denominator),
+            span(regions.attention_partial_numerator),
             span(regions.attention_activation),
             span(regions.attention_branch),
             span(regions.post_attention_residual),

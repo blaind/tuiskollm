@@ -97,6 +97,10 @@ mod mtp_bf16_qkv;
 #[cfg(feature = "device")]
 mod mtp_bf16_qkv_benchmark;
 #[cfg(feature = "device")]
+mod mtp_bf16_split_kv_paged_gqa;
+#[cfg(feature = "device")]
+mod mtp_bf16_split_kv_paged_gqa_benchmark;
+#[cfg(feature = "device")]
 mod mtp_layer;
 #[cfg(feature = "device")]
 mod mtp_layer_benchmark;
@@ -527,6 +531,13 @@ pub use mtp_bf16_qkv::{
 };
 #[cfg(feature = "device")]
 pub use mtp_bf16_qkv_benchmark::benchmark_mtp_bf16_qkv;
+#[cfg(feature = "device")]
+pub use mtp_bf16_split_kv_paged_gqa::{
+    MtpBf16SplitKvPagedGqaQualification, MtpBf16SplitKvPagedGqaQualificationError,
+    qualify_mtp_bf16_split_kv_paged_gqa,
+};
+#[cfg(feature = "device")]
+pub use mtp_bf16_split_kv_paged_gqa_benchmark::benchmark_mtp_bf16_split_kv_paged_gqa;
 #[cfg(feature = "device")]
 pub use mtp_layer::{MtpLayerQualification, MtpLayerQualificationError, qualify_mtp_layer};
 #[cfg(feature = "device")]

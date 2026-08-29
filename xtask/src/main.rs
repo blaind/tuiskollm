@@ -55,10 +55,10 @@ const QWEN36_LONG_CONTEXT_KV_TEST_FILTER: &str = "qwen36_long_context_kv::tests"
 const STREAMING_WEIGHT_POOL_TEST_FILTER: &str = "streaming_weight_pool_suite_";
 const QWEN38_FLASH_NEXT_ENGRAM_STAGING_TEST_FILTER: &str =
     "qwen38_flash_next_engram_staging_suite_";
-const MTP_BF16_PAGED_GQA_BENCHMARK_FILTER: &str =
-    "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_";
+const MTP_BF16_PAGED_GQA_BENCHMARK_FILTER: &str = "paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_";
 const MTP_LAYER_TEST_FILTER: &str = "mtp_layer::tests::mtp_layer_suite_";
 const MTP_LAYER_BENCHMARK_FILTER: &str = "mtp_layer_benchmark::tests::mtp_layer_suite_";
+const RESIDENT_MTP_TEST_FILTER: &str = "qwen38_resident_mtp_suite_";
 const QWEN36_RESIDUAL_NORM_RESOURCE_BASELINE: &str =
     "qual/baselines/qwen36-residual-norm-sm120.txt";
 const QWEN35_NVFP4_SWIGLU_RESOURCE_BASELINE: &str = "qual/baselines/qwen35-nvfp4-swiglu-sm120.txt";
@@ -531,6 +531,10 @@ const BENCH_DEVICE_BASELINES: &[(&str, &[&str])] = &[
     (
         "long-context-mtp-paged-gqa",
         &[LONG_CONTEXT_PAGED_GQA_RESOURCE_BASELINE],
+    ),
+    (
+        "mtp-bf16-split-kv-paged-gqa",
+        &[MTP_BF16_PAGED_GQA_RESOURCE_BASELINE],
     ),
     (
         "dense-fp8-mlp",
@@ -1536,6 +1540,10 @@ const SUBCOMMANDS: &[Subcommand] = &[
     forwarded("bench-mtp-bf16-qkv", bench_mtp_bf16_qkv),
     forwarded("bench-mtp-bf16-qk-prepare", bench_mtp_bf16_qk_prepare),
     forwarded("bench-mtp-bf16-paged-gqa", bench_mtp_bf16_paged_gqa),
+    forwarded(
+        "bench-mtp-bf16-split-kv-paged-gqa",
+        bench_mtp_bf16_split_kv_paged_gqa,
+    ),
     forwarded("bench-dense-fp8-mlp", bench_dense_fp8_mlp),
     forwarded("bench-dense-fp8-gdn-layer", bench_dense_fp8_gdn_layer),
     forwarded("bench-full-attention-layer", bench_full_attention_layer),
@@ -3797,7 +3805,7 @@ fn qualify_resident_mtp(
     };
     run_qualification_test(
         root,
-        "resident_mtp_suite_",
+        RESIDENT_MTP_TEST_FILTER,
         QUALIFICATION_IGNORED_SERIAL_FLAGS,
         Some(("TUISKO_SNAPSHOT", snapshot.as_os_str())),
     )?;
@@ -4505,6 +4513,13 @@ fn bench_mtp_bf16_paged_gqa(
     arguments: &[std::ffi::OsString],
 ) -> Result<(), Box<dyn Error>> {
     bench_suite(root, PerformanceSuite::MtpBf16PagedGqa, arguments)
+}
+
+fn bench_mtp_bf16_split_kv_paged_gqa(
+    root: &Path,
+    arguments: &[std::ffi::OsString],
+) -> Result<(), Box<dyn Error>> {
+    run_bench_device(root, "mtp-bf16-split-kv-paged-gqa", arguments)
 }
 
 fn bench_dense_fp8_mlp(
@@ -10833,11 +10848,38 @@ fn gate_mtp_bf16_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|entry| entry.name.starts_with("mtp_bf16_paged_gqa_TID_"))
         .collect::<Vec<_>>();
+    let split_partials = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("mtp_bf16_split_kv_paged_gqa_partial_TID_")
+        })
+        .collect::<Vec<_>>();
+    let split_reductions = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .starts_with("mtp_bf16_split_kv_paged_gqa_reduce_TID_")
+        })
+        .collect::<Vec<_>>();
     require_count("MTP BF16 paged GQA", attention.len(), 8)?;
+    require_count("MTP BF16 split-KV partial", split_partials.len(), 8)?;
+    require_count("MTP BF16 split-KV reduction", split_reductions.len(), 8)?;
     for entry in &attention {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in split_partials.iter().chain(&split_reductions) {
+        if !entry.body.contains(".reqntid 32, 1, 1") || !entry.body.contains(".minnctapersm 16") {
+            return Err(format!(
+                "entry `{}` lost its 32-thread/sixteen-CTA launch bounds",
                 entry.name
             )
             .into());
@@ -10874,13 +10916,79 @@ fn gate_mtp_bf16_paged_gqa(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
+    let mut split_partial_registers = Vec::new();
+    let mut split_partial_shared = Vec::new();
+    for entry in split_partials {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        split_partial_registers.push(resource.registers);
+        split_partial_shared.push(resource.shared);
+
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["LDG.E.U16", "SHFL.BFLY", "MUFU.EX2"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+        if body.contains("F2FP.F16.E4M3.UNPACK_B") {
+            return Err(format!(
+                "entry `{}` unexpectedly decodes the MTP cache as E4M3",
+                entry.name
+            )
+            .into());
+        }
+    }
+    let mut split_reduce_registers = Vec::new();
+    let mut split_reduce_shared = Vec::new();
+    for entry in split_reductions {
+        let resource = resources
+            .get(entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}`", entry.name))?;
+        require_spill_free(entry.name, resource)?;
+        split_reduce_registers.push(resource.registers);
+        split_reduce_shared.push(resource.shared);
+
+        let body = sass_function_body(sass, entry.name)
+            .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
+        for instruction in ["SHFL.BFLY", "MUFU.EX2"] {
+            if !body.contains(instruction) {
+                return Err(
+                    format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
+                );
+            }
+        }
+    }
     registers.sort_unstable();
+    split_partial_registers.sort_unstable();
+    split_reduce_registers.sort_unstable();
     require_registers(&baseline, "attention_registers", &registers)?;
     require_uniform_value(&baseline, "shared_bytes", &shared)?;
+    require_registers(
+        &baseline,
+        "split_partial_registers",
+        &split_partial_registers,
+    )?;
+    require_registers(&baseline, "split_reduce_registers", &split_reduce_registers)?;
+    require_uniform_value(
+        &baseline,
+        "split_partial_shared_bytes",
+        &split_partial_shared,
+    )?;
+    require_uniform_value(&baseline, "split_reduce_shared_bytes", &split_reduce_shared)?;
 
     println!(
-        "MTP BF16 paged GQA gate passed: 8 decode entries, REG {:?}, STACK:0 LOCAL:0, SHARED {:?}, U16/SHFL/EX2 present and E4M3 absent",
-        registers, shared
+        "MTP BF16 paged GQA gate passed: 8 control + 8 split partial + 8 split reduce entries, REG {:?}/{:?}/{:?}, STACK:0 LOCAL:0, SHARED {:?}/{:?}/{:?}, U16/SHFL/EX2 present and E4M3 absent",
+        registers,
+        split_partial_registers,
+        split_reduce_registers,
+        shared,
+        split_partial_shared,
+        split_reduce_shared,
     );
     Ok(())
 }
@@ -15233,17 +15341,36 @@ mod tests {
         QWEN38_FLASH_NEXT_PLE_TEST_FILTER, QWEN38_FLASH_NEXT_PROJECTION_TEST_FILTER,
         QWEN38_FLASH_NEXT_PROMPT_PRIME_TEST_FILTER, QWEN38_FLASH_NEXT_QSA_LAYER_TEST_FILTER,
         QWEN38_FLASH_NEXT_RESIDENT_MODEL_TEST_FILTER, RESIDENT_MTP_BATCH_TEST_FILTER,
-        SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES, STREAMING_WEIGHT_POOL_TEST_FILTER,
-        SUBCOMMANDS, bench_device_baselines, bench_device_command, concatenated_resource_baselines,
-        contains_immediate_operand, device_is_idle, dispatch, dispatch_probe, names_opcode,
-        parse_baseline, parse_compute_pids, parse_cuda_toolkit_identity, parse_entries,
-        parse_performance_device_sample, parse_performance_iteration, parse_resources,
-        parse_rustc_identity, preflight_performance_baselines, qualification_test_arguments,
+        RESIDENT_MTP_TEST_FILTER, SM120_DEVICE_CODEGEN_CRATES, SM120_RESOURCE_BASELINES,
+        STREAMING_WEIGHT_POOL_TEST_FILTER, SUBCOMMANDS, bench_device_baselines,
+        bench_device_command, concatenated_resource_baselines, contains_immediate_operand,
+        device_is_idle, dispatch, dispatch_probe, names_opcode, parse_baseline, parse_compute_pids,
+        parse_cuda_toolkit_identity, parse_entries, parse_performance_device_sample,
+        parse_performance_iteration, parse_resources, parse_rustc_identity,
+        preflight_performance_baselines, qualification_test_arguments,
         require_consumed_baseline_keys, require_count, require_registers, require_uniform_value,
         resolve_target_output, sass_function_body, workspace_root,
     };
     use std::collections::BTreeSet;
     use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn qwen38_resident_mtp_filter_selects_oracles_and_accounting_only() {
+        let selected = [
+            "resident_mtp::tests::qwen38_resident_mtp_suite_inventory_is_exact",
+            "resident_mtp::tests::qwen38_resident_mtp_suite_source_values_match_every_route_and_lifecycle",
+            "resident_mtp_benchmark::tests::qwen38_resident_mtp_suite_benchmark_inventory_and_accounting_are_exact",
+        ];
+        for test in selected {
+            assert!(test.contains(RESIDENT_MTP_TEST_FILTER));
+        }
+        for excluded in [
+            "qwen35_resident_mtp::tests::qwen35_resident_mtp_suite_inventory_is_exact",
+            "qwen35_resident_mtp_benchmark::tests::qwen35_resident_mtp_suite_benchmark_inventory_and_accounting_are_exact",
+        ] {
+            assert!(!excluded.contains(RESIDENT_MTP_TEST_FILTER));
+        }
+    }
     use std::fs;
     use std::path::Path;
 
@@ -15525,10 +15652,13 @@ mod tests {
     }
 
     #[test]
-    fn mtp_paged_gqa_benchmark_filter_selects_both_accounting_tests() {
+    fn mtp_paged_gqa_benchmark_filter_selects_all_accounting_tests() {
         for test in [
             "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_byte_accounting_covers_every_query_head_cache_read",
             "bf16_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_arena_accounting_exposes_every_padding_byte",
+            "mtp_bf16_split_kv_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_split_kv_byte_accounting_covers_partition_and_reduction_traffic",
+            "mtp_bf16_split_kv_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_split_kv_each_batch_uses_only_the_shared_resident_page_pool",
+            "mtp_bf16_split_kv_paged_gqa_benchmark::tests::mtp_bf16_paged_gqa_split_kv_arena_accounting_exposes_every_owner_and_padding_byte",
         ] {
             assert!(test.contains(MTP_BF16_PAGED_GQA_BENCHMARK_FILTER));
         }
@@ -16733,7 +16863,7 @@ mod tests {
             ),
             (
                 "qualify-resident-mtp",
-                "resident_mtp_suite_",
+                RESIDENT_MTP_TEST_FILTER,
                 SERIAL,
                 SNAPSHOT,
             ),
