@@ -122,3 +122,22 @@ A finalized-server MMLU abstract-algebra zero-shot `--limit 10 --batch_size 4` s
 5.1 seconds, down from about 17 seconds. The aggregate accuracy remained 7/10, and all ten logged
 sample prompts, loglikelihood responses, targets, and correctness fields matched the earlier run
 exactly. Limited runs are timing and integration checks, not publishable quality estimates.
+
+## Rejected device-side normalizer
+
+A second 2026-08-29 hypothesis proposed replacing full-vocabulary downloads and the host FP64
+normalizer with a parallel device reduction. It was rejected before implementation or device use
+because the current API result binds the sequential token-order sum.
+
+One finite represented-BF16 counterexample has vocabulary width 248,320, token zero at `0.0`, and
+every remaining token at `-37.0`. The host loop adds each `exp(-37)` after `1.0`; every contribution
+is below half an FP64 ULP there, so the denominator remains exactly `1.0` and the f32 top logprob is
+`0.0` (`0x00000000`). A representative 256-lane partial/tree reduction first groups those small
+terms, producing denominator `1.0000000000211064` and f32 top logprob `-2.110645e-11`
+(`0xadb9a780`). That is a material response change, not a one-ULP deviation. CUDA and host
+transcendental implementations also have distinct identity risk.
+
+A future compact normalizer therefore needs either an explicitly revised response-numerics
+contract or an exact token-order algorithm with a directly measured production-owner win. The
+rejected evidence is preserved at
+`target/benchmarks/prompt-scoring-device-reduction-rejected.json`.
