@@ -8,13 +8,67 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::convert::Infallible;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use tokio::sync::mpsc::{Receiver, channel};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tuisko_engine::GeneratedText;
 
 // Bounded so a connected-but-stalled client backpressures the pump instead of buffering
 // the whole generation in RAM.
 const STREAM_EVENT_BUFFER: usize = 32;
+
+/// Shared cancellation state observed by the resident scheduler.
+#[derive(Clone, Debug)]
+pub(crate) struct ClientStatus(Arc<AtomicBool>);
+
+/// Response-lifetime guard that marks its client disconnected when dropped.
+pub(crate) struct ClientConnection {
+    status: ClientStatus,
+}
+
+impl ClientStatus {
+    /// Creates connected scheduler state and its response-lifetime guard.
+    pub(crate) fn connected() -> (Self, ClientConnection) {
+        let status = Self(Arc::new(AtomicBool::new(false)));
+        let connection = ClientConnection {
+            status: status.clone(),
+        };
+        (status, connection)
+    }
+
+    #[cfg(test)]
+    /// Creates connected scheduler state without a lifetime guard for fixtures.
+    pub(crate) fn fixture_connected() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Whether the response owner has been dropped.
+    pub(crate) fn is_disconnected(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ClientConnection {
+    fn drop(&mut self) {
+        self.status.0.store(true, Ordering::Release);
+    }
+}
+
+struct ClientEventStream {
+    events: ReceiverStream<Result<Event, Infallible>>,
+    _connection: ClientConnection,
+}
+
+impl Stream for ClientEventStream {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.events).poll_next(context)
+    }
+}
 
 /// One exact scheduler-to-HTTP reply.
 pub enum GenerationReply {
@@ -131,6 +185,53 @@ pub async fn blocking_response(
 /// not a rejection before committing to the stream shape.
 pub fn streaming_response(
     first: GenerationReply,
+    replies: Receiver<GenerationReply>,
+    id: String,
+    created: u64,
+    model_id: &'static str,
+    split_reasoning: bool,
+    parse_tools: bool,
+    include_usage: bool,
+) -> Response {
+    let connection = ClientStatus::connected().1;
+    streaming_response_with_connection(
+        Some(first),
+        replies,
+        id,
+        created,
+        model_id,
+        split_reasoning,
+        parse_tools,
+        include_usage,
+        connection,
+    )
+}
+
+pub(crate) fn connected_streaming_response(
+    replies: Receiver<GenerationReply>,
+    id: String,
+    created: u64,
+    model_id: &'static str,
+    split_reasoning: bool,
+    parse_tools: bool,
+    include_usage: bool,
+    connection: ClientConnection,
+) -> Response {
+    streaming_response_with_connection(
+        None,
+        replies,
+        id,
+        created,
+        model_id,
+        split_reasoning,
+        parse_tools,
+        include_usage,
+        connection,
+    )
+}
+
+fn streaming_response_with_connection(
+    first: Option<GenerationReply>,
     mut replies: Receiver<GenerationReply>,
     id: String,
     created: u64,
@@ -138,6 +239,7 @@ pub fn streaming_response(
     split_reasoning: bool,
     parse_tools: bool,
     include_usage: bool,
+    connection: ClientConnection,
 ) -> Response {
     let (events_tx, events_rx) = channel::<Result<Event, Infallible>>(STREAM_EVENT_BUFFER);
     tokio::spawn(async move {
@@ -161,7 +263,7 @@ pub fn streaming_response(
 
         let mut parser = AssistantStreamParser::new(split_reasoning, parse_tools);
         let mut terminal = false;
-        let mut next = Some(first);
+        let mut next = first;
         loop {
             let reply = match next.take() {
                 Some(reply) => reply,
@@ -282,7 +384,10 @@ pub fn streaming_response(
         }
         let _ = events_tx.send(Ok(Event::default().data("[DONE]"))).await;
     });
-    let stream = ReceiverStream::new(events_rx);
+    let stream = ClientEventStream {
+        events: ReceiverStream::new(events_rx),
+        _connection: connection,
+    };
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
@@ -437,7 +542,8 @@ fn stream_chunk(mut chunk: Value, include_usage: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        GenerationReply, STREAM_EVENT_BUFFER, blocking_response, streaming_response, tool_call_id,
+        ClientConnection, ClientStatus, GenerationReply, STREAM_EVENT_BUFFER, blocking_response,
+        connected_streaming_response, tool_call_id,
     };
     use axum::body::to_bytes;
     use axum::http::{StatusCode, header};
@@ -462,6 +568,10 @@ mod tests {
             text: text.into(),
             finish_reason: reason,
         }
+    }
+
+    fn connection() -> ClientConnection {
+        ClientStatus::connected().1
     }
 
     async fn body(response: axum::response::Response) -> String {
@@ -534,6 +644,9 @@ mod tests {
         runtime().block_on(async {
             let (sender, receiver) = channel(8);
             sender
+                .try_send(GenerationReply::Delta("inspect</think>\n\n<tool_".into()))
+                .unwrap();
+            sender
                 .try_send(GenerationReply::Delta(
                     "call><function=bash><parameter=command>ls</parameter></function></tool_call>"
                         .into(),
@@ -548,8 +661,7 @@ mod tests {
                     cached_prompt_tokens: 2,
                 })
                 .unwrap();
-            let response = streaming_response(
-                GenerationReply::Delta("inspect</think>\n\n<tool_".into()),
+            let response = connected_streaming_response(
                 receiver,
                 "chatcmpl-tuisko-0002".into(),
                 19,
@@ -557,6 +669,7 @@ mod tests {
                 true,
                 true,
                 true,
+                connection(),
             );
 
             assert_eq!(
@@ -669,8 +782,10 @@ mod tests {
     fn stalled_clients_stop_accepting_replies_at_the_channel_bounds() {
         runtime().block_on(async {
             let (sender, receiver) = channel(4);
-            let response = streaming_response(
-                GenerationReply::Delta("data ".into()),
+            sender
+                .try_send(GenerationReply::Delta("data ".into()))
+                .unwrap();
+            let response = connected_streaming_response(
                 receiver,
                 "id".into(),
                 1,
@@ -678,6 +793,7 @@ mod tests {
                 false,
                 false,
                 false,
+                connection(),
             );
             let mut buffered = 0;
             loop {
@@ -699,11 +815,11 @@ mod tests {
     }
 
     #[test]
-    fn streaming_failure_and_disconnect_stay_in_stream() {
+    fn dropping_stream_response_marks_the_client_disconnected() {
         runtime().block_on(async {
-            let (_sender, receiver) = channel(8);
-            let response = streaming_response(
-                GenerationReply::Failed("device launch failed".into()),
+            let (status, connection) = ClientStatus::connected();
+            let (_sender, receiver) = channel(1);
+            let response = connected_streaming_response(
                 receiver,
                 "id".into(),
                 1,
@@ -711,6 +827,31 @@ mod tests {
                 false,
                 false,
                 false,
+                connection,
+            );
+
+            assert!(!status.is_disconnected());
+            drop(response);
+            assert!(status.is_disconnected());
+        });
+    }
+
+    #[test]
+    fn streaming_failure_and_disconnect_stay_in_stream() {
+        runtime().block_on(async {
+            let (sender, receiver) = channel(8);
+            sender
+                .try_send(GenerationReply::Failed("device launch failed".into()))
+                .unwrap();
+            let response = connected_streaming_response(
+                receiver,
+                "id".into(),
+                1,
+                TEST_MODEL,
+                false,
+                false,
+                false,
+                connection(),
             );
             let failure_body = body(response).await;
             let data = failure_body
@@ -723,9 +864,11 @@ mod tests {
             assert_eq!(error["error"]["type"], "server_error");
 
             let (sender, receiver) = channel::<GenerationReply>(8);
+            sender
+                .try_send(GenerationReply::Delta("partial".into()))
+                .unwrap();
             drop(sender);
-            let response = streaming_response(
-                GenerationReply::Delta("partial".into()),
+            let response = connected_streaming_response(
                 receiver,
                 "id".into(),
                 1,
@@ -733,6 +876,7 @@ mod tests {
                 false,
                 false,
                 false,
+                connection(),
             );
             let body = body(response).await;
             let data = body

@@ -27,6 +27,10 @@ const TARGET_LOGIT_ROWS: usize = MAX_BATCH + TARGET_DOWNLOAD_ROWS;
 const DRAFT_LOGIT_ROWS: usize = 2 * MAX_BATCH;
 const DRAFT_HIDDEN_ROWS: usize = 2 * MAX_BATCH;
 
+fn disconnected_prefill() -> EngineError {
+    EngineError::generation("client disconnected during prompt prefill")
+}
+
 /// Concrete compact MTP scheduler for up to eight resident requests.
 pub struct ResidentMtpBatchGenerator {
     frontend: TextFrontend,
@@ -341,14 +345,14 @@ impl ResidentMtpBatchGenerator {
         &mut self,
         request: &ChatGenerationRequest,
     ) -> EngineResult<ResidentBatchAdmission> {
-        self.admit_with_progress(request, |_, _| {})
+        self.admit_with_progress(request, |_, _| true)
     }
 
     /// Admits one request while reporting processed prompt tokens at existing stream boundaries.
     pub fn admit_with_progress(
         &mut self,
         request: &ChatGenerationRequest,
-        mut progress: impl FnMut(usize, usize),
+        mut progress: impl FnMut(usize, usize) -> bool,
     ) -> EngineResult<ResidentBatchAdmission> {
         let control = GenerationSession::start(&self.frontend, request)?;
         let prompt_tokens = control.prompt_token_ids().len();
@@ -377,7 +381,9 @@ impl ResidentMtpBatchGenerator {
 
         let (slot, reused, reset, reuse) = self.select_slot(control.prompt_token_ids())?;
         let prefill_tokens = prompt_tokens.saturating_sub(reused);
-        progress(0, prefill_tokens);
+        if !progress(0, prefill_tokens) {
+            return Err(disconnected_prefill());
+        }
         if reused > message_boundary_tokens {
             return Err(EngineError::generation(format!(
                 "resident MTP reused prefix {reused} exceeds message boundary {message_boundary_tokens}"
@@ -410,15 +416,22 @@ impl ResidentMtpBatchGenerator {
         if reused < message_boundary_tokens {
             let retained_hidden =
                 (reused != 0).then(|| &self.target_boundary_hidden[hidden_slot(slot)]);
-            native_prefill_tokens = prime_prompt_with_progress(
+            native_prefill_tokens = match prime_prompt_with_progress(
                 &mut self.program,
                 &self.stream,
                 control.message_boundary_token_ids(),
                 slot,
                 reused,
                 retained_hidden,
-                &mut |processed| progress(processed.saturating_sub(reused), prefill_tokens),
-            )?;
+                &mut |processed| {
+                    progress(processed.saturating_sub(reused), prefill_tokens)
+                        .then_some(())
+                        .ok_or_else(disconnected_prefill)
+                },
+            ) {
+                Ok(tokens) => tokens,
+                Err(error) => return self.abort_admission(slot, error),
+            };
             self.program.target().read_residual_row_into(
                 &self.stream,
                 0,
@@ -430,10 +443,12 @@ impl ResidentMtpBatchGenerator {
                 &mut self.message_boundary_history,
                 &mut self.message_boundary_state,
             )?;
-            progress(
+            if !progress(
                 message_boundary_tokens.saturating_sub(reused),
                 prefill_tokens,
-            );
+            ) {
+                return self.abort_admission(slot, disconnected_prefill());
+            }
             self.message_boundary_valid[slot] = true;
         } else if !self.message_boundary_valid[slot] {
             return Err(EngineError::generation(
@@ -441,15 +456,22 @@ impl ResidentMtpBatchGenerator {
             ));
         }
         if message_boundary_tokens < prompt_tokens {
-            let suffix_native = prime_prompt_with_progress(
+            let suffix_native = match prime_prompt_with_progress(
                 &mut self.program,
                 &self.stream,
                 control.prompt_token_ids(),
                 slot,
                 message_boundary_tokens,
                 Some(&self.message_boundary_hidden[hidden_slot(slot)]),
-                &mut |processed| progress(processed.saturating_sub(reused), prefill_tokens),
-            )?;
+                &mut |processed| {
+                    progress(processed.saturating_sub(reused), prefill_tokens)
+                        .then_some(())
+                        .ok_or_else(disconnected_prefill)
+                },
+            ) {
+                Ok(tokens) => tokens,
+                Err(error) => return self.abort_admission(slot, error),
+            };
             native_prefill_tokens = native_prefill_tokens
                 .checked_add(suffix_native)
                 .ok_or_else(|| {
@@ -467,7 +489,9 @@ impl ResidentMtpBatchGenerator {
                 0,
                 &mut self.target_boundary_hidden[hidden_slot(slot)],
             )?;
-            progress(prefill_tokens, prefill_tokens);
+            if !progress(prefill_tokens, prefill_tokens) {
+                return self.abort_admission(slot, disconnected_prefill());
+            }
         }
         self.sessions[slot] = Some(ResidentMtpBatchSession {
             request_id,
@@ -491,6 +515,17 @@ impl ResidentMtpBatchGenerator {
             prompt_metrics,
             completed: None,
         })
+    }
+
+    fn abort_admission(
+        &mut self,
+        slot: usize,
+        error: EngineError,
+    ) -> EngineResult<ResidentBatchAdmission> {
+        self.retained[slot] = None;
+        self.message_boundary_valid[slot] = false;
+        self.program.recycle_kv_slot(&self.stream, slot)?;
+        Err(error)
     }
 
     /// Advances every active request by one exact anchor, tail, or speculative transaction.
