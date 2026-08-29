@@ -97,6 +97,26 @@ unsafe fn load_e4m3x8(source: *const u8, scale: f32) -> [f32; VALUES_PER_LANE] {
 }
 
 #[inline(always)]
+unsafe fn load_aligned_e4m3x8(source: *const u8, scale: f32) -> [f32; VALUES_PER_LANE] {
+    let packed = unsafe { *source.cast::<u64>() };
+    let (x0, x1) = e4m3x2_to_f32(packed as u16);
+    let (x2, x3) = e4m3x2_to_f32((packed >> 16) as u16);
+    let (x4, x5) = e4m3x2_to_f32((packed >> 32) as u16);
+    let (x6, x7) = e4m3x2_to_f32((packed >> 48) as u16);
+
+    [
+        x0 * scale,
+        x1 * scale,
+        x2 * scale,
+        x3 * scale,
+        x4 * scale,
+        x5 * scale,
+        x6 * scale,
+        x7 * scale,
+    ]
+}
+
+#[inline(always)]
 unsafe fn load_bf16x8(source: *const u16) -> [f32; VALUES_PER_LANE] {
     unsafe {
         [
@@ -2408,9 +2428,9 @@ pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: u
         // Decode represented K/V once per warp while each independent row keeps position order.
         while position < tile_end {
             let tile_element = (position - tile_position) * A::HEAD_DIM + dimension;
-            let key = unsafe { load_e4m3x8(shared.add(tile_element), key_scale) };
+            let key = unsafe { load_aligned_e4m3x8(shared.add(tile_element), key_scale) };
             let value = unsafe {
-                load_e4m3x8(
+                load_aligned_e4m3x8(
                     shared.add(LONG_CONTEXT_MTP_TILE * A::HEAD_DIM + tile_element),
                     value_scale,
                 )
