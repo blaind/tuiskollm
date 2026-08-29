@@ -122,6 +122,31 @@ slightly decreased. The incremental cost is therefore tiled prefill plus the LM-
 device-to-host, and host-softmax scoring path. An exact percentage attribution still requires a
 directly instrumented scoring-owner benchmark; do not infer it from these request-level timings.
 
+### Short quality runs
+
+For a shared GPU, prefer one complete MMLU subject over a limited slice of the 57-subject group.
+Ten subjects have exactly 100 test questions, including `mmlu_abstract_algebra`,
+`mmlu_college_computer_science`, `mmlu_computer_security`, `mmlu_medical_genetics`, and
+`mmlu_global_facts`. The measured abstract-algebra pilot projects to about three minutes zero-shot
+or five to six minutes five-shot for its complete subject. Other subjects vary with prompt length.
+
+Run subjects separately and pin the shot count, for example:
+
+```bash
+target/lm-eval-venv/bin/lm_eval run \
+  --model local-completions \
+  --model_args model=unsloth/Qwen3.8-27B-NVFP4,base_url=http://127.0.0.1:8000/v1/completions,tokenizer=unsloth/Qwen3.8-27B-NVFP4,revision=16b6615af3548b88e2d8e382457bc705b00479cf,tokenizer_backend=huggingface,tokenized_requests=true,max_length=220000,num_concurrent=1 \
+  --tasks mmlu_abstract_algebra \
+  --num_fewshot 0 \
+  --batch_size 4 \
+  --log_samples \
+  --output_path target/lm-eval/mmlu-abstract-algebra-zero-shot
+```
+
+A complete single-subject result measures that domain but is not an aggregate MMLU score. Keep
+subjects, shot counts, and output paths separate rather than presenting a hand-selected subset as
+the official 57-subject metric.
+
 Generation-only tasks continue to use `local-chat-completions` and
 `http://127.0.0.1:8000/v1/chat/completions`.
 
