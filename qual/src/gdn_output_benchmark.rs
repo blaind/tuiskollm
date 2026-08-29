@@ -12,7 +12,7 @@ use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     GpuTimer,
 };
-use tuisko_kernels_sm120::GdnOutputProjectionOp;
+use tuisko_kernels_sm120::{DenseFp8GdnOutputTmaMaps, GdnOutputProjectionOp};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -53,6 +53,7 @@ struct Addresses {
 struct Session {
     routes: Vec<RouteGraphs>,
     _op: GdnOutputProjectionOp,
+    _maps: DenseFp8GdnOutputTmaMaps,
     arena: DeviceArena,
     regions: Regions,
     stream: Arc<CudaStream>,
@@ -87,10 +88,19 @@ impl Session {
             weight_scales: arena.address(regions.weight_scales)?,
             output: arena.address(regions.output)?,
         };
+        // SAFETY: the arena owns exact stable T=1024 activation and weight planes.
+        let maps = unsafe {
+            DenseFp8GdnOutputTmaMaps::new(
+                &stream,
+                addresses.activation_codes.cast_const(),
+                addresses.weight_codes,
+            )?
+        };
         let mut routes = Vec::with_capacity(EXACT_ROUTES.len());
         for rows in EXACT_ROUTES {
             routes.push(capture_route(
                 &op,
+                &maps,
                 &stream,
                 &addresses,
                 rows,
@@ -101,6 +111,7 @@ impl Session {
         Ok(Self {
             routes,
             _op: op,
+            _maps: maps,
             arena,
             regions,
             stream,
@@ -228,15 +239,49 @@ fn make_weight_scales() -> Vec<u16> {
 
 fn capture_route(
     op: &GdnOutputProjectionOp,
+    maps: &DenseFp8GdnOutputTmaMaps,
     stream: &CudaStream,
     addresses: &Addresses,
     rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
+    let launch_once = || -> GpuResult<()> {
+        if rows == MAX_ROWS {
+            // SAFETY: every pointer names its complete, aligned arena region.
+            return unsafe {
+                op.launch_macro_prefill(
+                    stream,
+                    addresses.input,
+                    addresses.activation_codes,
+                    addresses.activation_scales,
+                    addresses.weight_codes,
+                    addresses.weight_scales,
+                    addresses.output,
+                    maps,
+                )
+            };
+        }
+        if rows == 128 {
+            // SAFETY: every pointer names its complete, aligned arena region.
+            return unsafe {
+                op.launch_t128_prefill(
+                    stream,
+                    addresses.input,
+                    addresses.activation_codes,
+                    addresses.activation_scales,
+                    addresses.weight_codes,
+                    addresses.weight_scales,
+                    addresses.output,
+                    maps,
+                )
+            };
+        }
+        launch(op, stream, addresses, rows)
+    };
+    let leaf = CudaGraph::capture(stream, launch_once)?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, rows)?;
+            launch_once()?;
         }
 
         Ok(())

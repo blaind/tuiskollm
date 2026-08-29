@@ -8,6 +8,8 @@ use crate::target::{EXPECTED_COMPUTE_CAPABILITY, FullAttentionQkvOp};
 use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, DeviceArena, GpuError, GpuResult,
 };
+#[cfg(feature = "device")]
+use tuisko_kernels_sm120::DenseFp8QkvTmaMaps;
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -97,6 +99,15 @@ pub fn qualify_fp8_qkv() -> Result<Fp8QkvQualification, Fp8QkvQualificationError
     arena.copy_from_host(&stream, regions.input, &input)?;
     arena.copy_from_host(&stream, regions.weight_codes, &weight_codes)?;
     arena.copy_from_host(&stream, regions.weight_scales, &weight_scales)?;
+    // SAFETY: the arena owns exact stable T=1024 activation and source weight planes.
+    #[cfg(feature = "device")]
+    let maps = unsafe {
+        DenseFp8QkvTmaMaps::new(
+            &stream,
+            arena.address(regions.activation_codes)?,
+            arena.address(regions.weight_codes)?,
+        )?
+    };
     let stable_addresses = addresses(&arena, regions)?;
     let mut report = Fp8QkvQualification {
         activation_codes: 0,
@@ -107,15 +118,22 @@ pub fn qualify_fp8_qkv() -> Result<Fp8QkvQualification, Fp8QkvQualificationError
         maximum_absolute_error: 0.0,
     };
 
+    let run = |rows: usize| -> GpuResult<()> {
+        #[cfg(feature = "device")]
+        if rows == 1_024 {
+            return launch_macro(&op, &maps, &arena, &stream, regions);
+        }
+        launch(&op, &arena, &stream, regions, rows)
+    };
     for rows in EXACT_ROUTES {
         reset_outputs(&arena, &stream, regions)?;
-        launch(&op, &arena, &stream, regions, rows)?;
+        run(rows)?;
         let eager = read_observed(&arena, &stream, regions)?;
         verify_eager(rows, &token_oracles, &eager, &mut report)?;
 
         reset_outputs(&arena, &stream, regions)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
+        let graph = CudaGraph::capture(&stream, || run(rows))?;
         // SAFETY: every allocation this graph captured is owned by this scope or
         // its caller and outlives the replays and the synchronize that follows.
         unsafe { graph.launch(&stream) }?;
@@ -234,6 +252,30 @@ fn launch(
             weight_codes,
             weight_scales,
             output,
+        )
+    }
+}
+
+#[cfg(feature = "device")]
+fn launch_macro(
+    op: &FullAttentionQkvOp,
+    maps: &DenseFp8QkvTmaMaps,
+    arena: &DeviceArena,
+    stream: &tuisko_gpu::CudaStream,
+    regions: Regions,
+) -> GpuResult<()> {
+    // SAFETY: the arena regions are 256-byte aligned, non-overlapping, context-local,
+    // and cover the maximum extents admitted by every exact route.
+    unsafe {
+        op.launch_macro_prefill(
+            stream,
+            arena.address(regions.input)?,
+            arena.address(regions.activation_codes)?,
+            arena.address(regions.activation_scales)?,
+            arena.address(regions.weight_codes)?,
+            arena.address(regions.weight_scales)?,
+            arena.address(regions.output)?,
+            maps,
         )
     }
 }

@@ -12,7 +12,7 @@ use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     GpuTimer,
 };
-use tuisko_kernels_sm120::AttentionOutputOp;
+use tuisko_kernels_sm120::{AttentionOutputOp, DenseFp8GdnOutputTmaMaps};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const MAX_BATCH: usize = 8;
@@ -68,6 +68,7 @@ struct RouteGraphs {
 struct Session {
     routes: Vec<RouteGraphs>,
     _op: AttentionOutputOp,
+    _maps: DenseFp8GdnOutputTmaMaps,
     arena: DeviceArena,
     regions: Regions,
     stream: Arc<CudaStream>,
@@ -91,14 +92,23 @@ impl Session {
         stream.synchronize().map_err(GpuError::from)?;
         let op = AttentionOutputOp::new(&context)?;
         let addresses = addresses(&arena, regions)?;
+        // SAFETY: the arena owns exact stable T=1024 activation and weight planes.
+        let maps = unsafe {
+            DenseFp8GdnOutputTmaMaps::new(
+                &stream,
+                addresses.activation_codes.cast_const(),
+                addresses.weight_codes,
+            )?
+        };
         let routes = EXACT_ROUTES
             .into_iter()
-            .map(|rows| capture_route(&op, &stream, &addresses, rows, repeated_operations))
+            .map(|rows| capture_route(&op, &maps, &stream, &addresses, rows, repeated_operations))
             .collect::<GpuResult<Vec<_>>>()?;
 
         Ok(Self {
             routes,
             _op: op,
+            _maps: maps,
             arena,
             regions,
             stream,
@@ -222,15 +232,35 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<Addresses> {
 
 fn capture_route(
     op: &AttentionOutputOp,
+    maps: &DenseFp8GdnOutputTmaMaps,
     stream: &CudaStream,
     addresses: &Addresses,
     rows: usize,
     repeated_operations: u64,
 ) -> GpuResult<RouteGraphs> {
-    let leaf = CudaGraph::capture(stream, || launch(op, stream, addresses, rows))?;
+    let launch_once = || -> GpuResult<()> {
+        if rows == MAX_ROWS {
+            // SAFETY: every pointer names its complete, aligned arena region.
+            return unsafe {
+                op.launch_macro_prefill(
+                    stream,
+                    addresses.attention,
+                    addresses.qkv,
+                    addresses.activation_codes,
+                    addresses.activation_scales,
+                    addresses.weight_codes,
+                    addresses.weight_scales,
+                    addresses.output,
+                    maps,
+                )
+            };
+        }
+        launch(op, stream, addresses, rows)
+    };
+    let leaf = CudaGraph::capture(stream, launch_once)?;
     let repeated = CudaGraph::capture(stream, || {
         for _ in 0..repeated_operations {
-            launch(op, stream, addresses, rows)?;
+            launch_once()?;
         }
         Ok(())
     })?;

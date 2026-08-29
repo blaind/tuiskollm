@@ -5,5 +5,5 @@ cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
 quantize_registers=25
 projection_registers=33,53,63,66,72,80,87,94
-prefill_projection_registers=52,52,52,52
+prefill_projection_registers=52,52,52,74
 prefill_projection_shared_bytes=1024

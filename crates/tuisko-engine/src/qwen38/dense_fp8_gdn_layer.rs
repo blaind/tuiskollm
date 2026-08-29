@@ -8,9 +8,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
 use tuisko_kernels_sm120::{
-    DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8GdnInputTmaMaps, DenseFp8SwiGluOp,
-    DenseFp8SwiGluTmaMaps, GdnInputProjectionOp, GdnOutputProjectionOp, GdnPrepareOp,
-    GdnRecurrenceOp, ResidualNormOp, Sm120Arch,
+    DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8GdnInputTmaMaps, DenseFp8GdnOutputTmaMaps,
+    DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps, GdnInputProjectionOp, GdnOutputProjectionOp,
+    GdnPrepareOp, GdnRecurrenceOp, ResidualNormOp, Sm120Arch,
 };
 use tuisko_model::{CheckpointSnapshot, DenseFp8MlpBindings, GdnBindings, Qwen38_27B};
 
@@ -26,6 +26,8 @@ pub struct DenseFp8GdnLayerProgram<A: Sm120Arch = Qwen38_27B> {
     down_maps: DenseFp8DownTmaMaps,
     #[allow(dead_code)]
     input_maps: DenseFp8GdnInputTmaMaps,
+    #[allow(dead_code)]
+    output_maps: DenseFp8GdnOutputTmaMaps,
     arena: DeviceArena,
     _norm: ResidualNormOp<A>,
     _input: GdnInputProjectionOp<A>,
@@ -306,6 +308,14 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
                 pointers.input_weight_codes,
             )?
         };
+        // SAFETY: the one owner arena keeps all encoded source addresses stable.
+        let output_maps = unsafe {
+            DenseFp8GdnOutputTmaMaps::new(
+                &stream,
+                pointers.output_activation_codes.cast_const(),
+                pointers.output_weight_codes,
+            )?
+        };
         let base_address = arena.base_address();
         let ops = Ops {
             norm: &norm,
@@ -318,6 +328,7 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
             gate_up_maps: &gate_up_maps,
             down_maps: &down_maps,
             input_maps: &input_maps,
+            output_maps: &output_maps,
         };
         let graphs = capture_decode_routes(&stream, ops, pointers)?;
         let prefill_graphs = capture_prefill_routes(&stream, ops, pointers)?;
@@ -328,6 +339,7 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
             gate_up_maps,
             down_maps,
             input_maps,
+            output_maps,
             arena,
             _norm: norm,
             _input: input,
@@ -435,11 +447,12 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
         MAX_ROWS
     }
 
-    /// Exact bytes in all six address-bound projection tensor-map descriptors.
+    /// Exact bytes in all eight address-bound projection tensor-map descriptors.
     pub const fn descriptor_bytes(&self) -> usize {
         DenseFp8SwiGluTmaMaps::BYTE_LEN
             + DenseFp8DownTmaMaps::BYTE_LEN
             + DenseFp8GdnInputTmaMaps::BYTE_LEN
+            + DenseFp8GdnOutputTmaMaps::BYTE_LEN
     }
 
     /// Checked owner layout.
@@ -525,16 +538,18 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
         addresses.extend(self.gate_up_maps.device_addresses());
         addresses.extend(self.down_maps.device_addresses());
         addresses.extend(self.input_maps.device_addresses());
+        addresses.extend(self.output_maps.device_addresses());
 
         Ok(addresses)
     }
 
     #[cfg(feature = "qualification")]
-    /// Copies all six opaque address-bound tensor maps.
-    pub fn qualification_descriptors(&self, stream: &CudaStream) -> EngineResult<[Vec<u64>; 6]> {
+    /// Copies all eight opaque address-bound tensor maps.
+    pub fn qualification_descriptors(&self, stream: &CudaStream) -> EngineResult<[Vec<u64>; 8]> {
         let gate_up = self.gate_up_maps.copy_to_host(stream)?;
         let down = self.down_maps.copy_to_host(stream)?;
         let input = self.input_maps.copy_to_host(stream)?;
+        let output = self.output_maps.copy_to_host(stream)?;
 
         Ok([
             gate_up[0].clone(),
@@ -543,6 +558,8 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
             down[1].clone(),
             input[0].clone(),
             input[1].clone(),
+            output[0].clone(),
+            output[1].clone(),
         ])
     }
 
@@ -653,6 +670,7 @@ impl<A: Sm120Arch> DenseFp8GdnLayerProgram<A> {
             gate_up_maps: &self.gate_up_maps,
             down_maps: &self.down_maps,
             input_maps: &self.input_maps,
+            output_maps: &self.output_maps,
         }
     }
 }
@@ -720,6 +738,7 @@ struct Ops<'a, A: Sm120Arch> {
     gate_up_maps: &'a DenseFp8SwiGluTmaMaps,
     down_maps: &'a DenseFp8DownTmaMaps,
     input_maps: &'a DenseFp8GdnInputTmaMaps,
+    output_maps: &'a DenseFp8GdnOutputTmaMaps,
 }
 
 fn capture_decode_routes<A: Sm120Arch>(
@@ -816,16 +835,30 @@ fn launch_route<A: Sm120Arch>(
             pointers.recurrent_plane,
             pointers.recurrent_output,
         )?;
-        ops.output.launch(
-            stream,
-            rows,
-            pointers.recurrent_output,
-            pointers.output_activation_codes,
-            pointers.output_activation_scales,
-            pointers.output_weight_codes,
-            pointers.output_weight_scales,
-            pointers.mixer_branch,
-        )?;
+        if rows == MAX_ROWS {
+            // T=1024 amortizes address-bound TMA setup across the macro tile.
+            ops.output.launch_macro_prefill(
+                stream,
+                pointers.recurrent_output,
+                pointers.output_activation_codes,
+                pointers.output_activation_scales,
+                pointers.output_weight_codes,
+                pointers.output_weight_scales,
+                pointers.mixer_branch,
+                ops.output_maps,
+            )?;
+        } else {
+            ops.output.launch(
+                stream,
+                rows,
+                pointers.recurrent_output,
+                pointers.output_activation_codes,
+                pointers.output_activation_scales,
+                pointers.output_weight_codes,
+                pointers.output_weight_scales,
+                pointers.mixer_branch,
+            )?;
+        }
         ops.norm.launch_residual(
             stream,
             rows,

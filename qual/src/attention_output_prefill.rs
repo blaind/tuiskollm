@@ -9,7 +9,7 @@ use tuisko_gpu::{
     ArenaLayout, ArenaRegion, CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult,
     device_memory_info,
 };
-use tuisko_kernels_sm120::AttentionOutputOp;
+use tuisko_kernels_sm120::{AttentionOutputOp, DenseFp8GdnOutputTmaMaps};
 use tuisko_model::{Arch, Qwen38_27B};
 
 const ROUTES: [usize; 4] = [32, 64, 128, 1_024];
@@ -125,6 +125,14 @@ pub fn qualify_attention_output_prefill()
     let oracles = make_oracles(&fixture)?;
     load_immutable(&arena, &stream, regions, &fixture)?;
     let op = AttentionOutputOp::new(&context)?;
+    // SAFETY: the arena owns exact stable T=1024 activation and source weight planes.
+    let maps = unsafe {
+        DenseFp8GdnOutputTmaMaps::new(
+            &stream,
+            arena.address(regions.activation_codes)?,
+            arena.address(regions.weight_codes)?,
+        )?
+    };
     let stable_addresses = addresses(&arena, regions)?;
     let mut report = AttentionOutputPrefillQualification {
         gated_values: 0,
@@ -143,14 +151,16 @@ pub fn qualify_attention_output_prefill()
 
     for rows in ROUTES {
         reset(&arena, &stream, regions, &fixture, rows)?;
-        launch(&op, &arena, &stream, regions, rows)?;
+        launch(&op, &maps, &arena, &stream, regions, rows)?;
         let eager = observe(&arena, &stream, regions)?;
         verify_eager(rows, &oracles, &eager, &mut report)?;
         verify_immutable(&arena, &stream, regions, &fixture, &mut report)?;
 
         reset(&arena, &stream, regions, &fixture, rows)?;
         stream.synchronize().map_err(GpuError::from)?;
-        let graph = CudaGraph::capture(&stream, || launch(&op, &arena, &stream, regions, rows))?;
+        let graph = CudaGraph::capture(&stream, || {
+            launch(&op, &maps, &arena, &stream, regions, rows)
+        })?;
         // SAFETY: every allocation this graph captured is owned by this scope or
         // its caller and outlives the replays and the synchronize that follows.
         unsafe { graph.launch(&stream) }?;
@@ -165,7 +175,7 @@ pub fn qualify_attention_output_prefill()
         }
     }
 
-    verify_no_post_warmup_allocation(&context, &op, &arena, &stream, regions, &fixture)?;
+    verify_no_post_warmup_allocation(&context, &op, &maps, &arena, &stream, regions, &fixture)?;
     device_benchmark::require_current_process_exclusive()?;
 
     Ok(report)
@@ -344,6 +354,7 @@ fn addresses(arena: &DeviceArena, regions: Regions) -> GpuResult<[usize; 7]> {
 
 fn launch(
     op: &AttentionOutputOp,
+    maps: &DenseFp8GdnOutputTmaMaps,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -351,17 +362,31 @@ fn launch(
 ) -> GpuResult<()> {
     // SAFETY: every region is aligned, disjoint, context-local, and covers T=1024.
     unsafe {
-        op.launch(
-            stream,
-            rows,
-            arena.address(regions.attention)?,
-            arena.address(regions.qkv)?,
-            arena.address(regions.activation_codes)?,
-            arena.address(regions.activation_scales)?,
-            arena.address(regions.weight_codes)?,
-            arena.address(regions.weight_scales)?,
-            arena.address(regions.output)?,
-        )
+        if rows == MAX_ROWS {
+            op.launch_macro_prefill(
+                stream,
+                arena.address(regions.attention)?,
+                arena.address(regions.qkv)?,
+                arena.address(regions.activation_codes)?,
+                arena.address(regions.activation_scales)?,
+                arena.address(regions.weight_codes)?,
+                arena.address(regions.weight_scales)?,
+                arena.address(regions.output)?,
+                maps,
+            )
+        } else {
+            op.launch(
+                stream,
+                rows,
+                arena.address(regions.attention)?,
+                arena.address(regions.qkv)?,
+                arena.address(regions.activation_codes)?,
+                arena.address(regions.activation_scales)?,
+                arena.address(regions.weight_codes)?,
+                arena.address(regions.weight_scales)?,
+                arena.address(regions.output)?,
+            )
+        }
     }
 }
 
@@ -543,6 +568,7 @@ fn verify_replay(
 fn verify_no_post_warmup_allocation(
     context: &CudaContext,
     op: &AttentionOutputOp,
+    maps: &DenseFp8GdnOutputTmaMaps,
     arena: &DeviceArena,
     stream: &CudaStream,
     regions: Regions,
@@ -552,7 +578,7 @@ fn verify_no_post_warmup_allocation(
     for rows in ROUTES {
         reset(arena, stream, regions, fixture, rows)?;
         graphs.push(CudaGraph::capture(stream, || {
-            launch(op, arena, stream, regions, rows)
+            launch(op, maps, arena, stream, regions, rows)
         })?);
     }
     for graph in &graphs {

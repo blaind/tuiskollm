@@ -440,6 +440,9 @@ impl DenseFp8DownTmaMaps {
 pub(super) struct DenseFp8DownTmaRoute {
     module: kernels::LoadedModule,
     prepared: PreparedLaunch<kernels::__fp8_down_tma_t1024_CudaKernel>,
+    // The same entry serves T=128 with a one-token-tile grid; the height-1024
+    // tensor maps bound every coordinate the smaller grid can name.
+    prepared_t128: PreparedLaunch<kernels::__fp8_down_tma_t1024_CudaKernel>,
 }
 
 impl DenseFp8DownTmaRoute {
@@ -455,12 +458,67 @@ impl DenseFp8DownTmaRoute {
                 SHARED_BYTES as u32,
             ))
             .map_err(|source| GpuError::launch("preparing dense-FP8 down T=1024", source))?;
+        let t128_blocks = ((128 / BLOCK_M) * (Qwen38_27B::HIDDEN / BLOCK_N)) as u32;
+        let prepared_t128 = module
+            .prepare_fp8_down_tma_t1024(LaunchConfig1D::new(
+                t128_blocks,
+                THREADS as u32,
+                SHARED_BYTES as u32,
+            ))
+            .map_err(|source| GpuError::launch("preparing dense-FP8 down T=128", source))?;
 
-        Ok(Self { module, prepared })
+        Ok(Self {
+            module,
+            prepared,
+            prepared_t128,
+        })
     }
 
     pub(super) unsafe fn launch(
         &self,
+        stream: &CudaStream,
+        maps: &DenseFp8DownTmaMaps,
+        activation_scales: *const f32,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: the caller admits every pointer and map boundary.
+        unsafe {
+            self.launch_prepared(
+                &self.prepared,
+                stream,
+                maps,
+                activation_scales,
+                weight_scales,
+                output,
+            )
+        }
+    }
+
+    pub(super) unsafe fn launch_t128(
+        &self,
+        stream: &CudaStream,
+        maps: &DenseFp8DownTmaMaps,
+        activation_scales: *const f32,
+        weight_scales: *const u16,
+        output: *mut u16,
+    ) -> GpuResult<()> {
+        // SAFETY: the caller admits every pointer and map boundary.
+        unsafe {
+            self.launch_prepared(
+                &self.prepared_t128,
+                stream,
+                maps,
+                activation_scales,
+                weight_scales,
+                output,
+            )
+        }
+    }
+
+    unsafe fn launch_prepared(
+        &self,
+        prepared: &PreparedLaunch<kernels::__fp8_down_tma_t1024_CudaKernel>,
         stream: &CudaStream,
         maps: &DenseFp8DownTmaMaps,
         activation_scales: *const f32,
@@ -477,14 +535,14 @@ impl DenseFp8DownTmaRoute {
         self.module
             .fp8_down_tma_t1024(
                 stream,
-                &self.prepared,
+                prepared,
                 maps.activation_code_map.cu_deviceptr() as *const cuda_device::tma::TmaDescriptor,
                 maps.weight_code_map.cu_deviceptr() as *const cuda_device::tma::TmaDescriptor,
                 activation_scales,
                 weight_scales,
                 output,
             )
-            .map_err(|source| GpuError::launch("launching dense-FP8 down T=1024", source))
+            .map_err(|source| GpuError::launch("launching dense-FP8 down TMA", source))
     }
 }
 

@@ -1,6 +1,9 @@
 //! Source-native FP8 GDN output projection.
 
 use crate::device::fp8_projection::{fp8_projection, quantize_gdn_output_activation};
+use crate::gdn_output_tma::{
+    DenseFp8GdnOutputTmaMaps, DenseFp8GdnOutputTmaRoute, ptx_name as gdn_output_tma_ptx_name,
+};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -139,45 +142,6 @@ mod kernels {
             );
         }
     }
-
-    /// Projects exactly 1,024 GDN output rows with native E4M3 MMA.
-    #[kernel]
-    #[launch_bounds(128, 4)]
-    #[launch_contract(
-        domain = 1,
-        coordinates = u32,
-        block = (128, 1, 1),
-        dynamic_shared = 24576,
-        min_compute_capability = (12, 0),
-    )]
-    pub fn gdn_output_projection_mma_t1024(
-        activation_codes: *const u32,
-        activation_scales: *const f32,
-        weight_codes: *const u32,
-        weight_scales: *const u16,
-        output: *mut u16,
-        k_tiles: u32,
-    ) {
-        // A 64x32 macro tile doubles activation reuse while four warps retain
-        // exact 16x32 MMA quadrants. Its K=128 double buffer is exactly 24 KiB.
-        unsafe {
-            attention_output_projection_mma::<
-                Qwen38_27B,
-                1_024,
-                MACRO_BLOCK_ROWS,
-                PREFILL_OUTPUT_ROWS,
-                PREFILL_K_WORDS,
-                PREFILL_K_SUBTILES,
-            >(
-                activation_codes,
-                activation_scales,
-                weight_codes,
-                weight_scales,
-                output,
-                k_tiles,
-            );
-        }
-    }
 }
 
 struct Route<A: Arch, const TOKENS: usize> {
@@ -262,18 +226,12 @@ impl<A: Arch, const TOKENS: usize> PreparedPrefillRoute<A, TOKENS> {
 
 struct PreparedMacroRoute<A: Arch> {
     quantize: PreparedLaunch<kernels::__gdn_output_quantize_CudaKernel>,
-    projection: PreparedLaunch<kernels::__gdn_output_projection_mma_t1024_CudaKernel>,
+    projection: DenseFp8GdnOutputTmaRoute,
     _arch: core::marker::PhantomData<A>,
 }
 
 impl<A: Arch> PreparedMacroRoute<A> {
-    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let token_tiles = PREFILL_ROWS[3] / MACRO_BLOCK_ROWS;
-        let projection_blocks = A::HIDDEN / PREFILL_OUTPUT_ROWS * token_tiles;
-        let projection_blocks = u32::try_from(projection_blocks).map_err(|_| {
-            GpuError::invalid_launch("GDN output macro-prefill grid exceeds CUDA width")
-        })?;
-
+    fn prepare(context: &Arc<CudaContext>, module: &kernels::LoadedModule) -> GpuResult<Self> {
         Ok(Self {
             quantize: module
                 .prepare_gdn_output_quantize(LaunchConfig1D::new(
@@ -284,15 +242,7 @@ impl<A: Arch> PreparedMacroRoute<A> {
                 .map_err(|source| {
                     GpuError::launch("preparing GDN output macro quantization", source)
                 })?,
-            projection: module
-                .prepare_gdn_output_projection_mma_t1024(LaunchConfig1D::new(
-                    projection_blocks,
-                    MACRO_THREADS,
-                    MACRO_SHARED_BYTES,
-                ))
-                .map_err(|source| {
-                    GpuError::launch("preparing GDN output macro projection", source)
-                })?,
+            projection: DenseFp8GdnOutputTmaRoute::new(context)?,
             _arch: core::marker::PhantomData,
         })
     }
@@ -305,9 +255,9 @@ impl<A: Arch> PreparedMacroRoute<A> {
         input: *const u16,
         codes: *mut u8,
         scales: *mut f32,
-        weight_codes: *const u8,
         weight_scales: *const u16,
         output: *mut u16,
+        maps: &DenseFp8GdnOutputTmaMaps,
     ) -> GpuResult<()> {
         module
             .gdn_output_quantize(
@@ -320,18 +270,11 @@ impl<A: Arch> PreparedMacroRoute<A> {
             .map_err(|source| {
                 GpuError::launch("launching GDN output macro quantization", source)
             })?;
-        module
-            .gdn_output_projection_mma_t1024(
-                stream,
-                &self.projection,
-                codes.cast::<u32>(),
-                scales,
-                weight_codes.cast::<u32>(),
-                weight_scales,
-                output,
-                (A::GDN_VALUE_ROWS / 4 / PREFILL_K_WORDS) as u32,
-            )
-            .map_err(|source| GpuError::launch("launching GDN output macro projection", source))
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.projection
+                .launch(stream, maps, scales, weight_scales, output)
+        }
     }
 }
 
@@ -391,7 +334,7 @@ impl<A: Arch, const TOKENS: usize> Route<A, TOKENS> {
     module(kernels::LoadedModule),
     error(GpuError),
     dispatch(dispatch_gdn_output),
-    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128, 1024),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 32, 64, 128),
     inventory(false)
 )]
 struct GdnOutputRoutes<A: Sm120Arch> {
@@ -417,14 +360,13 @@ struct GdnOutputRoutes<A: Sm120Arch> {
     t64: PreparedPrefillRoute<A, 64>,
     #[route(128)]
     t128: PreparedPrefillRoute<A, 128>,
-    #[route(1024)]
-    t1024: PreparedMacroRoute<A>,
 }
 
 /// Prepared source-native FP8 GDN output routes for exact decode and prefill rows.
 pub struct GdnOutputProjectionOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     routes: GdnOutputRoutes<A>,
+    t1024: PreparedMacroRoute<A>,
 }
 
 impl<A: Sm120Arch> GdnOutputProjectionOp<A> {
@@ -436,8 +378,89 @@ impl<A: Sm120Arch> GdnOutputProjectionOp<A> {
             .map_err(|source| GpuError::module("loading the GDN output module", source))?;
         Ok(Self {
             routes: GdnOutputRoutes::prepare(&module)?,
+            t1024: PreparedMacroRoute::prepare(context, &module)?,
             module,
         })
+    }
+
+    /// Dynamically quantizes and applies the exact T=1024 TMA output route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 1024 rows.
+    /// `maps` was constructed for the same `codes` and `weight_codes`
+    /// addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_macro_prefill(
+        &self,
+        stream: &CudaStream,
+        input: *const u16,
+        codes: *mut u8,
+        scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8GdnOutputTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != codes.addr() || maps.weight_codes() != weight_codes.addr() {
+            return Err(GpuError::invalid_launch(
+                "dense-FP8 GDN output tensor maps do not match the launch addresses",
+            ));
+        }
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024.launch(
+                &self.module,
+                stream,
+                input,
+                codes,
+                scales,
+                weight_scales,
+                output,
+                maps,
+            )
+        }
+    }
+
+    /// Dynamically quantizes and applies the T=128 tile of the TMA output route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 128 rows.
+    /// `maps` was constructed for the same `codes` and `weight_codes`
+    /// addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_t128_prefill(
+        &self,
+        stream: &CudaStream,
+        input: *const u16,
+        codes: *mut u8,
+        scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8GdnOutputTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != codes.addr() || maps.weight_codes() != weight_codes.addr() {
+            return Err(GpuError::invalid_launch(
+                "dense-FP8 GDN output tensor maps do not match the launch addresses",
+            ));
+        }
+        self.module
+            .gdn_output_quantize(
+                stream,
+                &self.routes.t128.quantize,
+                input.cast::<u32>(),
+                codes.cast::<u16>(),
+                scales,
+            )
+            .map_err(|source| GpuError::launch("launching GDN output quantization", source))?;
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024
+                .projection
+                .launch_t128(stream, maps, scales, weight_scales, output)
+        }
     }
 
     /// Dynamically quantizes recurrent values and applies the output projection.
@@ -461,6 +484,11 @@ impl<A: Sm120Arch> GdnOutputProjectionOp<A> {
         weight_scales: *const u16,
         output: *mut u16,
     ) -> GpuResult<()> {
+        if rows == 1_024 {
+            return Err(GpuError::invalid_launch(
+                "FP8 GDN output T=1024 requires launch_macro_prefill with its tensor maps",
+            ));
+        }
         let Some(class) = route_class(rows) else {
             return Err(GpuError::invalid_launch(format!(
                 "FP8 GDN output row count {rows} is outside the admitted routes 1..={MAX_BATCH},32,64,128,1024"
@@ -501,7 +529,7 @@ pub(crate) fn gdn_output_ptx_names() -> Vec<&'static str> {
         kernels::gdn_output_projection_mma_exact_ptx_name::<32>(),
         kernels::gdn_output_projection_mma_exact_ptx_name::<64>(),
         kernels::gdn_output_projection_mma_exact_ptx_name::<128>(),
-        "gdn_output_projection_mma_t1024",
+        gdn_output_tma_ptx_name(),
     ]
 }
 

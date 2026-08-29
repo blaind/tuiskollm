@@ -6,6 +6,7 @@ use crate::device::fp8_projection::{
 use crate::gdn_input_tma::{
     DenseFp8GdnInputTmaMaps, DenseFp8GdnInputTmaRoute, ptx_name as gdn_input_tma_ptx_name,
 };
+use crate::qkv_tma::{DenseFp8QkvTmaMaps, DenseFp8QkvTmaRoute, ptx_name as qkv_tma_ptx_name};
 use cuda_device::{SharedArray, cuda_module, kernel, launch_bounds, launch_contract};
 use std::{marker::PhantomData, sync::Arc};
 use tuisko_gpu::{CudaContext, CudaStream, GpuError, GpuResult, LaunchConfig1D, PreparedLaunch};
@@ -255,38 +256,6 @@ mod kernels {
         // padded 64-row activation tile and exact 64-row output tiles.
         unsafe {
             prefill_projection_mma::<{ Qwen38_27B::HIDDEN }, TOKENS, 64, 32, 4>(
-                activation_codes,
-                activation_scales,
-                weight_codes,
-                weight_scales,
-                output,
-                k_tiles,
-                Qwen38_27B::ATTENTION_QKV_ROWS,
-            );
-        }
-    }
-
-    /// Projects exactly 1,024 rows through the retained low-shared-memory QKV tile.
-    #[kernel]
-    #[launch_bounds(256, 2)]
-    #[launch_contract(
-        domain = 1,
-        coordinates = u32,
-        block = (256, 1, 1),
-        dynamic_shared = 16384,
-        min_compute_capability = (12, 0),
-    )]
-    pub fn fp8_qkv_mma_t1024(
-        activation_codes: *const u32,
-        activation_scales: *const f32,
-        weight_codes: *const u32,
-        weight_scales: *const u16,
-        output: *mut u16,
-        k_tiles: u32,
-    ) {
-        // SAFETY: the fixed launch covers every 64-row token tile and QKV output tile.
-        unsafe {
-            prefill_projection_mma::<{ Qwen38_27B::HIDDEN }, 1024, 64, 16, 2>(
                 activation_codes,
                 activation_scales,
                 weight_codes,
@@ -658,33 +627,16 @@ impl<A: Arch, const TOKENS: usize> PreparedQkvPrefillRoute<A, TOKENS> {
     }
 }
 
-struct PreparedQkvT1024Route<A: Arch> {
+struct PreparedQkvT1024Route {
     quantize: PreparedLaunch<kernels::__quantize_activation_e4m3_CudaKernel>,
-    projection: PreparedLaunch<kernels::__fp8_qkv_mma_t1024_CudaKernel>,
-    architecture: PhantomData<A>,
+    projection: DenseFp8QkvTmaRoute,
 }
 
-impl<A: Arch> PreparedQkvT1024Route<A> {
-    fn prepare(module: &kernels::LoadedModule) -> GpuResult<Self> {
-        let token_tiles = QKV_MMA_MACRO_TOKENS / QKV_MMA_PREFILL_BLOCK_ROWS;
-        let projection_blocks = A::ATTENTION_QKV_ROWS / QKV_MMA_OUTPUT_ROWS * token_tiles;
-        let projection_blocks = u32::try_from(projection_blocks).map_err(|_| {
-            GpuError::invalid_launch("FP8 QKV macro-prefill grid exceeds CUDA width")
-        })?;
-        let projection = module
-            .prepare_fp8_qkv_mma_t1024(LaunchConfig1D::new(
-                projection_blocks,
-                QKV_MMA_PREFILL_THREADS,
-                QKV_MMA_MACRO_SHARED_BYTES,
-            ))
-            .map_err(|source| {
-                GpuError::launch("preparing the FP8 QKV macro-prefill projection", source)
-            })?;
-
+impl PreparedQkvT1024Route {
+    fn prepare(context: &Arc<CudaContext>, module: &kernels::LoadedModule) -> GpuResult<Self> {
         Ok(Self {
             quantize: prepare_quantize::<QKV_MMA_MACRO_TOKENS>(module)?,
-            projection,
-            architecture: PhantomData,
+            projection: DenseFp8QkvTmaRoute::new(context)?,
         })
     }
 
@@ -696,9 +648,9 @@ impl<A: Arch> PreparedQkvT1024Route<A> {
         input: *const u16,
         activation_codes: *mut u8,
         activation_scales: *mut f32,
-        weight_codes: *const u8,
         weight_scales: *const u16,
         output: *mut u16,
+        maps: &DenseFp8QkvTmaMaps,
     ) -> GpuResult<()> {
         module
             .quantize_activation_e4m3(
@@ -709,21 +661,11 @@ impl<A: Arch> PreparedQkvT1024Route<A> {
                 activation_scales,
             )
             .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
-        let k_tiles = A::HIDDEN / 4 / QKV_MMA_MACRO_K_WORDS;
-        module
-            .fp8_qkv_mma_t1024(
-                stream,
-                &self.projection,
-                activation_codes.cast::<u32>(),
-                activation_scales,
-                weight_codes.cast::<u32>(),
-                weight_scales,
-                output,
-                k_tiles as u32,
-            )
-            .map_err(|source| {
-                GpuError::launch("launching the FP8 QKV macro-prefill projection", source)
-            })
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.projection
+                .launch(stream, maps, activation_scales, weight_scales, output)
+        }
     }
 }
 
@@ -859,7 +801,7 @@ pub(crate) fn fp8_qkv_ptx_names() -> [&'static str; 14] {
         kernels::fp8_qkv_mma_ptx_name::<32>(),
         kernels::fp8_qkv_mma_ptx_name::<64>(),
         kernels::fp8_qkv_mma_ptx_name::<128>(),
-        "fp8_qkv_mma_t1024",
+        qkv_tma_ptx_name(),
     ]
 }
 
@@ -900,7 +842,7 @@ pub(crate) fn fp8_lm_head_ptx_names() -> [&'static str; 8] {
     module(kernels::LoadedModule),
     error(GpuError),
     dispatch(dispatch_fp8_qkv),
-    required(1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 1024),
+    required(1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128),
     inventory(false)
 )]
 struct FullAttentionQkvRoutes<A: Arch> {
@@ -928,8 +870,6 @@ struct FullAttentionQkvRoutes<A: Arch> {
     t64: PreparedQkvPrefillRoute<A, 64>,
     #[route(128)]
     t128: PreparedQkvPrefillRoute<A, 128>,
-    #[route(1024)]
-    t1024: PreparedQkvT1024Route<A>,
 }
 
 #[derive(ExactRoutes)]
@@ -996,6 +936,7 @@ struct LmHeadRoutes<A: Arch> {
 pub struct FullAttentionQkvOp<A: Sm120Arch = Qwen38_27B> {
     module: kernels::LoadedModule,
     routes: FullAttentionQkvRoutes<A>,
+    t1024: PreparedQkvT1024Route,
 }
 
 impl<A: Sm120Arch> FullAttentionQkvOp<A> {
@@ -1009,8 +950,97 @@ impl<A: Sm120Arch> FullAttentionQkvOp<A> {
 
         Ok(Self {
             routes: FullAttentionQkvRoutes::prepare(&module)?,
+            t1024: PreparedQkvT1024Route::prepare(context, &module)?,
             module,
         })
+    }
+
+    /// Dynamically quantizes and applies the exact T=1024 TMA QKV route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 1024 rows.
+    /// `maps` was constructed for the same `activation_codes` and
+    /// `weight_codes` addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_macro_prefill(
+        &self,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8QkvTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != activation_codes.addr()
+            || maps.weight_codes() != weight_codes.addr()
+        {
+            return Err(GpuError::invalid_launch(
+                "dense-FP8 QKV tensor maps do not match the launch addresses",
+            ));
+        }
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024.launch(
+                &self.module,
+                stream,
+                input,
+                activation_codes,
+                activation_scales,
+                weight_scales,
+                output,
+                maps,
+            )
+        }
+    }
+
+    /// Dynamically quantizes and applies the T=128 tile of the TMA QKV route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 128 rows.
+    /// `maps` was constructed for the same `activation_codes` and
+    /// `weight_codes` addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_t128_prefill(
+        &self,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8QkvTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != activation_codes.addr()
+            || maps.weight_codes() != weight_codes.addr()
+        {
+            return Err(GpuError::invalid_launch(
+                "dense-FP8 QKV tensor maps do not match the launch addresses",
+            ));
+        }
+        self.module
+            .quantize_activation_e4m3(
+                stream,
+                &self.routes.t128.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024.projection.launch_t128(
+                stream,
+                maps,
+                activation_scales,
+                weight_scales,
+                output,
+            )
+        }
     }
 
     /// Dynamically quantizes an admitted row count and projects fused Q/K/V output.
@@ -1051,9 +1081,17 @@ impl<A: Sm120Arch> FullAttentionQkvOp<A> {
                     output,
                 )
             },
-            else => Err(GpuError::invalid_launch(format!(
-                "FP8 QKV row count {rows} is outside the admitted routes 1..={MAX_BATCH}, 16, 32, 64, 128, and 1024"
-            )))
+            else => {
+                if rows == QKV_MMA_MACRO_TOKENS {
+                    Err(GpuError::invalid_launch(
+                        "FP8 QKV T=1024 requires launch_macro_prefill with its tensor maps",
+                    ))
+                } else {
+                    Err(GpuError::invalid_launch(format!(
+                        "FP8 QKV row count {rows} is outside the admitted routes 1..={MAX_BATCH}, 16, 32, 64, 128, and 1024"
+                    )))
+                }
+            }
         )
     }
 }
@@ -1118,6 +1156,53 @@ impl<A: Sm120Arch> GdnInputProjectionOp<A> {
                 weight_scales,
                 output,
                 maps,
+            )
+        }
+    }
+
+    /// Dynamically quantizes and applies the T=128 tile of the TMA GDN input route.
+    ///
+    /// # Safety
+    ///
+    /// The pointer contract matches [`Self::launch`] at exactly 128 rows.
+    /// `maps` was constructed for the same `activation_codes` and
+    /// `weight_codes` addresses, which remain live and stable through replay.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_t128_prefill(
+        &self,
+        stream: &CudaStream,
+        input: *const u16,
+        activation_codes: *mut u8,
+        activation_scales: *mut f32,
+        weight_codes: *const u8,
+        weight_scales: *const u16,
+        output: *mut u16,
+        maps: &DenseFp8GdnInputTmaMaps,
+    ) -> GpuResult<()> {
+        if maps.activation_codes() != activation_codes.addr()
+            || maps.weight_codes() != weight_codes.addr()
+        {
+            return Err(GpuError::invalid_launch(
+                "dense-FP8 GDN input tensor maps do not match the launch addresses",
+            ));
+        }
+        self.module
+            .quantize_activation_e4m3(
+                stream,
+                &self.routes.t128.quantize,
+                input.cast::<u32>(),
+                activation_codes.cast::<u16>(),
+                activation_scales,
+            )
+            .map_err(|source| GpuError::launch("launching FP8 activation quantization", source))?;
+        // SAFETY: the public method admits every pointer and map boundary.
+        unsafe {
+            self.t1024.projection.launch_t128(
+                stream,
+                maps,
+                activation_scales,
+                weight_scales,
+                output,
             )
         }
     }
@@ -1276,9 +1361,10 @@ mod tests {
 
     #[test]
     fn route_tables_cover_only_the_admitted_widths() {
+        // T=1024 lives outside the route table as the op-level TMA field.
         assert_eq!(
             FullAttentionQkvRoutes::<Qwen38_27B>::admitted_rows(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128, 1_024]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128]
         );
         assert_eq!(
             GdnInputProjectionRoutes::<Qwen38_27B>::admitted_rows(),

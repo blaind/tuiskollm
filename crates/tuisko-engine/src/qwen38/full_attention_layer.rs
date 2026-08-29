@@ -10,8 +10,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use tuisko_gpu::{CudaContext, CudaGraph, CudaStream, DeviceArena, GpuError, GpuResult};
 use tuisko_kernels_sm120::{
-    AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8DownTmaMaps, DenseFp8SwiGluOp,
-    DenseFp8SwiGluTmaMaps, FullAttentionQkvOp, PagedGqaOp, ResidualNormOp, Sm120Arch,
+    AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8DownTmaMaps,
+    DenseFp8GdnOutputTmaMaps, DenseFp8QkvTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps,
+    FullAttentionQkvOp, PagedGqaOp, ResidualNormOp, Sm120Arch,
 };
 use tuisko_model::{
     CheckpointSnapshot, DenseFp8MlpBindings, FullAttentionPostBindings, FullAttentionQkvBindings,
@@ -30,6 +31,10 @@ pub struct FullAttentionLayerProgram<A: Sm120Arch = Qwen38_27B> {
     gate_up_maps: DenseFp8SwiGluTmaMaps,
     #[allow(dead_code)]
     down_maps: DenseFp8DownTmaMaps,
+    #[allow(dead_code)]
+    qkv_maps: DenseFp8QkvTmaMaps,
+    #[allow(dead_code)]
+    output_maps: DenseFp8GdnOutputTmaMaps,
     arena: DeviceArena,
     _norm: ResidualNormOp<A>,
     _qkv: FullAttentionQkvOp<A>,
@@ -315,6 +320,22 @@ impl<A: Sm120Arch> FullAttentionLayerProgram<A> {
                 pointers.down_weight_codes,
             )?
         };
+        // SAFETY: the one owner arena keeps all encoded source addresses stable.
+        let qkv_maps = unsafe {
+            DenseFp8QkvTmaMaps::new(
+                &stream,
+                pointers.qkv_activation_codes.cast_const(),
+                pointers.qkv_weight_codes,
+            )?
+        };
+        // SAFETY: the one owner arena keeps all encoded source addresses stable.
+        let output_maps = unsafe {
+            DenseFp8GdnOutputTmaMaps::new(
+                &stream,
+                pointers.output_activation_codes.cast_const(),
+                pointers.output_weight_codes,
+            )?
+        };
         let base_address = arena.base_address();
         let ops = Ops {
             norm: &norm,
@@ -326,6 +347,8 @@ impl<A: Sm120Arch> FullAttentionLayerProgram<A> {
             down: &down,
             gate_up_maps: &gate_up_maps,
             down_maps: &down_maps,
+            qkv_maps: &qkv_maps,
+            output_maps: &output_maps,
         };
         let scales = CacheScales {
             key: key_cache_scale,
@@ -339,6 +362,8 @@ impl<A: Sm120Arch> FullAttentionLayerProgram<A> {
             prefill_graphs,
             gate_up_maps,
             down_maps,
+            qkv_maps,
+            output_maps,
             arena,
             _norm: norm,
             _qkv: qkv_op,
@@ -584,7 +609,10 @@ impl<A: Sm120Arch> FullAttentionLayerProgram<A> {
 
     /// Exact bytes in the four address-bound MLP tensor maps.
     pub const fn descriptor_bytes(&self) -> usize {
-        DenseFp8SwiGluTmaMaps::BYTE_LEN + DenseFp8DownTmaMaps::BYTE_LEN
+        DenseFp8SwiGluTmaMaps::BYTE_LEN
+            + DenseFp8DownTmaMaps::BYTE_LEN
+            + DenseFp8QkvTmaMaps::BYTE_LEN
+            + DenseFp8GdnOutputTmaMaps::BYTE_LEN
     }
 
     /// Checked owner layout.
@@ -661,21 +689,29 @@ impl<A: Sm120Arch> FullAttentionLayerProgram<A> {
         let mut addresses = Pointers::bind(&self.arena, self.layout.regions())?.addresses();
         addresses.extend(self.gate_up_maps.device_addresses());
         addresses.extend(self.down_maps.device_addresses());
+        addresses.extend(self.qkv_maps.device_addresses());
+        addresses.extend(self.output_maps.device_addresses());
 
         Ok(addresses)
     }
 
     #[cfg(feature = "qualification")]
     /// Copies every opaque address-bound tensor map.
-    pub fn qualification_descriptors(&self, stream: &CudaStream) -> EngineResult<[Vec<u64>; 4]> {
+    pub fn qualification_descriptors(&self, stream: &CudaStream) -> EngineResult<[Vec<u64>; 8]> {
         let gate_up = self.gate_up_maps.copy_to_host(stream)?;
         let down = self.down_maps.copy_to_host(stream)?;
+        let qkv = self.qkv_maps.copy_to_host(stream)?;
+        let output = self.output_maps.copy_to_host(stream)?;
 
         Ok([
             gate_up[0].clone(),
             gate_up[1].clone(),
             down[0].clone(),
             down[1].clone(),
+            qkv[0].clone(),
+            qkv[1].clone(),
+            output[0].clone(),
+            output[1].clone(),
         ])
     }
 
@@ -796,6 +832,8 @@ impl<A: Sm120Arch> FullAttentionLayerProgram<A> {
             down: &self._down,
             gate_up_maps: &self.gate_up_maps,
             down_maps: &self.down_maps,
+            qkv_maps: &self.qkv_maps,
+            output_maps: &self.output_maps,
         }
     }
 
@@ -892,6 +930,8 @@ struct Ops<'a, A: Sm120Arch> {
     down: &'a DenseFp8DownOp<A>,
     gate_up_maps: &'a DenseFp8SwiGluTmaMaps,
     down_maps: &'a DenseFp8DownTmaMaps,
+    qkv_maps: &'a DenseFp8QkvTmaMaps,
+    output_maps: &'a DenseFp8GdnOutputTmaMaps,
 }
 
 #[derive(Clone, Copy)]
@@ -965,16 +1005,30 @@ fn launch_route<A: Sm120Arch>(
             pointers.input_norm,
             pointers.mixer_normalized,
         )?;
-        ops.qkv.launch(
-            stream,
-            rows,
-            pointers.mixer_normalized,
-            pointers.qkv_activation_codes,
-            pointers.qkv_activation_scales,
-            pointers.qkv_weight_codes,
-            pointers.qkv_weight_scales,
-            pointers.qkv,
-        )?;
+        if rows == MAX_ROWS {
+            // T=1024 amortizes address-bound TMA setup across the macro tile.
+            ops.qkv.launch_macro_prefill(
+                stream,
+                pointers.mixer_normalized,
+                pointers.qkv_activation_codes,
+                pointers.qkv_activation_scales,
+                pointers.qkv_weight_codes,
+                pointers.qkv_weight_scales,
+                pointers.qkv,
+                ops.qkv_maps,
+            )?;
+        } else {
+            ops.qkv.launch(
+                stream,
+                rows,
+                pointers.mixer_normalized,
+                pointers.qkv_activation_codes,
+                pointers.qkv_activation_scales,
+                pointers.qkv_weight_codes,
+                pointers.qkv_weight_scales,
+                pointers.qkv,
+            )?;
+        }
         ops.qk_prepare.launch(
             stream,
             rows,
@@ -1042,17 +1096,32 @@ fn launch_route<A: Sm120Arch>(
                 scales.value,
             )?;
         }
-        ops.attention_output.launch(
-            stream,
-            rows,
-            pointers.attention,
-            pointers.qkv,
-            pointers.output_activation_codes,
-            pointers.output_activation_scales,
-            pointers.output_weight_codes,
-            pointers.output_weight_scales,
-            pointers.mixer_branch,
-        )?;
+        if rows == MAX_ROWS {
+            // T=1024 amortizes address-bound TMA setup across the macro tile.
+            ops.attention_output.launch_macro_prefill(
+                stream,
+                pointers.attention,
+                pointers.qkv,
+                pointers.output_activation_codes,
+                pointers.output_activation_scales,
+                pointers.output_weight_codes,
+                pointers.output_weight_scales,
+                pointers.mixer_branch,
+                ops.output_maps,
+            )?;
+        } else {
+            ops.attention_output.launch(
+                stream,
+                rows,
+                pointers.attention,
+                pointers.qkv,
+                pointers.output_activation_codes,
+                pointers.output_activation_scales,
+                pointers.output_weight_codes,
+                pointers.output_weight_scales,
+                pointers.mixer_branch,
+            )?;
+        }
         ops.norm.launch_residual(
             stream,
             rows,

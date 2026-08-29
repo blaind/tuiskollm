@@ -31,10 +31,10 @@ use tuisko_gpu::{
 use tuisko_kernels_sm120::ATTENTION_PAGE_SIZE;
 use tuisko_kernels_sm120::{
     AttentionOutputOp, AttentionQkPrepareOp, DenseFp8DownOp, DenseFp8DownTmaMaps,
-    DenseFp8GdnInputTmaMaps, DenseFp8SwiGluOp, DenseFp8SwiGluTmaMaps, FullAttentionQkvOp,
-    GdnInputProjectionOp, GdnOutputProjectionOp, GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp,
-    LONG_CONTEXT_GQA_PARTITION_BUCKETS, LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp,
-    LongContextPagedGqaOp, Nvfp4DownOp, Nvfp4SwiGluOp,
+    DenseFp8GdnInputTmaMaps, DenseFp8GdnOutputTmaMaps, DenseFp8QkvTmaMaps, DenseFp8SwiGluOp,
+    DenseFp8SwiGluTmaMaps, FullAttentionQkvOp, GdnInputProjectionOp, GdnOutputProjectionOp,
+    GdnPrepareOp, GdnRecurrenceOp, GdnStateSnapshotOp, LONG_CONTEXT_GQA_PARTITION_BUCKETS,
+    LONG_CONTEXT_GQA_PARTITION_SIZE, LmHeadOp, LongContextPagedGqaOp, Nvfp4DownOp, Nvfp4SwiGluOp,
     PAGED_GQA_PREFILL_LONG_PARTITION_MIN_CONTEXT, PagedGqaOp, ResidualNormOp,
 };
 use tuisko_model::{
@@ -544,6 +544,9 @@ pub struct ResidentModelProgram {
     graphs: ResidentGraphs,
     dense_mlp_maps: Vec<DenseMlpMaps>,
     gdn_input_maps: Vec<DenseFp8GdnInputTmaMaps>,
+    gdn_output_maps: Vec<DenseFp8GdnOutputTmaMaps>,
+    attention_output_maps: Vec<DenseFp8GdnOutputTmaMaps>,
+    qkv_maps: Vec<DenseFp8QkvTmaMaps>,
     arena: DeviceArena,
     kv_arena: DeviceArena,
     kv_slots: PagedKvSlotPool,
@@ -1010,6 +1013,9 @@ impl ResidentModelProgram {
         let pointers = ProgramPointers::bind(&arena, &kv_arena, &layout, &scalars)?;
         let dense_mlp_maps = DenseMlpMaps::bind_all(&stream, &pointers)?;
         let gdn_input_maps = DenseMlpMaps::bind_gdn_input(&stream, &pointers)?;
+        let gdn_output_maps = DenseMlpMaps::bind_gdn_output(&stream, &pointers)?;
+        let attention_output_maps = DenseMlpMaps::bind_attention_output(&stream, &pointers)?;
+        let qkv_maps = DenseMlpMaps::bind_qkv(&stream, &pointers)?;
         let base_address = arena.base_address();
         let kv_base_address = kv_arena.base_address();
         let ops = Ops {
@@ -1030,7 +1036,16 @@ impl ResidentModelProgram {
             nvfp4_down: &nvfp4_down,
             lm_head: &lm_head,
         };
-        let graphs = capture_routes(&stream, ops, &pointers, &dense_mlp_maps, &gdn_input_maps)?;
+        let graphs = capture_routes(
+            &stream,
+            ops,
+            &pointers,
+            &dense_mlp_maps,
+            &gdn_input_maps,
+            &gdn_output_maps,
+            &attention_output_maps,
+            &qkv_maps,
+        )?;
         load_stats.graph_capture_ns = elapsed_ns("resident graph capture", graph_start)?;
         if let Some(progress) = progress
             && progress_tail_upload_bytes == 0
@@ -1043,6 +1058,9 @@ impl ResidentModelProgram {
                 graphs,
                 dense_mlp_maps,
                 gdn_input_maps,
+                gdn_output_maps,
+                attention_output_maps,
+                qkv_maps,
                 arena,
                 kv_arena,
                 kv_slots,
@@ -2512,6 +2530,21 @@ impl ResidentModelProgram {
                 .iter()
                 .map(DenseFp8GdnInputTmaMaps::byte_len)
                 .sum::<usize>()
+            + self
+                .gdn_output_maps
+                .iter()
+                .map(DenseFp8GdnOutputTmaMaps::byte_len)
+                .sum::<usize>()
+            + self
+                .attention_output_maps
+                .iter()
+                .map(DenseFp8GdnOutputTmaMaps::byte_len)
+                .sum::<usize>()
+            + self
+                .qkv_maps
+                .iter()
+                .map(DenseFp8QkvTmaMaps::byte_len)
+                .sum::<usize>()
     }
 
     /// Complete device arena bytes, including exact alignment padding.
@@ -2618,6 +2651,9 @@ impl ResidentModelProgram {
             &self._pointers,
             &self.dense_mlp_maps,
             &self.gdn_input_maps,
+            &self.gdn_output_maps,
+            &self.attention_output_maps,
+            &self.qkv_maps,
         )?;
         Ok(())
     }
@@ -2767,6 +2803,9 @@ impl ResidentModelProgram {
                     &self._pointers,
                     &self.dense_mlp_maps,
                     &self.gdn_input_maps,
+                    &self.gdn_output_maps,
+                    &self.attention_output_maps,
+                    &self.qkv_maps,
                 )?;
             }
             Ok(())
@@ -3129,6 +3168,15 @@ impl ResidentModelProgram {
             maps.push_addresses(&mut addresses);
         }
         for maps in &self.gdn_input_maps {
+            addresses.extend(maps.device_addresses());
+        }
+        for maps in &self.gdn_output_maps {
+            addresses.extend(maps.device_addresses());
+        }
+        for maps in &self.attention_output_maps {
+            addresses.extend(maps.device_addresses());
+        }
+        for maps in &self.qkv_maps {
             addresses.extend(maps.device_addresses());
         }
         addresses
@@ -4720,6 +4768,72 @@ impl DenseMlpMaps {
         Ok(maps)
     }
 
+    fn bind_gdn_output(
+        stream: &CudaStream,
+        pointers: &ProgramPointers,
+    ) -> EngineResult<Vec<DenseFp8GdnOutputTmaMaps>> {
+        let mut maps = Vec::new();
+        for layer in &pointers.layers {
+            let MixerPointers::Gdn(gdn) = layer.mixer else {
+                continue;
+            };
+            // SAFETY: resident arenas keep the shared scratch and this layer's
+            // source-native weight addresses stable for every captured graph.
+            maps.push(unsafe {
+                DenseFp8GdnOutputTmaMaps::new(
+                    stream,
+                    pointers.workspace.activation_codes.cast_const(),
+                    gdn.output_weight_codes,
+                )?
+            });
+        }
+        Ok(maps)
+    }
+
+    fn bind_attention_output(
+        stream: &CudaStream,
+        pointers: &ProgramPointers,
+    ) -> EngineResult<Vec<DenseFp8GdnOutputTmaMaps>> {
+        let mut maps = Vec::new();
+        for layer in &pointers.layers {
+            let MixerPointers::Attention(attention) = layer.mixer else {
+                continue;
+            };
+            // SAFETY: resident arenas keep the shared scratch and this layer's
+            // source-native weight addresses stable for every captured graph.
+            maps.push(unsafe {
+                DenseFp8GdnOutputTmaMaps::new(
+                    stream,
+                    pointers.workspace.activation_codes.cast_const(),
+                    attention.output_weight_codes,
+                )?
+            });
+        }
+        Ok(maps)
+    }
+
+    fn bind_qkv(
+        stream: &CudaStream,
+        pointers: &ProgramPointers,
+    ) -> EngineResult<Vec<DenseFp8QkvTmaMaps>> {
+        let mut maps = Vec::new();
+        for layer in &pointers.layers {
+            let MixerPointers::Attention(attention) = layer.mixer else {
+                continue;
+            };
+            // SAFETY: resident arenas keep the shared scratch and this layer's
+            // source-native weight addresses stable for every captured graph.
+            maps.push(unsafe {
+                DenseFp8QkvTmaMaps::new(
+                    stream,
+                    pointers.workspace.activation_codes.cast_const(),
+                    attention.qkv_weight_codes,
+                )?
+            });
+        }
+        Ok(maps)
+    }
+
     fn byte_len(&self) -> usize {
         self.gate_up.byte_len() + self.down.byte_len()
     }
@@ -4995,6 +5109,9 @@ fn capture_routes(
     pointers: &ProgramPointers,
     dense_mlp_maps: &[DenseMlpMaps],
     gdn_input_maps: &[DenseFp8GdnInputTmaMaps],
+    gdn_output_maps: &[DenseFp8GdnOutputTmaMaps],
+    attention_output_maps: &[DenseFp8GdnOutputTmaMaps],
+    qkv_maps: &[DenseFp8QkvTmaMaps],
 ) -> EngineResult<ResidentGraphs> {
     let mut short = Vec::with_capacity(MAX_BATCH);
     for batch in 1..=MAX_BATCH {
@@ -5036,7 +5153,17 @@ fn capture_routes(
     let mut prefill = Vec::with_capacity(PREFILL_GRAPH_ROUTE_COUNT);
     for route in prefill_graph_routes() {
         prefill.push(CudaGraph::capture(stream, || {
-            launch_prefill_route(stream, route, ops, pointers, dense_mlp_maps, gdn_input_maps)
+            launch_prefill_route(
+                stream,
+                route,
+                ops,
+                pointers,
+                dense_mlp_maps,
+                gdn_input_maps,
+                gdn_output_maps,
+                attention_output_maps,
+                qkv_maps,
+            )
         })?);
     }
     let prefill = prefill.try_into().map_err(|_| {
@@ -5707,6 +5834,9 @@ fn launch_prefill_route(
     pointers: &ProgramPointers,
     dense_mlp_maps: &[DenseMlpMaps],
     gdn_input_maps: &[DenseFp8GdnInputTmaMaps],
+    gdn_output_maps: &[DenseFp8GdnOutputTmaMaps],
+    attention_output_maps: &[DenseFp8GdnOutputTmaMaps],
+    qkv_maps: &[DenseFp8QkvTmaMaps],
 ) -> GpuResult<()> {
     let rows = route.tokens;
     let workspace = pointers.workspace;
@@ -5728,7 +5858,17 @@ fn launch_prefill_route(
 
     let mut residual_input = workspace.residual_a;
     for (index, layer) in pointers.layers.iter().enumerate() {
-        launch_prefill_mixer(stream, route, ops, workspace, layer.mixer, gdn_input_maps)?;
+        launch_prefill_mixer(
+            stream,
+            route,
+            ops,
+            workspace,
+            layer.mixer,
+            gdn_input_maps,
+            gdn_output_maps,
+            attention_output_maps,
+            qkv_maps,
+        )?;
         // SAFETY: branch and residual planes are disjoint MAX_ROWS regions.
         unsafe {
             ops.norm.launch_residual(
@@ -5798,6 +5938,9 @@ fn launch_prefill_mixer(
     workspace: WorkspacePointers,
     mixer: MixerPointers,
     gdn_input_maps: &[DenseFp8GdnInputTmaMaps],
+    gdn_output_maps: &[DenseFp8GdnOutputTmaMaps],
+    attention_output_maps: &[DenseFp8GdnOutputTmaMaps],
+    qkv_maps: &[DenseFp8QkvTmaMaps],
 ) -> GpuResult<()> {
     let rows = route.tokens;
     // SAFETY: shared scratch is consumed before reuse. All prefill rows map to
@@ -5818,6 +5961,26 @@ fn launch_prefill_mixer(
                             )
                         })?;
                     ops.gdn_input.launch_macro_prefill(
+                        stream,
+                        workspace.mixer_normalized,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.input_weight_codes,
+                        p.input_weight_scales,
+                        workspace.projected,
+                        maps,
+                    )?;
+                } else if rows == 128 {
+                    // The T=1024 TMA entry also serves one 128-row token tile.
+                    let maps = gdn_input_maps
+                        .iter()
+                        .find(|maps| maps.source_addresses()[1] == p.input_weight_codes.addr())
+                        .ok_or_else(|| {
+                            GpuError::invalid_launch(
+                                "resident GDN input tensor-map inventory is missing this layer",
+                            )
+                        })?;
+                    ops.gdn_input.launch_t128_prefill(
                         stream,
                         workspace.mixer_normalized,
                         workspace.activation_codes,
@@ -5867,28 +6030,116 @@ fn launch_prefill_mixer(
                     workspace.recurrent_plane,
                     workspace.recurrent_output,
                 )?;
-                ops.gdn_output.launch(
-                    stream,
-                    rows,
-                    workspace.recurrent_output,
-                    workspace.activation_codes,
-                    workspace.activation_scales,
-                    p.output_weight_codes,
-                    p.output_weight_scales,
-                    workspace.mixer_branch,
-                )
+                if rows == super::resident_model_layout::MAX_ROWS {
+                    // T=1024 amortizes address-bound TMA setup across the tile;
+                    // the map is selected by its encoded weight address, which
+                    // launch_macro_prefill re-validates against the pointers.
+                    let maps = gdn_output_maps
+                        .iter()
+                        .find(|maps| maps.source_addresses()[1] == p.output_weight_codes.addr())
+                        .ok_or_else(|| {
+                            GpuError::invalid_launch(
+                                "resident GDN output tensor-map inventory is missing this layer",
+                            )
+                        })?;
+                    ops.gdn_output.launch_macro_prefill(
+                        stream,
+                        workspace.recurrent_output,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.output_weight_codes,
+                        p.output_weight_scales,
+                        workspace.mixer_branch,
+                        maps,
+                    )
+                } else if rows == 128 {
+                    // The T=1024 TMA entry also serves one 128-row token tile.
+                    let maps = gdn_output_maps
+                        .iter()
+                        .find(|maps| maps.source_addresses()[1] == p.output_weight_codes.addr())
+                        .ok_or_else(|| {
+                            GpuError::invalid_launch(
+                                "resident GDN output tensor-map inventory is missing this layer",
+                            )
+                        })?;
+                    ops.gdn_output.launch_t128_prefill(
+                        stream,
+                        workspace.recurrent_output,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.output_weight_codes,
+                        p.output_weight_scales,
+                        workspace.mixer_branch,
+                        maps,
+                    )
+                } else {
+                    ops.gdn_output.launch(
+                        stream,
+                        rows,
+                        workspace.recurrent_output,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.output_weight_codes,
+                        p.output_weight_scales,
+                        workspace.mixer_branch,
+                    )
+                }
             }
             MixerPointers::Attention(p) => {
-                ops.attention_qkv.launch(
-                    stream,
-                    rows,
-                    workspace.mixer_normalized,
-                    workspace.activation_codes,
-                    workspace.activation_scales,
-                    p.qkv_weight_codes,
-                    p.qkv_weight_scales,
-                    workspace.projected,
-                )?;
+                if rows == super::resident_model_layout::MAX_ROWS {
+                    // T=1024 amortizes address-bound TMA setup across the tile;
+                    // the map is selected by its encoded weight address, which
+                    // launch_macro_prefill re-validates against the pointers.
+                    let maps = qkv_maps
+                        .iter()
+                        .find(|maps| maps.source_addresses()[1] == p.qkv_weight_codes.addr())
+                        .ok_or_else(|| {
+                            GpuError::invalid_launch(
+                                "resident QKV tensor-map inventory is missing this layer",
+                            )
+                        })?;
+                    ops.attention_qkv.launch_macro_prefill(
+                        stream,
+                        workspace.mixer_normalized,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.qkv_weight_codes,
+                        p.qkv_weight_scales,
+                        workspace.projected,
+                        maps,
+                    )?;
+                } else if rows == 128 {
+                    // The T=1024 TMA entry also serves one 128-row token tile.
+                    let maps = qkv_maps
+                        .iter()
+                        .find(|maps| maps.source_addresses()[1] == p.qkv_weight_codes.addr())
+                        .ok_or_else(|| {
+                            GpuError::invalid_launch(
+                                "resident QKV tensor-map inventory is missing this layer",
+                            )
+                        })?;
+                    ops.attention_qkv.launch_t128_prefill(
+                        stream,
+                        workspace.mixer_normalized,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.qkv_weight_codes,
+                        p.qkv_weight_scales,
+                        workspace.projected,
+                        maps,
+                    )?;
+                } else {
+                    ops.attention_qkv.launch(
+                        stream,
+                        rows,
+                        workspace.mixer_normalized,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.qkv_weight_codes,
+                        p.qkv_weight_scales,
+                        workspace.projected,
+                    )?;
+                }
                 ops.attention_qk_prepare.launch(
                     stream,
                     rows,
@@ -5958,17 +6209,67 @@ fn launch_prefill_mixer(
                         )?
                     }
                 }
-                ops.attention_output.launch(
-                    stream,
-                    rows,
-                    workspace.attention,
-                    workspace.projected,
-                    workspace.activation_codes,
-                    workspace.activation_scales,
-                    p.output_weight_codes,
-                    p.output_weight_scales,
-                    workspace.mixer_branch,
-                )
+                if rows == super::resident_model_layout::MAX_ROWS {
+                    // T=1024 amortizes address-bound TMA setup across the tile;
+                    // the map is selected by its encoded weight address, which
+                    // launch_macro_prefill re-validates against the pointers.
+                    let maps = attention_output_maps
+                        .iter()
+                        .find(|maps| {
+                            maps.source_addresses()[1] == p.output_weight_codes.addr()
+                        })
+                        .ok_or_else(|| {
+                            GpuError::invalid_launch(
+                                "resident attention-output tensor-map inventory is missing this layer",
+                            )
+                        })?;
+                    ops.attention_output.launch_macro_prefill(
+                        stream,
+                        workspace.attention,
+                        workspace.projected,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.output_weight_codes,
+                        p.output_weight_scales,
+                        workspace.mixer_branch,
+                        maps,
+                    )
+                } else if rows == 128 {
+                    // The T=1024 TMA entry also serves one 128-row token tile.
+                    let maps = attention_output_maps
+                        .iter()
+                        .find(|maps| {
+                            maps.source_addresses()[1] == p.output_weight_codes.addr()
+                        })
+                        .ok_or_else(|| {
+                            GpuError::invalid_launch(
+                                "resident attention-output tensor-map inventory is missing this layer",
+                            )
+                        })?;
+                    ops.attention_output.launch_t128_prefill(
+                        stream,
+                        workspace.attention,
+                        workspace.projected,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.output_weight_codes,
+                        p.output_weight_scales,
+                        workspace.mixer_branch,
+                        maps,
+                    )
+                } else {
+                    ops.attention_output.launch(
+                        stream,
+                        rows,
+                        workspace.attention,
+                        workspace.projected,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.output_weight_codes,
+                        p.output_weight_scales,
+                        workspace.mixer_branch,
+                    )
+                }
             }
         }
     }
@@ -6193,6 +6494,33 @@ fn launch_mlp(
                         workspace.mlp_branch,
                         &maps.down,
                     )
+                } else if rows == 128 {
+                    // The T=1024 TMA entries also serve one 128-row token tile.
+                    let maps = dense_mlp_maps.get(p.map_index).ok_or_else(|| {
+                        GpuError::invalid_launch(
+                            "resident dense MLP tensor-map index is outside its owner inventory",
+                        )
+                    })?;
+                    ops.dense_swiglu.launch_t128_prefill(
+                        stream,
+                        workspace.mlp_normalized,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.gate_up_weight_codes,
+                        p.gate_up_weight_scales,
+                        workspace.swiglu,
+                        &maps.gate_up,
+                    )?;
+                    return ops.dense_down.launch_t128_prefill(
+                        stream,
+                        workspace.swiglu,
+                        workspace.activation_codes,
+                        workspace.activation_scales,
+                        p.down_weight_codes,
+                        p.down_weight_scales,
+                        workspace.mlp_branch,
+                        &maps.down,
+                    );
                 } else {
                     ops.dense_swiglu.launch(
                         stream,

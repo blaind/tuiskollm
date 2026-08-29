@@ -82,7 +82,7 @@ mod tests {
         ("tuisko_kernels_sm120_norm", 68),
         ("tuisko_kernels_sm120_attention", 206),
         ("tuisko_kernels_sm120_nvfp4", 140),
-        ("tuisko_kernels_sm120_fp8_projection", 160),
+        ("tuisko_kernels_sm120_fp8_projection", 159),
         ("tuisko_kernels_sm120_fp8_mlp", 26),
         ("tuisko_kernels_sm120_qwen38_flash_next_projection", 53),
         ("tuisko_kernels_sm120_gdn", 134),

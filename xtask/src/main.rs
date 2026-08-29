@@ -7602,7 +7602,7 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>();
     let qkv_t1024 = entries
         .iter()
-        .filter(|entry| entry.name == "fp8_qkv_mma_t1024")
+        .filter(|entry| entry.name == "fp8_qkv_tma_t1024")
         .collect::<Vec<_>>();
     require_count("FP8 activation quantization", quantize.len(), 1)?;
     require_count("FP8 QKV", qkv.len(), 8)?;
@@ -7624,10 +7624,19 @@ fn gate_fp8_qkv(root: &Path) -> Result<(), Box<dyn Error>> {
     {
         return Err("FP8 QKV T=16 lost its 64-thread/four-CTA launch bounds".into());
     }
-    for entry in qkv_prefill.iter().chain(&qkv_t1024) {
+    for entry in &qkv_prefill {
         if !entry.body.contains(".reqntid 256, 1, 1") || !entry.body.contains(".minnctapersm 2") {
             return Err(format!(
                 "entry `{}` lost its 256-thread/two-CTA prefill launch bounds",
+                entry.name
+            )
+            .into());
+        }
+    }
+    for entry in &qkv_t1024 {
+        if !entry.body.contains(".reqntid 288, 1, 1") || !entry.body.contains(".minnctapersm 2") {
+            return Err(format!(
+                "entry `{}` lost its 288-thread/two-CTA TMA launch bounds",
                 entry.name
             )
             .into());
@@ -10019,7 +10028,7 @@ fn gate_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>();
     let macro_prefill = entries
         .iter()
-        .filter(|entry| entry.name == "gdn_output_projection_mma_t1024")
+        .filter(|entry| entry.name == "fp8_gdn_output_tma_t1024")
         .collect::<Vec<_>>();
     require_count("GDN output quantization", quantize.len(), 1)?;
     require_count("GDN output projection", projection.len(), 8)?;
@@ -10043,10 +10052,10 @@ fn gate_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    if !macro_prefill[0].body.contains(".reqntid 128, 1, 1")
-        || !macro_prefill[0].body.contains(".minnctapersm 4")
+    if !macro_prefill[0].body.contains(".reqntid 288, 1, 1")
+        || !macro_prefill[0].body.contains(".minnctapersm 2")
     {
-        return Err("GDN output T=1024 lost its 128-thread/four-CTA launch bounds".into());
+        return Err("GDN output T=1024 lost its 288-thread/two-CTA TMA launch bounds".into());
     }
     let artifact = sm120_gate_artifact(root)?;
     let resources = &artifact.resources;
@@ -10102,7 +10111,12 @@ fn gate_gdn_output(root: &Path) -> Result<(), Box<dyn Error>> {
         require_spill_free(entry.name, resource)?;
         let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
-        for instruction in ["QMMA.16832.F32.E4M3.E4M3", "LDGSTS"] {
+        let staging = if entry.name == "fp8_gdn_output_tma_t1024" {
+            "UTMALDG.2D"
+        } else {
+            "LDGSTS"
+        };
+        for instruction in ["QMMA.16832.F32.E4M3.E4M3", staging] {
             if !body.contains(instruction) {
                 return Err(
                     format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
@@ -10946,9 +10960,10 @@ fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
                 .starts_with("attention_output_projection_mma_exact_TID_")
         })
         .collect::<Vec<_>>();
+    // T=1024 shares the GDN output TMA entry (identical 6,144-wide geometry).
     let macro_prefill = entries
         .iter()
-        .filter(|entry| entry.name == "attention_output_projection_mma_t1024")
+        .filter(|entry| entry.name == "fp8_gdn_output_tma_t1024")
         .collect::<Vec<_>>();
     require_count("attention-output gate quantization", quantize.len(), 1)?;
     require_count("attention-output projection", projection.len(), 8)?;
@@ -10972,10 +10987,10 @@ fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    if !macro_prefill[0].body.contains(".reqntid 128, 1, 1")
-        || !macro_prefill[0].body.contains(".minnctapersm 4")
+    if !macro_prefill[0].body.contains(".reqntid 288, 1, 1")
+        || !macro_prefill[0].body.contains(".minnctapersm 2")
     {
-        return Err("attention-output T=1024 lost its 128-thread/four-CTA launch bounds".into());
+        return Err("attention-output T=1024 lost its 288-thread/two-CTA TMA launch bounds".into());
     }
 
     let artifact = sm120_gate_artifact(root)?;
@@ -11039,7 +11054,12 @@ fn gate_attention_output(root: &Path) -> Result<(), Box<dyn Error>> {
         require_spill_free(entry.name, resource)?;
         let body = sass_function_body(sass, entry.name)
             .ok_or_else(|| format!("cuobjdump omitted `{}` SASS", entry.name))?;
-        for instruction in ["QMMA.16832.F32.E4M3.E4M3", "LDGSTS"] {
+        let staging = if entry.name == "fp8_gdn_output_tma_t1024" {
+            "UTMALDG.2D"
+        } else {
+            "LDGSTS"
+        };
+        for instruction in ["QMMA.16832.F32.E4M3.E4M3", staging] {
             if !body.contains(instruction) {
                 return Err(
                     format!("entry `{}` lost required `{instruction}` SASS", entry.name).into(),
