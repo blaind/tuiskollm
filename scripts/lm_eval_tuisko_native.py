@@ -147,8 +147,7 @@ def install_model() -> None:
                 self._batch_size = min(
                     self._batch_size, parse_batch_size(max_batch_size)
                 )
-            if device not in (None, "cpu"):
-                raise ValueError("tuisko-native is an HTTP client and admits only device=cpu")
+            del device
 
         @property
         def eot_token_id(self) -> int:
