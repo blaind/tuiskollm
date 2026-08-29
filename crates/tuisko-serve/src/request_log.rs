@@ -9,6 +9,7 @@ pub(crate) struct RequestLog {
     accepted_offset: Duration,
     first_output: Option<Instant>,
     prompt_metrics: PromptEncodingMetrics,
+    mtp_acceptance: Option<(usize, usize)>,
     route: &'static str,
 }
 
@@ -25,6 +26,7 @@ impl RequestLog {
             accepted_offset: accepted.saturating_duration_since(server_started),
             first_output: None,
             prompt_metrics: PromptEncodingMetrics::default(),
+            mtp_acceptance: None,
             route,
         }
     }
@@ -35,6 +37,11 @@ impl RequestLog {
 
     pub(crate) fn observe_output(&mut self) {
         self.first_output.get_or_insert_with(Instant::now);
+    }
+
+    pub(crate) fn observe_mtp_acceptance(&mut self, accepted: usize, proposed: usize) {
+        debug_assert!(accepted <= proposed);
+        self.mtp_acceptance = Some((accepted, proposed));
     }
 
     pub(crate) fn finish(
@@ -91,6 +98,16 @@ impl RequestLog {
                 (generated_tokens - 1) as f64 / ((total_ms - ttft) / 1_000.0)
             });
         let bpe_tail_tokens = prompt_tokens.saturating_sub(frontend_reused);
+        let mtp_acceptance =
+            self.mtp_acceptance
+                .map_or_else(String::new, |(accepted, proposed)| {
+                    let percent = if proposed == 0 {
+                        0.0
+                    } else {
+                        100.0 * accepted as f64 / proposed as f64
+                    };
+                    format!(", mtp accept {accepted}/{proposed} ({percent:.1}%)")
+                });
         let miss = if self.prompt_metrics.miss_reason.is_empty() {
             String::new()
         } else {
@@ -101,7 +118,7 @@ impl RequestLog {
         });
 
         format!(
-            "TuiskoLLM request {}: {:.0} ms (+{total_ms:.1} ms), prompt {prompt_tokens} tok, cached {cached_prompt_tokens} tok ({cached_percent:.1}%), input {input_tokens} tok, gen {generated_tokens} tok, ttft {:.1} ms, decode {decode_tokens_per_second:.1} tok/s, route {}, render {:.1} ms, encode {:.1} ms, bpe-tail {bpe_tail_tokens} tok{miss}, finish {finish_reason}{error}",
+            "TuiskoLLM request {}: {:.0} ms (+{total_ms:.1} ms), prompt {prompt_tokens} tok, cached {cached_prompt_tokens} tok ({cached_percent:.1}%), input {input_tokens} tok, gen {generated_tokens} tok, ttft {:.1} ms, decode {decode_tokens_per_second:.1} tok/s{mtp_acceptance}, route {}, render {:.1} ms, encode {:.1} ms, bpe-tail {bpe_tail_tokens} tok{miss}, finish {finish_reason}{error}",
             self.id,
             self.accepted_offset.as_secs_f64() * 1_000.0,
             ttft_ms.unwrap_or(-1.0),
@@ -145,6 +162,7 @@ mod tests {
             miss_reason: String::new(),
         });
         log.first_output = Some(accepted + Duration::from_millis(200));
+        log.observe_mtp_acceptance(23, 30);
         let line = log.render_at(
             accepted + Duration::from_millis(1_200),
             Some(&output().prompt),
@@ -156,8 +174,26 @@ mod tests {
 
         assert_eq!(
             line,
-            "TuiskoLLM request 7: 125 ms (+1200.0 ms), prompt 100 tok, cached 80 tok (80.0%), input 20 tok, gen 11 tok, ttft 200.0 ms, decode 10.0 tok/s, route mtp-draft-3, render 1.5 ms, encode 2.2 ms, bpe-tail 25 tok, finish length"
+            "TuiskoLLM request 7: 125 ms (+1200.0 ms), prompt 100 tok, cached 80 tok (80.0%), input 20 tok, gen 11 tok, ttft 200.0 ms, decode 10.0 tok/s, mtp accept 23/30 (76.7%), route mtp-draft-3, render 1.5 ms, encode 2.2 ms, bpe-tail 25 tok, finish length"
         );
+    }
+
+    #[test]
+    fn observed_mtp_without_proposals_reports_a_defined_zero_rate() {
+        let started = Instant::now();
+        let mut log = RequestLog::new(8, started, started, "mtp-draft-3");
+        log.observe_mtp_acceptance(0, 0);
+
+        let line = log.render_at(
+            started + Duration::from_millis(1),
+            None,
+            0,
+            0,
+            "length",
+            None,
+        );
+
+        assert!(line.contains("mtp accept 0/0 (0.0%)"));
     }
 
     #[test]
@@ -176,6 +212,7 @@ mod tests {
         assert!(line.contains("prompt 0 tok, cached 0 tok (0.0%), input 0 tok"));
         assert!(line.contains("ttft -1.0 ms, decode 0.0 tok/s"));
         assert!(line.ends_with("finish error (capacity refused)"));
+        assert!(!line.contains("mtp accept"));
         assert!(!line.contains(['\r', '\n']));
     }
 

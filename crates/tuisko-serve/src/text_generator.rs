@@ -28,6 +28,11 @@ pub(crate) trait GenerationEvent {
 
     /// Complete output when this round terminated the request.
     fn completed(&self) -> Option<&GeneratedText>;
+
+    /// Cumulative accepted and proposed MTP draft counts, when exposed by this target.
+    fn mtp_acceptance(&self) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 /// One scheduler round's events in the stable active order at round entry.
@@ -88,6 +93,10 @@ impl GenerationEvent for ResidentMtpBatchEvent {
 
     fn completed(&self) -> Option<&GeneratedText> {
         self.completed.as_ref()
+    }
+
+    fn mtp_acceptance(&self) -> Option<(usize, usize)> {
+        Some((self.stats.accepted_drafts, self.stats.draft_proposals))
     }
 }
 
