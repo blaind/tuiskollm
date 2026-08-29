@@ -8,7 +8,7 @@ use crate::common::mtp::{
 };
 use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope, text_rope};
 use crate::common::slots::device_zero_context;
-use crate::qwen38::resident_mtp_generation::prime_prompt;
+use crate::qwen38::resident_mtp_generation::prime_prompt_with_progress;
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GeneratedText, GenerationSession,
     GenerationStep, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, ResidentBatchAdmission,
@@ -341,6 +341,15 @@ impl ResidentMtpBatchGenerator {
         &mut self,
         request: &ChatGenerationRequest,
     ) -> EngineResult<ResidentBatchAdmission> {
+        self.admit_with_progress(request, |_, _| {})
+    }
+
+    /// Admits one request while reporting processed prompt tokens at existing stream boundaries.
+    pub fn admit_with_progress(
+        &mut self,
+        request: &ChatGenerationRequest,
+        mut progress: impl FnMut(usize, usize),
+    ) -> EngineResult<ResidentBatchAdmission> {
         let control = GenerationSession::start(&self.frontend, request)?;
         let prompt_tokens = control.prompt_token_ids().len();
         let message_boundary_tokens = control.message_boundary_token_ids().len();
@@ -367,6 +376,8 @@ impl ResidentMtpBatchGenerator {
         }
 
         let (slot, reused, reset, reuse) = self.select_slot(control.prompt_token_ids())?;
+        let prefill_tokens = prompt_tokens.saturating_sub(reused);
+        progress(0, prefill_tokens);
         if reused > message_boundary_tokens {
             return Err(EngineError::generation(format!(
                 "resident MTP reused prefix {reused} exceeds message boundary {message_boundary_tokens}"
@@ -399,13 +410,14 @@ impl ResidentMtpBatchGenerator {
         if reused < message_boundary_tokens {
             let retained_hidden =
                 (reused != 0).then(|| &self.target_boundary_hidden[hidden_slot(slot)]);
-            native_prefill_tokens = prime_prompt(
+            native_prefill_tokens = prime_prompt_with_progress(
                 &mut self.program,
                 &self.stream,
                 control.message_boundary_token_ids(),
                 slot,
                 reused,
                 retained_hidden,
+                &mut |processed| progress(processed.saturating_sub(reused), prefill_tokens),
             )?;
             self.program.target().read_residual_row_into(
                 &self.stream,
@@ -418,6 +430,10 @@ impl ResidentMtpBatchGenerator {
                 &mut self.message_boundary_history,
                 &mut self.message_boundary_state,
             )?;
+            progress(
+                message_boundary_tokens.saturating_sub(reused),
+                prefill_tokens,
+            );
             self.message_boundary_valid[slot] = true;
         } else if !self.message_boundary_valid[slot] {
             return Err(EngineError::generation(
@@ -425,13 +441,14 @@ impl ResidentMtpBatchGenerator {
             ));
         }
         if message_boundary_tokens < prompt_tokens {
-            let suffix_native = prime_prompt(
+            let suffix_native = prime_prompt_with_progress(
                 &mut self.program,
                 &self.stream,
                 control.prompt_token_ids(),
                 slot,
                 message_boundary_tokens,
                 Some(&self.message_boundary_hidden[hidden_slot(slot)]),
+                &mut |processed| progress(processed.saturating_sub(reused), prefill_tokens),
             )?;
             native_prefill_tokens = native_prefill_tokens
                 .checked_add(suffix_native)
@@ -450,6 +467,7 @@ impl ResidentMtpBatchGenerator {
                 0,
                 &mut self.target_boundary_hidden[hidden_slot(slot)],
             )?;
+            progress(prefill_tokens, prefill_tokens);
         }
         self.sessions[slot] = Some(ResidentMtpBatchSession {
             request_id,

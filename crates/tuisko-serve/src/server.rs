@@ -20,7 +20,7 @@ use std::future::Future;
 use std::io::{IsTerminal, Write as IoWrite};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender, channel, error::TryRecvError, error::TrySendError};
@@ -234,14 +234,13 @@ enum InferencePhase {
 struct InferenceProgress {
     phase: InferencePhase,
     active: usize,
-    rounds: usize,
     output_tokens: usize,
     first_output_tokens: usize,
     spinner_tick: usize,
     phase_elapsed: Duration,
     elapsed: Duration,
     ttft: Option<Duration>,
-    last_prefill: Option<(usize, Duration)>,
+    prefill_progress: Option<(usize, usize)>,
     mtp_stats: Option<ResidentMtpGenerationStats>,
 }
 
@@ -262,11 +261,34 @@ struct InferenceDisplayState {
     first_output_tokens: usize,
     last_active: usize,
     spinner_tick: usize,
-    rounds: usize,
     output_tokens: usize,
-    last_prefill: Option<(usize, Duration)>,
+    prefill_progress: Arc<PrefillProgress>,
     mtp_by_request: HashMap<ResidentRequestId, ResidentMtpGenerationStats>,
     session_active: bool,
+}
+
+#[derive(Debug, Default)]
+struct PrefillProgress {
+    completed: AtomicUsize,
+    total: AtomicUsize,
+}
+
+impl PrefillProgress {
+    fn reset(&self) {
+        self.total.store(0, Ordering::Release);
+        self.completed.store(0, Ordering::Release);
+    }
+
+    fn observe(&self, completed: usize, total: usize) {
+        self.total.store(total, Ordering::Release);
+        self.completed
+            .store(completed.min(total), Ordering::Release);
+    }
+
+    fn snapshot(&self) -> Option<(usize, usize)> {
+        let total = self.total.load(Ordering::Acquire);
+        (total != 0).then(|| (self.completed.load(Ordering::Acquire).min(total), total))
+    }
 }
 
 impl InferenceDisplay {
@@ -282,9 +304,8 @@ impl InferenceDisplay {
             first_output_tokens: 0,
             last_active: 0,
             spinner_tick: 0,
-            rounds: 0,
             output_tokens: 0,
-            last_prefill: None,
+            prefill_progress: Arc::new(PrefillProgress::default()),
             mtp_by_request: HashMap::new(),
             session_active: false,
         }));
@@ -325,19 +346,22 @@ impl InferenceDisplay {
         state.phase_epoch = state.phase_epoch.wrapping_add(1);
         state.phase_started = Instant::now();
         state.last_active = requests;
+        state.prefill_progress.reset();
     }
 
-    fn observe_prefill(&mut self, tokens: usize, elapsed: Duration) {
-        self.state
-            .lock()
-            .expect("display mutex poisoned")
-            .last_prefill = Some((tokens, elapsed));
+    fn prefill_progress(&self) -> Arc<PrefillProgress> {
+        Arc::clone(
+            &self
+                .state
+                .lock()
+                .expect("display mutex poisoned")
+                .prefill_progress,
+        )
     }
 
     fn decode(&mut self, active: usize) {
         let mut state = self.state.lock().expect("display mutex poisoned");
         state.begin_session(Instant::now());
-        state.rounds = state.rounds.saturating_add(1);
         if state.phase != Some(InferencePhase::Decode) {
             let now = Instant::now();
             state.phase = Some(InferencePhase::Decode);
@@ -394,9 +418,7 @@ impl InferenceDisplay {
         state.first_output = None;
         state.first_output_tokens = 0;
         state.last_active = 0;
-        state.rounds = 0;
         state.output_tokens = 0;
-        state.last_prefill = None;
         state.mtp_by_request.clear();
         state.session_active = false;
     }
@@ -414,9 +436,7 @@ impl Drop for InferenceDisplay {
 impl InferenceDisplayState {
     fn begin_session(&mut self, accepted: Instant) {
         if !self.session_active {
-            self.rounds = 0;
             self.output_tokens = 0;
-            self.last_prefill = None;
             self.mtp_by_request.clear();
             self.session_started = accepted;
             self.first_output = None;
@@ -468,7 +488,6 @@ fn render_inference_state(state: &mut InferenceDisplayState) -> Option<(u64, Str
         InferenceProgress {
             phase,
             active: state.last_active,
-            rounds: state.rounds,
             output_tokens: state.output_tokens,
             first_output_tokens: state.first_output_tokens,
             spinner_tick: state.spinner_tick,
@@ -477,7 +496,7 @@ fn render_inference_state(state: &mut InferenceDisplayState) -> Option<(u64, Str
             ttft: state
                 .first_output
                 .map(|first| first.saturating_duration_since(state.session_started)),
-            last_prefill: state.last_prefill,
+            prefill_progress: state.prefill_progress.snapshot(),
             mtp_stats,
         },
         state.color,
@@ -1620,15 +1639,34 @@ fn render_inference_progress(progress: InferenceProgress, color: bool) -> String
     let frame = FRAMES[progress.spinner_tick % FRAMES.len()];
     let (label, detail) = match progress.phase {
         InferencePhase::Prefill => {
-            let suffix = if progress.active == 1 { "" } else { "s" };
-            (
-                "PREFILL",
-                format!(
-                    "{} request{suffix} · {:.1} s",
-                    progress.active,
-                    progress.phase_elapsed.as_secs_f64()
-                ),
-            )
+            let detail = progress.prefill_progress.map_or_else(
+                || {
+                    format!(
+                        "B{} · tokenizing · {:.1}s",
+                        progress.active,
+                        progress.phase_elapsed.as_secs_f64()
+                    )
+                },
+                |(completed, total)| {
+                    let remaining = total.saturating_sub(completed);
+                    let seconds = progress.phase_elapsed.as_secs_f64();
+                    let speed = if seconds > 0.0 {
+                        completed as f64 / seconds
+                    } else {
+                        0.0
+                    };
+                    format!(
+                        "B{} {}/{} · left {} · {} · {:.1}s",
+                        progress.active,
+                        compact_count(completed),
+                        compact_count(total),
+                        compact_count(remaining),
+                        compact_rate(speed),
+                        seconds,
+                    )
+                },
+            );
+            ("PREFILL", detail)
         }
         InferencePhase::Decode => {
             let decode_elapsed = progress
@@ -1645,60 +1683,24 @@ fn render_inference_progress(progress: InferenceProgress, color: bool) -> String
                 0.0
             };
             let ttft = progress.ttft.map_or_else(
-                || "ttft pending".into(),
-                |ttft| format!("ttft {:.1} s", ttft.as_secs_f64()),
+                || "TTFT pending".into(),
+                |ttft| format!("TTFT {:.1}s", ttft.as_secs_f64()),
             );
-            let prefill = progress
-                .last_prefill
-                .map_or_else(String::new, |(tokens, elapsed)| {
-                    let seconds = elapsed.as_secs_f64();
-                    let speed = if seconds > 0.0 {
-                        tokens as f64 / seconds
-                    } else {
-                        0.0
-                    };
-                    format!(" · prefill {speed:.1} tok/s")
-                });
-            let rounds = if progress.mtp_stats.is_none() {
-                format!(" · {} rounds", progress.rounds)
-            } else {
-                String::new()
-            };
             let mtp = progress.mtp_stats.map_or_else(String::new, |stats| {
-                let verifications = stats.verification_routes.iter().sum::<usize>();
-                let milliseconds_per_verification = if verifications == 0 {
-                    0.0
-                } else {
-                    decode_elapsed.as_secs_f64() * 1_000.0 / verifications as f64
-                };
-                let outputs_per_verification = if verifications == 0 {
-                    0.0
-                } else {
-                    stats.verified_outputs as f64 / verifications as f64
-                };
                 let percent = if stats.draft_proposals == 0 {
                     0.0
                 } else {
                     100.0 * stats.accepted_drafts as f64 / stats.draft_proposals as f64
                 };
-                format!(
-                    " · lane-V={verifications} {milliseconds_per_verification:.1} wall-ms/lane-v {outputs_per_verification:.2} tok/lane-v K={}/{}/{}/{} · MTP {}/{} ({percent:.1}%)",
-                    stats.verification_routes[0],
-                    stats.verification_routes[1],
-                    stats.verification_routes[2],
-                    stats.verification_routes[3],
-                    stats.accepted_drafts,
-                    stats.draft_proposals,
-                )
+                format!(" · MTP {percent:.1}%")
             });
             (
                 "DECODE",
                 format!(
-                    "B={} · elapsed {:.1} s · {ttft} · decode {:.1} s{rounds} · {} tok · {speed:.1} tok/s{prefill}{mtp}",
+                    "B{} · {} tok · {speed:.1} tok/s · {:.1}s · {ttft}{mtp}",
                     progress.active,
-                    progress.elapsed.as_secs_f64(),
-                    decode_elapsed.as_secs_f64(),
                     progress.output_tokens,
+                    decode_elapsed.as_secs_f64(),
                 ),
             )
         }
@@ -1709,6 +1711,24 @@ fn render_inference_progress(progress: InferenceProgress, color: bool) -> String
         ("", "")
     };
     format!("\r\x1b[2K{active_color}{label}{reset} {frame}       {detail}…")
+}
+
+fn compact_count(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn compact_rate(tokens_per_second: f64) -> String {
+    if tokens_per_second >= 1_000.0 {
+        format!("{:.1}K tok/s", tokens_per_second / 1_000.0)
+    } else {
+        format!("{tokens_per_second:.1} tok/s")
+    }
 }
 
 fn render_shutdown(interactive: bool, color: bool) -> String {
@@ -1829,14 +1849,16 @@ fn admit_group<G: TextGenerator>(
     display.prefill(batch, accepted);
     let prefill_started = Instant::now();
     let requests = waiting.iter().map(|job| &job.request).collect::<Vec<_>>();
-    let admissions = generator.admit_batch(&requests);
+    let progress = display.prefill_progress();
+    let admissions = generator.admit_batch_with_progress(&requests, &mut |completed, total| {
+        progress.observe(completed, total);
+    });
     let prefill_elapsed = prefill_started.elapsed();
     let prefill_tokens = admissions
         .iter()
         .filter_map(|admission| admission.as_ref().ok())
         .map(|admission| admission.native_prefill_tokens)
         .sum();
-    display.observe_prefill(prefill_tokens, prefill_elapsed);
     display.clear();
     debug_assert_eq!(admissions.len(), waiting.len());
     for (mut job, admission) in waiting.drain(..).zip(admissions) {
@@ -3002,32 +3024,33 @@ mod tests {
             InferenceProgress {
                 phase: InferencePhase::Prefill,
                 active: 2,
-                rounds: 0,
                 output_tokens: 0,
                 first_output_tokens: 0,
                 spinner_tick: 0,
-                phase_elapsed: Duration::from_millis(1_250),
-                elapsed: Duration::from_millis(1_250),
+                phase_elapsed: Duration::from_millis(6_200),
+                elapsed: Duration::from_millis(6_200),
                 ttft: None,
-                last_prefill: None,
+                prefill_progress: Some((32_768, 159_035)),
                 mtp_stats: None,
             },
             false,
         );
-        assert_eq!(prefill, "\r\x1b[2KPREFILL ⠋       2 requests · 1.2 s…");
+        assert_eq!(
+            prefill,
+            "\r\x1b[2KPREFILL ⠋       B2 32.8K/159.0K · left 126.3K · 5.3K tok/s · 6.2s…"
+        );
 
         let decode = render_inference_progress(
             InferenceProgress {
                 phase: InferencePhase::Decode,
                 active: 3,
-                rounds: 17,
                 output_tokens: 41,
                 first_output_tokens: 1,
                 spinner_tick: 1,
                 phase_elapsed: Duration::from_secs(2),
                 elapsed: Duration::from_secs(5),
                 ttft: Some(Duration::from_secs(1)),
-                last_prefill: Some((2_000, Duration::from_secs(2))),
+                prefill_progress: None,
                 mtp_stats: Some(ResidentMtpGenerationStats {
                     verification_routes: [0, 0, 0, 10],
                     draft_proposals: 30,
@@ -3038,11 +3061,8 @@ mod tests {
             true,
         );
         assert!(decode.starts_with("\r\x1b[2K\x1b[1;36mDECODE\x1b[0m ⠙"));
-        assert!(decode.contains("B=3 · elapsed 5.0 s · ttft 1.0 s · decode 4.0 s"));
-        assert!(decode.contains("41 tok · 10.0 tok/s"));
-        assert!(decode.ends_with(
-            "prefill 1000.0 tok/s · lane-V=10 400.0 wall-ms/lane-v 2.90 tok/lane-v K=0/0/0/10 · MTP 23/30 (76.7%)…"
-        ));
+        assert!(decode.ends_with("B3 · 41 tok · 10.0 tok/s · 4.0s · TTFT 1.0s · MTP 76.7%…"));
+        assert!(decode.chars().count() <= 90);
 
         let daemon = render_shutdown(false, false);
         assert_eq!(

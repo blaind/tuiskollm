@@ -482,6 +482,26 @@ pub(crate) fn prime_prompt(
     processed_prefix: usize,
     boundary_hidden: Option<&[u16]>,
 ) -> EngineResult<usize> {
+    prime_prompt_with_progress(
+        program,
+        stream,
+        token_ids,
+        slot,
+        processed_prefix,
+        boundary_hidden,
+        &mut |_| {},
+    )
+}
+
+pub(crate) fn prime_prompt_with_progress(
+    program: &mut ResidentMtpProgram,
+    stream: &CudaStream,
+    token_ids: &[u32],
+    slot: usize,
+    processed_prefix: usize,
+    boundary_hidden: Option<&[u16]>,
+    progress: &mut impl FnMut(usize),
+) -> EngineResult<usize> {
     if token_ids.is_empty() {
         return Err(EngineError::generation(
             "resident MTP generation requires a nonempty prompt",
@@ -542,6 +562,7 @@ pub(crate) fn prime_prompt(
         program.replay_prompt(stream, route)?;
         cursor += tokens;
         native += tokens;
+        progress(cursor);
     }
     while cursor < primed {
         replay_target_token(program, stream, token_ids[cursor], cursor)?;
@@ -559,6 +580,7 @@ pub(crate) fn prime_prompt(
         )?;
         program.replay_prompt(stream, route)?;
         cursor += 1;
+        progress(cursor);
     }
     replay_target_token(program, stream, token_ids[primed], primed)?;
     Ok(native)

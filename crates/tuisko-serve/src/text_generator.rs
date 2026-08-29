@@ -63,6 +63,18 @@ pub(crate) trait TextGenerator {
         requests.iter().map(|request| self.admit(request)).collect()
     }
 
+    /// Admits queued requests while publishing processed and total prefill tokens when supported.
+    fn admit_batch_with_progress<P>(
+        &mut self,
+        requests: &[&ChatGenerationRequest],
+        _progress: &mut P,
+    ) -> Vec<Result<ResidentBatchAdmission, EngineError>>
+    where
+        P: FnMut(usize, usize),
+    {
+        self.admit_batch(requests)
+    }
+
     /// Advances every active request by exactly one scheduler round.
     fn step(&mut self) -> Result<Self::Events, EngineError>;
 
@@ -116,6 +128,38 @@ impl TextGenerator for ResidentMtpBatchGenerator {
         request: &ChatGenerationRequest,
     ) -> Result<ResidentBatchAdmission, EngineError> {
         ResidentMtpBatchGenerator::admit(self, request)
+    }
+
+    fn admit_batch_with_progress<P>(
+        &mut self,
+        requests: &[&ChatGenerationRequest],
+        progress: &mut P,
+    ) -> Vec<Result<ResidentBatchAdmission, EngineError>>
+    where
+        P: FnMut(usize, usize),
+    {
+        let mut completed_before = 0usize;
+        let mut total_before = 0usize;
+        requests
+            .iter()
+            .map(|request| {
+                let mut current_total = 0usize;
+                let admission = ResidentMtpBatchGenerator::admit_with_progress(
+                    self,
+                    request,
+                    |completed, total| {
+                        current_total = total;
+                        progress(
+                            completed_before.saturating_add(completed),
+                            total_before.saturating_add(total),
+                        );
+                    },
+                );
+                completed_before = completed_before.saturating_add(current_total);
+                total_before = total_before.saturating_add(current_total);
+                admission
+            })
+            .collect()
     }
 
     fn step(&mut self) -> Result<Self::Events, EngineError> {
