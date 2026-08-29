@@ -678,12 +678,11 @@ async fn serve_until_worker_failure(
     interactive: bool,
     color: bool,
 ) -> Result<(), ServerError> {
-    serve_until_worker_failure_or_shutdown(
-        listener,
-        router,
-        worker_failure,
-        shutdown_signal(interactive, color),
-    )
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(shutdown_signals(interactive, color, shutdown_tx));
+    serve_until_worker_failure_or_shutdown(listener, router, worker_failure, async move {
+        let _ = shutdown_rx.await;
+    })
     .await
 }
 
@@ -703,12 +702,23 @@ async fn serve_until_worker_failure_or_shutdown(
     }
 }
 
-async fn shutdown_signal(interactive: bool, color: bool) {
+async fn shutdown_signals(interactive: bool, color: bool, shutdown: oneshot::Sender<()>) {
     if tokio::signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await;
     }
+    write_shutdown_line(render_shutdown(interactive, color));
+    let _ = shutdown.send(());
+
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    write_shutdown_line(render_forced_shutdown(interactive, color));
+    std::process::exit(130);
+}
+
+fn write_shutdown_line(line: String) {
     let mut stdout = std::io::stdout().lock();
-    let _ = stdout.write_all(render_shutdown(interactive, color).as_bytes());
+    let _ = stdout.write_all(line.as_bytes());
     let _ = stdout.flush();
 }
 
@@ -1721,6 +1731,18 @@ fn render_shutdown(interactive: bool, color: bool) -> String {
     format!("{clear}{stopping}STOPPING{reset}       interrupt received · draining connections…\n")
 }
 
+fn render_forced_shutdown(interactive: bool, color: bool) -> String {
+    let (stopping, reset) = if color {
+        ("\x1b[1;31m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    let clear = if interactive { "\r\x1b[2K" } else { "" };
+    format!(
+        "{clear}{stopping}STOPPING{reset}       second interrupt received · exiting immediately…\n"
+    )
+}
+
 fn clear_progress_line(output: &mut impl IoWrite, interactive: bool) -> std::io::Result<()> {
     if interactive {
         output.write_all(b"\r\x1b[2K")?;
@@ -2527,10 +2549,10 @@ mod tests {
         AppState, ChatJob, EnqueueError, InferencePhase, InferenceProgress, Job, LifecycleState,
         QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerConfig, ServerError, ServerModel,
         chat_completions, completion_id, enqueue_chat_job, fail_queued, health, load, models,
-        readiness, record_admission, render_inference_progress, render_load_progress,
-        render_loading, render_shutdown, render_startup, render_weight_progress, router, run,
-        serve_reloadable, serve_until_worker_failure, serve_until_worker_failure_or_shutdown,
-        try_send_generation_steps, unload,
+        readiness, record_admission, render_forced_shutdown, render_inference_progress,
+        render_load_progress, render_loading, render_shutdown, render_startup,
+        render_weight_progress, router, run, serve_reloadable, serve_until_worker_failure,
+        serve_until_worker_failure_or_shutdown, try_send_generation_steps, unload,
     };
     use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
@@ -3052,6 +3074,15 @@ mod tests {
         let terminal = render_shutdown(true, true);
         assert!(terminal.starts_with("\r\x1b[2K\x1b[1;33mSTOPPING\x1b[0m"));
         assert!(terminal.ends_with("draining connections…\n"));
+
+        let forced_daemon = render_forced_shutdown(false, false);
+        assert_eq!(
+            forced_daemon,
+            "STOPPING       second interrupt received · exiting immediately…\n"
+        );
+        let forced_terminal = render_forced_shutdown(true, true);
+        assert!(forced_terminal.starts_with("\r\x1b[2K\x1b[1;31mSTOPPING\x1b[0m"));
+        assert!(forced_terminal.ends_with("exiting immediately…\n"));
     }
 
     #[test]
