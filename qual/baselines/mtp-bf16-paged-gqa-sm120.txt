@@ -5,3 +5,7 @@ cuda_toolkit_release=13.3
 cuda_toolkit_version=13.3.73
 attention_registers=56,56,56,56,56,56,56,56
 shared_bytes=9280
+split_partial_registers=54,54,54,54,54,54,54,54
+split_reduce_registers=56,56,56,56,56,56,56,56
+split_partial_shared_bytes=1024
+split_reduce_shared_bytes=1024
