@@ -2185,57 +2185,40 @@ pub(crate) unsafe fn long_context_paged_gqa_partial<A: Arch, const TOKENS: usize
 }
 
 #[inline(always)]
-unsafe fn scan_long_context_mtp_tile(
+fn update_long_context_mtp_row(
     query: &[f32; VALUES_PER_LANE],
-    shared: *const u8,
-    dimension: usize,
-    tile_position: usize,
-    tile_end: usize,
-    key_scale: f32,
-    value_scale: f32,
+    key: &[f32; VALUES_PER_LANE],
+    value: &[f32; VALUES_PER_LANE],
     maximum: &mut f32,
     denominator: &mut f32,
     accumulator: &mut [f32; VALUES_PER_LANE],
 ) {
-    let mut position = tile_position;
-    while position < tile_end {
-        let tile_element = (position - tile_position) * 256 + dimension;
-        let key = unsafe { load_e4m3x8(shared.add(tile_element), key_scale) };
-        let value = unsafe {
-            load_e4m3x8(
-                shared.add(LONG_CONTEXT_MTP_TILE * 256 + tile_element),
-                value_scale,
-            )
-        };
-        let mut score = 0.0f32;
-        let mut element = 0usize;
+    let mut score = 0.0f32;
+    let mut element = 0usize;
+    while element < VALUES_PER_LANE {
+        score = float::fma_rn_f32(query[element], key[element], score);
+        element += 1;
+    }
+    score = warp::reduce_sum_f32(score) * 0.0625;
+
+    if score > *maximum {
+        let old_scale = fast_exp(*maximum - score);
+        *denominator = *denominator * old_scale + 1.0;
+        *maximum = score;
+        element = 0;
         while element < VALUES_PER_LANE {
-            score = float::fma_rn_f32(query[element], key[element], score);
+            accumulator[element] =
+                float::fma_rn_f32(1.0, value[element], accumulator[element] * old_scale);
             element += 1;
         }
-        score = warp::reduce_sum_f32(score) * 0.0625;
-
-        if score > *maximum {
-            let old_scale = fast_exp(*maximum - score);
-            *denominator = *denominator * old_scale + 1.0;
-            *maximum = score;
-            element = 0;
-            while element < VALUES_PER_LANE {
-                accumulator[element] =
-                    float::fma_rn_f32(1.0, value[element], accumulator[element] * old_scale);
-                element += 1;
-            }
-        } else {
-            let weight = fast_exp(score - *maximum);
-            *denominator += weight;
-            element = 0;
-            while element < VALUES_PER_LANE {
-                accumulator[element] =
-                    float::fma_rn_f32(weight, value[element], accumulator[element]);
-                element += 1;
-            }
+    } else {
+        let weight = fast_exp(score - *maximum);
+        *denominator += weight;
+        element = 0;
+        while element < VALUES_PER_LANE {
+            accumulator[element] = float::fma_rn_f32(weight, value[element], accumulator[element]);
+            element += 1;
         }
-        position += 1;
     }
 }
 
@@ -2420,54 +2403,50 @@ pub(crate) unsafe fn long_context_mtp_paged_gqa_partial<A: Arch, const TOKENS: u
         }
         thread::sync_threads();
 
-        let tile_limit = tile_position + LONG_CONTEXT_MTP_TILE;
-        if tile_position < length0 {
-            unsafe {
-                scan_long_context_mtp_tile(
-                    &query0,
-                    shared,
-                    dimension,
-                    tile_position,
-                    core::cmp::min(tile_limit, length0),
-                    key_scale,
+        let tile_end = core::cmp::min(tile_position + LONG_CONTEXT_MTP_TILE, partition_end);
+        let mut position = tile_position;
+        // Decode represented K/V once per warp while each independent row keeps position order.
+        while position < tile_end {
+            let tile_element = (position - tile_position) * A::HEAD_DIM + dimension;
+            let key = unsafe { load_e4m3x8(shared.add(tile_element), key_scale) };
+            let value = unsafe {
+                load_e4m3x8(
+                    shared.add(LONG_CONTEXT_MTP_TILE * A::HEAD_DIM + tile_element),
                     value_scale,
+                )
+            };
+
+            if position < length0 {
+                update_long_context_mtp_row(
+                    &query0,
+                    &key,
+                    &value,
                     &mut maximum0,
                     &mut denominator0,
                     &mut accumulator0,
                 );
             }
-        }
-        if row1 < row_count && tile_position < length1 {
-            unsafe {
-                scan_long_context_mtp_tile(
+            if row1 < row_count && position < length1 {
+                update_long_context_mtp_row(
                     &query1,
-                    shared,
-                    dimension,
-                    tile_position,
-                    core::cmp::min(tile_limit, length1),
-                    key_scale,
-                    value_scale,
+                    &key,
+                    &value,
                     &mut maximum1,
                     &mut denominator1,
                     &mut accumulator1,
                 );
             }
-        }
-        if row2 < row_count && tile_position < length2 {
-            unsafe {
-                scan_long_context_mtp_tile(
+            if row2 < row_count && position < length2 {
+                update_long_context_mtp_row(
                     &query2,
-                    shared,
-                    dimension,
-                    tile_position,
-                    core::cmp::min(tile_limit, length2),
-                    key_scale,
-                    value_scale,
+                    &key,
+                    &value,
                     &mut maximum2,
                     &mut denominator2,
                     &mut accumulator2,
                 );
             }
+            position += 1;
         }
         thread::sync_threads();
         tile_position += LONG_CONTEXT_MTP_TILE;
