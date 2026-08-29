@@ -73,12 +73,52 @@ No checkpoint tensor is converted and no new device kernel or generated symbol i
 The scoring path adds LM-head launches and device-to-host logit traffic only while evaluation is
 explicitly requested; it does not alter chat TTFT or decode.
 
+For an equal-length prompt batch, the resident scorer may replay the longest exact shared route
+prefix once, capture its recurrent state, and restore that state for each suffix. Reuse requires
+the complete prompt reservations and route segments to be identical, and stops before the final
+completion replay. Unequal lengths and batches whose shared route would include the T=1024 macro
+tile use independent scoring. This keeps the optimization on the qualified MMLU-sized route while
+the separate ignored `resident_mtp_batch_t1024_macro_scoring_repeatability_acceptance` documents
+the ordinary macro-scoring repeatability condition that remains open.
+
 ## Qualification before merge
 
-The source-backed device gate must cover prompt lengths around every route seam: 1, 2, 31, 32,
-33, 63, 64, 65, 127, 128, 129, 1023, 1024, and 1025 tokens, plus one long-attention context.
-For every scored row, compare the selected logprob, greedy token, and greedy logprob with an
-independent host softmax over the production BF16 logits. Time the complete scoring owner for
-representative short multiple-choice prompts and 1K/8K prompts; report prompts/s, scored tokens/s,
-LM-head launches, and downloaded bytes. These are scoring baselines and must remain separate from
-chat prefill and decode baselines.
+The base scoring gate covers prompt lengths around every route seam: 1, 2, 31, 32, 33, 63, 64,
+65, 127, 128, 129, 1023, 1024, and 1025 tokens, plus one long-attention context. For every scored
+row, compare the selected logprob, greedy token, and greedy logprob with an independent host
+softmax over the production BF16 logits.
+
+Shared-prefix qualification separately compares the optimized batch with complete independent
+scoring at the admitted seams through a 1023-token common prefix. It includes equal-length
+multi-token suffixes and requires exact equality at every observable response field. The suite
+filter also selects its benchmark-accounting sibling:
+
+```bash
+cargo run -p xtask -- qualify-generation-mtp-batch "$SNAPSHOT"
+cargo run -p xtask -- bench-prompt-scoring "$SNAPSHOT"
+```
+
+The benchmark directly times one production four-choice `score_prompts` call and the complete
+sequence of four production `score_prompt` calls. Do not infer either boundary by adding leaf
+medians, and keep scoring reports separate from chat prefill and decode baselines.
+
+## Shared-prefix timing evidence
+
+The 2026-08-29 RTX 5090 diagnostic used three samples, one warmup, and one operation per sample.
+For four 61-token prompts with a 60-token common prefix, loaded clocks stayed at 2197 MHz and the
+complete host-synchronized medians were:
+
+| Boundary | Median | Relative to independent |
+| --- | ---: | ---: |
+| One shared-prefix batch | 631.902 ms | 3.56x faster |
+| Four independent prompts | 2252.483 ms | reference |
+
+The run had zero timed device-memory growth and is stored under
+`target/benchmarks/prompt-scoring-shared-prefix-samples-3.json`; it is diagnostic evidence, not a
+blessed baseline.
+
+A finalized-server MMLU abstract-algebra zero-shot `--limit 10 --batch_size 4` smoke completed in
+9.65 seconds wall time, versus 25.78 seconds before prefix reuse. API request progress took about
+5.1 seconds, down from about 17 seconds. The aggregate accuracy remained 7/10, and all ten logged
+sample prompts, loglikelihood responses, targets, and correctness fields matched the earlier run
+exactly. Limited runs are timing and integration checks, not publishable quality estimates.

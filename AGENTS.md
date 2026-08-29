@@ -75,6 +75,9 @@ production path, including frontend files when tokenizer or template ownership i
 For a reused workspace, inactive-tail checks begin after the widest surviving writer, not
 necessarily the final writer. If an owner's output aliases its next input, a repeated benchmark
 must restore the production input before every measured replay.
+Any shared replay must reproduce the full pre-launch ownership state of every independent replay.
+Matching route widths or rounded allocation counts is not sufficient when exact token reservations
+differ.
 The runner must refuse a busy device or incomparable clocks; it never changes clock or power state.
 After owner warmup, validate clocks under sustained production-graph load before starting a long
 timing matrix. A failed loaded-clock probe ends the run early. If clocks drift only after that
