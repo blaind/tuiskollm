@@ -206,6 +206,22 @@ A finalized-server MMLU abstract-algebra zero-shot `--limit 10 --batch_size 4` s
 sample prompts, loglikelihood responses, targets, and correctness fields matched the earlier run
 exactly. Limited runs are timing and integration checks, not publishable quality estimates.
 
+### Shared-row normalizer reuse
+
+The shared boundary produces one represented-BF16 logit row for every answer alternative. Its
+sequential token-order FP64 normalizer and argmax are now computed once, then reused to derive each
+selected-token score. An adversarial full-vocabulary host test preserves exact f32 response bits,
+including the `0.0` result for one `0.0` logit followed by 248,319 represented `-37.0` logits. The
+source-backed shared-versus-independent device gate also remained bitwise exact at every admitted
+route seam; its focused device phase completed in 37.12 seconds.
+
+On the same three-sample four-choice diagnostic shape, shared-prefix scoring moved from 631.902 ms
+to 629.809 ms, a 2.093 ms or 0.33% reduction. The independent reference was 2254.145 ms and is not
+changed by this optimization. Loaded clocks were 2190..2197 MHz with memory at 13801 MHz, and timed
+device-memory growth remained zero. The report is
+`target/benchmarks/prompt-scoring-shared-normalizer-samples-3.json`; three samples remain diagnostic
+and are not baseline authority.
+
 ## Rejected device-side normalizer
 
 A second 2026-08-29 hypothesis proposed replacing full-vocabulary downloads and the host FP64

@@ -605,11 +605,12 @@ impl ResidentMtpBatchGenerator {
             prompt[target_position] =
                 Some(score_logit_row(logits, common_prompt[target_position])?);
         } else if target_position == common_prompt.len() {
+            let normalized = NormalizedLogitRow::new(logits)?;
             for (score, branch) in boundary_scores.iter_mut().zip(prompts) {
                 *score = Some(if branch.len() == target_position {
-                    score_greedy_row(logits)?
+                    normalized.score_greedy()
                 } else {
-                    score_logit_row(logits, branch[target_position])?
+                    normalized.score_token(logits, branch[target_position])?
                 });
             }
         }
@@ -2562,32 +2563,54 @@ fn finish_prompt_logprobs(
 }
 
 fn score_logit_row(logits: &[u16], token_id: u32) -> EngineResult<PromptTokenLogprob> {
-    let token = usize::try_from(token_id)
-        .ok()
-        .filter(|&token| token < logits.len())
-        .ok_or_else(|| EngineError::sampling("scored token is outside its logit row"))?;
-    let (top_token, top_logit, log_normalizer) = logit_row_normalizer(logits)?;
-    let selected = f64::from(bf16_to_f32(logits[token]));
-    Ok(PromptTokenLogprob {
-        token_id,
-        logprob: (selected - log_normalizer) as f32,
-        top_token_id: u32::try_from(top_token)
-            .map_err(|_| EngineError::sampling("greedy token exceeds u32"))?,
-        top_logprob: (top_logit - log_normalizer) as f32,
-    })
+    NormalizedLogitRow::new(logits)?.score_token(logits, token_id)
 }
 
 fn score_greedy_row(logits: &[u16]) -> EngineResult<PromptTokenLogprob> {
-    let (top_token, top_logit, log_normalizer) = logit_row_normalizer(logits)?;
-    let token_id =
-        u32::try_from(top_token).map_err(|_| EngineError::sampling("greedy token exceeds u32"))?;
-    let logprob = (top_logit - log_normalizer) as f32;
-    Ok(PromptTokenLogprob {
-        token_id,
-        logprob,
-        top_token_id: token_id,
-        top_logprob: logprob,
-    })
+    Ok(NormalizedLogitRow::new(logits)?.score_greedy())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NormalizedLogitRow {
+    top_token_id: u32,
+    top_logit: f64,
+    log_normalizer: f64,
+}
+
+impl NormalizedLogitRow {
+    fn new(logits: &[u16]) -> EngineResult<Self> {
+        let (top_token, top_logit, log_normalizer) = logit_row_normalizer(logits)?;
+        Ok(Self {
+            top_token_id: u32::try_from(top_token)
+                .map_err(|_| EngineError::sampling("greedy token exceeds u32"))?,
+            top_logit,
+            log_normalizer,
+        })
+    }
+
+    fn score_token(self, logits: &[u16], token_id: u32) -> EngineResult<PromptTokenLogprob> {
+        let token = usize::try_from(token_id)
+            .ok()
+            .filter(|&token| token < logits.len())
+            .ok_or_else(|| EngineError::sampling("scored token is outside its logit row"))?;
+        let selected = f64::from(bf16_to_f32(logits[token]));
+        Ok(PromptTokenLogprob {
+            token_id,
+            logprob: (selected - self.log_normalizer) as f32,
+            top_token_id: self.top_token_id,
+            top_logprob: (self.top_logit - self.log_normalizer) as f32,
+        })
+    }
+
+    fn score_greedy(self) -> PromptTokenLogprob {
+        let logprob = (self.top_logit - self.log_normalizer) as f32;
+        PromptTokenLogprob {
+            token_id: self.top_token_id,
+            logprob,
+            top_token_id: self.top_token_id,
+            top_logprob: logprob,
+        }
+    }
 }
 
 fn logit_row_normalizer(logits: &[u16]) -> EngineResult<(usize, f64, f64)> {
@@ -2657,10 +2680,11 @@ fn compact_hidden_row(row_index: usize) -> std::ops::Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTENTION_PAGE_SIZE, DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, RetainedMtpSlot, RetainedReuse,
-        TARGET_LOGIT_ROWS, best_retained_prefix, longest_common_token_prefix,
-        plan_prompt_scoring_batch, prompt_scoring_routes, score_greedy_row, score_logit_row,
-        target_download_logits, target_download_row, validate_prompt_scoring_batch,
+        ATTENTION_PAGE_SIZE, DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, NormalizedLogitRow,
+        RetainedMtpSlot, RetainedReuse, TARGET_LOGIT_ROWS, best_retained_prefix,
+        longest_common_token_prefix, plan_prompt_scoring_batch, prompt_scoring_routes,
+        score_greedy_row, score_logit_row, target_download_logits, target_download_row,
+        validate_prompt_scoring_batch,
     };
     use crate::MAX_BATCH;
     use crate::common::banks::row;
@@ -2685,6 +2709,25 @@ mod tests {
         assert!((f64::from(selected.logprob) + normalizer).abs() < 1.0e-6);
         assert_eq!(greedy.token_id, 1);
         assert!((f64::from(greedy.logprob) - (1.0 - normalizer)).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn reused_logit_normalizer_is_bitwise_identical_to_independent_scoring() {
+        let mut logits = vec![((-37.0f32).to_bits() >> 16) as u16; Qwen38_27B::VOCAB];
+        logits[0] = (0.0f32.to_bits() >> 16) as u16;
+        let tokens = [0, 17, 23, u32::try_from(Qwen38_27B::VOCAB - 1).unwrap()];
+        let independent = tokens.map(|token| score_logit_row(&logits, token).unwrap());
+        let normalized = NormalizedLogitRow::new(&logits).unwrap();
+        let reused = tokens.map(|token| normalized.score_token(&logits, token).unwrap());
+
+        assert_eq!(reused, independent);
+        assert_eq!(
+            normalized.score_greedy(),
+            score_greedy_row(&logits).unwrap()
+        );
+        assert_eq!(reused[0].top_token_id, 0);
+        assert_eq!(reused[0].logprob.to_bits(), 0.0f32.to_bits());
+        assert_eq!(reused[1].logprob.to_bits(), (-37.0f32).to_bits());
     }
 
     #[test]
