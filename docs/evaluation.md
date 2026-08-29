@@ -85,7 +85,8 @@ jobs would contend for the one scoring scratch slot. Full MMLU and HellaSwag run
 thousands of alternative prompts and can take hours. A limited result proves plumbing only; its
 accuracy is not evaluation authority. On an exclusive GPU, establish a measured examples/second
 rate with `--limit 10`, then `--limit 100`, before scheduling a full suite. On a shared GPU, keep
-the cases sequential and bounded, then stop the server promptly to release resident memory.
+the cases sequential and bounded. Stop the server promptly when the evaluation runner owns its
+lifecycle; leave a reused server untouched unless its owner asks otherwise.
 
 ### MMLU planning estimate
 
@@ -121,6 +122,51 @@ The five-shot API phase increased from about 17 to 31 seconds while its residual
 slightly decreased. The incremental cost is therefore tiled prefill plus the LM-head,
 device-to-host, and host-softmax scoring path. An exact percentage attribution still requires a
 directly instrumented scoring-owner benchmark; do not infer it from these request-level timings.
+
+### Short quality runs
+
+For a shared GPU, prefer one complete MMLU subject over a limited slice of the 57-subject group.
+Ten subjects have exactly 100 test questions, including `mmlu_abstract_algebra`,
+`mmlu_college_computer_science`, `mmlu_computer_security`, `mmlu_medical_genetics`, and
+`mmlu_global_facts`. The measured abstract-algebra pilot projects to about three minutes zero-shot
+or five to six minutes five-shot for its complete subject. Other subjects vary with prompt length.
+
+Run subjects separately and pin the shot count, for example:
+
+```bash
+target/lm-eval-venv/bin/lm_eval run \
+  --model local-completions \
+  --model_args model=unsloth/Qwen3.8-27B-NVFP4,base_url=http://127.0.0.1:8000/v1/completions,tokenizer=unsloth/Qwen3.8-27B-NVFP4,revision=16b6615af3548b88e2d8e382457bc705b00479cf,tokenizer_backend=huggingface,tokenized_requests=true,max_length=220000,num_concurrent=1 \
+  --tasks mmlu_abstract_algebra \
+  --num_fewshot 0 \
+  --batch_size 4 \
+  --log_samples \
+  --output_path target/lm-eval/mmlu-abstract-algebra-zero-shot
+```
+
+A complete single-subject result measures that domain but is not an aggregate MMLU score. Keep
+subjects, shot counts, and output paths separate rather than presenting a hand-selected subset as
+the official 57-subject metric.
+
+#### Measured complete-subject diagnostics
+
+On 2026-08-29, three complete 100-question subjects ran zero-shot against the pinned checkpoint on
+the exact RTX 5090 target. Each subject used `batch_size=4` and `num_concurrent=1`, so the server
+scored 400 answer choices sequentially per run:
+
+| Subject | Correct | Accuracy | Standard error | Wall time |
+| --- | ---: | ---: | ---: | ---: |
+| college computer science | 81/100 | 0.81 | 0.0394 | 194.22 s |
+| abstract algebra | 72/100 | 0.72 | 0.0451 | 158.66 s |
+| medical genetics | 92/100 | 0.92 | 0.0273 | 167.23 s |
+
+The hand-selected three-subject micro-average is 245/300, or 81.7%, and is diagnostic only. It is
+not the official MMLU aggregate because it omits 54 subjects and does not preserve the suite's
+subject weighting. The medical-genetics wall time includes one retry after a transient
+`model lifecycle is unloading` response; all 400 choices ultimately completed and the harness
+wrote the aggregate and per-sample results under `target/lm-eval/`. The reused server became
+unreachable after that run without the evaluation runner stopping or signaling it, so investigate
+the server lifecycle separately before relying on unattended multi-subject runs.
 
 Generation-only tasks continue to use `local-chat-completions` and
 `http://127.0.0.1:8000/v1/chat/completions`.
