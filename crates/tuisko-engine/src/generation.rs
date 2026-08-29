@@ -28,6 +28,34 @@ pub struct ChatGenerationRequest {
     pub tool_constraint: Option<Arc<ToolCallConstraintSpec>>,
 }
 
+/// Exact log-probability for one teacher-forced token and the row's greedy token.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptTokenLogprob {
+    /// Teacher-forced or generated token represented by this row.
+    pub token_id: u32,
+    /// Natural-log probability of `token_id` under the represented BF16 logits.
+    pub logprob: f32,
+    /// Greedy token selected from the same represented BF16 logit row.
+    pub top_token_id: u32,
+    /// Natural-log probability of `top_token_id`.
+    pub top_logprob: f32,
+}
+
+/// OpenAI echo-logprob data for one token-ID prompt and one greedy completion token.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptLogprobs {
+    /// Prompt token IDs exactly as admitted by the scoring route.
+    pub prompt_token_ids: Vec<u32>,
+    /// Prompt-aligned scores; the first token has no causal predecessor and is `None`.
+    pub prompt: Vec<Option<PromptTokenLogprob>>,
+    /// Greedy token predicted after the complete prompt.
+    pub completion: PromptTokenLogprob,
+    /// Prompt plus completion decoded without skipping special tokens.
+    pub echoed_text: String,
+    /// Per-token decoded spellings for the prompt plus completion.
+    pub token_text: Vec<String>,
+}
+
 impl ChatGenerationRequest {
     /// Creates a request with the admitted checkpoint defaults.
     pub fn new(messages: Vec<ChatMessage>) -> Self {

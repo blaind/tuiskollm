@@ -10,12 +10,13 @@
 //! target inside `tuisko-engine`.
 
 use tuisko_engine::{
-    ChatGenerationRequest, EngineError, GeneratedText, GenerationStep, MAX_BATCH,
-    Qwen35ResidentMtpBatchEvent, Qwen35ResidentMtpBatchEvents, Qwen35ResidentMtpBatchGenerator,
-    Qwen36ResidentBatchGenerator, Qwen38FlashNextMtpResidentGenerator,
-    Qwen38FlashNextResidentBatchGenerator, ResidentBatchAdmission, ResidentBatchEvent,
-    ResidentBatchEvents, ResidentCancellation, ResidentMtpBatchEvent, ResidentMtpBatchEvents,
-    ResidentMtpBatchGenerator, ResidentMtpGenerationStats, ResidentRequestId,
+    ChatGenerationRequest, EngineError, EngineErrorCode, GeneratedText, GenerationStep, MAX_BATCH,
+    PromptLogprobs, Qwen35ResidentMtpBatchEvent, Qwen35ResidentMtpBatchEvents,
+    Qwen35ResidentMtpBatchGenerator, Qwen36ResidentBatchGenerator,
+    Qwen38FlashNextMtpResidentGenerator, Qwen38FlashNextResidentBatchGenerator,
+    ResidentBatchAdmission, ResidentBatchEvent, ResidentBatchEvents, ResidentCancellation,
+    ResidentMtpBatchEvent, ResidentMtpBatchEvents, ResidentMtpBatchGenerator,
+    ResidentMtpGenerationStats, ResidentRequestId,
 };
 
 /// One request's committed steps and terminal output from a scheduler round.
@@ -92,6 +93,14 @@ pub(crate) trait TextGenerator {
 
     /// Concurrent requests this target schedules on the device.
     fn slot_capacity(&self) -> usize;
+
+    /// Scores token-ID prompts while the scheduler is idle when this exact target admits it.
+    fn score_prompts(&mut self, _prompts: &[Vec<u32>]) -> Result<Vec<PromptLogprobs>, EngineError> {
+        Err(EngineError::Contract {
+            code: EngineErrorCode::Generation,
+            message: "prompt scoring is unsupported for this exact target".into(),
+        })
+    }
 }
 
 impl GenerationEvent for ResidentMtpBatchEvent {
@@ -185,6 +194,13 @@ impl TextGenerator for ResidentMtpBatchGenerator {
 
     fn slot_capacity(&self) -> usize {
         MAX_BATCH
+    }
+
+    fn score_prompts(&mut self, prompts: &[Vec<u32>]) -> Result<Vec<PromptLogprobs>, EngineError> {
+        prompts
+            .iter()
+            .map(|prompt| ResidentMtpBatchGenerator::score_prompt(self, prompt))
+            .collect()
     }
 }
 

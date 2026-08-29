@@ -58,6 +58,31 @@ pub struct ChatCompletionRequest {
     chat_template_kwargs: ChatTemplateKwargs,
 }
 
+/// Token-ID-only OpenAI completions request admitted for lm-eval prompt scoring.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionRequest {
+    model: String,
+    prompt: CompletionPrompt,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    logprobs: Option<usize>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    echo: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CompletionPrompt {
+    TokenIds(Vec<u32>),
+    TokenIdBatch(Vec<Vec<u32>>),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FunctionTool {
@@ -113,6 +138,13 @@ pub struct PreparedChatRequest {
     pub tool_constraint: Option<Arc<ToolCallConstraintSpec>>,
     /// Whether SSE output ends with the OpenAI usage-only chunk.
     pub include_usage: bool,
+}
+
+/// Exact token-ID prompts admitted by the evaluation scoring route.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PreparedCompletionRequest {
+    /// One to eight nonempty token-ID prompts in response-choice order.
+    pub prompts: Vec<Vec<u32>>,
 }
 
 /// Rejection at the OpenAI transport boundary.
@@ -276,6 +308,59 @@ impl ChatCompletionRequest {
                 .stream_options
                 .is_some_and(|options| options.include_usage),
         })
+    }
+}
+
+impl CompletionRequest {
+    /// Admits only the echo-plus-one-greedy-token contract used by lm-eval loglikelihood.
+    pub fn prepare_for(
+        self,
+        served_model: &str,
+    ) -> Result<PreparedCompletionRequest, ChatRequestError> {
+        if self.model != served_model {
+            return Err(ChatRequestError::ModelNotFound {
+                requested: self.model,
+            });
+        }
+        if self
+            .temperature
+            .is_some_and(|temperature| temperature != 0.0)
+        {
+            return Err(ChatRequestError::Invalid(
+                "prompt scoring requires temperature=0".into(),
+            ));
+        }
+        if self.max_tokens != Some(1) {
+            return Err(ChatRequestError::Invalid(
+                "prompt scoring requires max_tokens=1".into(),
+            ));
+        }
+        if self.logprobs != Some(1) {
+            return Err(ChatRequestError::Invalid(
+                "prompt scoring requires logprobs=1".into(),
+            ));
+        }
+        if !self.echo {
+            return Err(ChatRequestError::Invalid(
+                "prompt scoring requires echo=true".into(),
+            ));
+        }
+        let _ = self.seed;
+        let prompts = match self.prompt {
+            CompletionPrompt::TokenIds(prompt) => vec![prompt],
+            CompletionPrompt::TokenIdBatch(prompts) => prompts,
+        };
+        if prompts.is_empty() || prompts.len() > 8 {
+            return Err(ChatRequestError::Invalid(
+                "prompt scoring requires 1..=8 prompts".into(),
+            ));
+        }
+        if let Some(index) = prompts.iter().position(Vec::is_empty) {
+            return Err(ChatRequestError::Invalid(format!(
+                "prompt scoring prompt {index} is empty"
+            )));
+        }
+        Ok(PreparedCompletionRequest { prompts })
     }
 }
 
@@ -540,12 +625,74 @@ fn require_no_special_tokens(what: &str, text: &str) -> Result<(), ChatRequestEr
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionRequest, ChatRequestError, SERVED_MODEL, SamplingPenalties};
+    use super::{
+        ChatCompletionRequest, ChatRequestError, CompletionRequest, SERVED_MODEL, SamplingPenalties,
+    };
     use tuisko_frontend::GenerationDefaults;
     use tuisko_model::{Arch, Qwen35_9B};
 
     fn request(body: &str) -> ChatCompletionRequest {
         serde_json::from_str(body).unwrap()
+    }
+
+    fn completion(body: &str) -> CompletionRequest {
+        serde_json::from_str(body).unwrap()
+    }
+
+    #[test]
+    fn admits_the_exact_lm_eval_echo_logprob_contract() {
+        let single = completion(&format!(
+            r#"{{"model":"{SERVED_MODEL}","prompt":[1,2,3],"temperature":0,"max_tokens":1,"logprobs":1,"seed":1234,"echo":true}}"#
+        ))
+        .prepare_for(SERVED_MODEL)
+        .unwrap();
+        assert_eq!(single.prompts, vec![vec![1, 2, 3]]);
+
+        let batch = completion(&format!(
+            r#"{{"model":"{SERVED_MODEL}","prompt":[[1,2],[3,4,5]],"temperature":0,"max_tokens":1,"logprobs":1,"echo":true}}"#
+        ))
+        .prepare_for(SERVED_MODEL)
+        .unwrap();
+        assert_eq!(batch.prompts, vec![vec![1, 2], vec![3, 4, 5]]);
+    }
+
+    #[test]
+    fn rejects_completion_modes_that_are_not_prompt_scoring() {
+        let cases = [
+            (
+                r#""prompt":[1],"temperature":1,"max_tokens":1,"logprobs":1,"echo":true"#,
+                "temperature=0",
+            ),
+            (
+                r#""prompt":[1],"temperature":0,"max_tokens":2,"logprobs":1,"echo":true"#,
+                "max_tokens=1",
+            ),
+            (
+                r#""prompt":[1],"temperature":0,"max_tokens":1,"logprobs":2,"echo":true"#,
+                "logprobs=1",
+            ),
+            (
+                r#""prompt":[1],"temperature":0,"max_tokens":1,"logprobs":1,"echo":false"#,
+                "echo=true",
+            ),
+            (
+                r#""prompt":[],"temperature":0,"max_tokens":1,"logprobs":1,"echo":true"#,
+                "prompt 0 is empty",
+            ),
+        ];
+        for (fields, expected) in cases {
+            let error = completion(&format!(r#"{{"model":"{SERVED_MODEL}",{fields}}}"#))
+                .prepare_for(SERVED_MODEL)
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        let error = completion(&format!(
+            r#"{{"model":"other/model","prompt":[1],"temperature":0,"max_tokens":1,"logprobs":1,"echo":true}}"#
+        ))
+        .prepare_for(SERVED_MODEL)
+        .unwrap_err();
+        assert!(matches!(error, ChatRequestError::ModelNotFound { .. }));
     }
 
     #[test]

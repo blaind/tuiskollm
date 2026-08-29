@@ -1,20 +1,22 @@
 //! Compact greedy and sampled MTP generation over the resident target-plus-draft owner.
 
 use crate::common::banks::{compact, row};
-use crate::common::math::product;
+use crate::common::math::{bf16_to_f32, product};
 use crate::common::mtp::{
-    DRAFT_WINDOW, MtpEventBuilder, VERIFY_ROWS, decide_greedy_lane, decide_sampled_lane,
-    require_generation_capacity,
+    DRAFT_WINDOW, MAX_NATIVE_PREFILL_TOKENS, MtpEventBuilder, VERIFY_ROWS, decide_greedy_lane,
+    decide_sampled_lane, next_native_prefill_tile, require_generation_capacity,
 };
 use crate::common::rope::{ROTARY_PAIRS, fill_contiguous_rope, text_rope};
 use crate::common::slots::device_zero_context;
-use crate::qwen38::resident_mtp_generation::prime_prompt_with_progress;
+use crate::qwen38::resident_mtp_generation::{
+    prime_prompt_with_progress, replay_prefill_tile, replay_target_token,
+};
 use crate::{
     ChatGenerationRequest, EngineError, EngineResult, GeneratedText, GenerationSession,
-    GenerationStep, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, ResidentBatchAdmission,
-    ResidentCancellation, ResidentLoadProgress, ResidentMtpGenerationStats, ResidentMtpLoadStats,
-    ResidentMtpProgram, ResidentMtpSegmentedVerifyRoute, ResidentMtpVerifyRoute, ResidentRequestId,
-    SamplingDistribution,
+    GenerationStep, LONG_CONTEXT_PHYSICAL_PAGES, MAX_BATCH, PromptLogprobs, PromptTokenLogprob,
+    ResidentBatchAdmission, ResidentCancellation, ResidentLoadProgress, ResidentMtpGenerationStats,
+    ResidentMtpLoadStats, ResidentMtpProgram, ResidentMtpSegmentedVerifyRoute,
+    ResidentMtpVerifyRoute, ResidentRequestId, SamplingDistribution,
 };
 use std::sync::Arc;
 use tuisko_frontend::{GenerationDefaults, TextFrontend};
@@ -346,6 +348,151 @@ impl ResidentMtpBatchGenerator {
         request: &ChatGenerationRequest,
     ) -> EngineResult<ResidentBatchAdmission> {
         self.admit_with_progress(request, |_, _| true)
+    }
+
+    /// Scores every causal token in one nonempty token-ID prompt and appends one greedy token.
+    ///
+    /// This eval-only boundary runs only while the compact scheduler is idle. It deliberately
+    /// uses slot zero and applies the normal inactive-prefix eviction policy under page pressure.
+    pub fn score_prompt(&mut self, token_ids: &[u32]) -> EngineResult<PromptLogprobs> {
+        if self.active != 0 {
+            return Err(EngineError::capacity(
+                "prompt scoring requires an idle resident scheduler",
+            ));
+        }
+        if token_ids.is_empty() {
+            return Err(EngineError::generation(
+                "prompt scoring requires at least one token",
+            ));
+        }
+        for (position, &token) in token_ids.iter().enumerate() {
+            if usize::try_from(token).map_or(true, |token| token >= Qwen38_27B::VOCAB) {
+                return Err(EngineError::generation(format!(
+                    "prompt scoring token {token} at position {position} is outside vocabulary 0..{}",
+                    Qwen38_27B::VOCAB
+                )));
+            }
+        }
+        if token_ids.len() > self.program.target().context_capacity() {
+            return Err(EngineError::capacity(format!(
+                "prompt scoring requires {} positions, current resident capacity is {}",
+                token_ids.len(),
+                self.program.target().context_capacity()
+            )));
+        }
+
+        let slot = 0;
+        self.prepare_kv_slot(slot, true, token_ids.len())?;
+        self.program.activate_kv_slot(slot)?;
+        if let Err(error) = self
+            .program
+            .reserve_kv_slot_tokens(&self.stream, slot, token_ids.len())
+        {
+            self.program.recycle_kv_slot(&self.stream, slot)?;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .program
+            .target()
+            .load_slot_routes(&self.stream, &[slot])
+        {
+            self.program.recycle_kv_slot(&self.stream, slot)?;
+            return Err(error);
+        }
+
+        let scored = self.score_prompt_in_slot(token_ids, slot);
+        let recycled = self.program.recycle_kv_slot(&self.stream, slot);
+        self.retained[slot] = None;
+        self.message_boundary_valid[slot] = false;
+        match (scored, recycled) {
+            (Ok(scored), Ok(_)) => Ok(scored),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn score_prompt_in_slot(
+        &mut self,
+        token_ids: &[u32],
+        slot: usize,
+    ) -> EngineResult<PromptLogprobs> {
+        let mut prompt = vec![None; token_ids.len()];
+        let primed = token_ids.len() - 1;
+        let mut cursor = 0usize;
+        let mut cosine = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+        let mut sine = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+
+        while let Some(tokens) = next_native_prefill_tile(primed - cursor) {
+            let rotary_values = fill_contiguous_rope(cursor, tokens, &mut cosine, &mut sine)?;
+            replay_prefill_tile(
+                &mut self.program,
+                &self.stream,
+                &token_ids[cursor..cursor + tokens],
+                slot,
+                cursor,
+                &cosine[..rotary_values],
+                &sine[..rotary_values],
+            )?;
+            for first_row in (0..tokens).step_by(MAX_BATCH) {
+                let rows = MAX_BATCH.min(tokens - first_row);
+                self.program.target().launch_prefill_lm_head_rows(
+                    &self.stream,
+                    first_row,
+                    rows,
+                    tokens,
+                )?;
+                self.program.target().read_logits_into(
+                    &self.stream,
+                    rows,
+                    &mut self.target_logits[target_download_logits(rows)],
+                )?;
+                for row_index in 0..rows {
+                    let target_position = cursor + first_row + row_index + 1;
+                    prompt[target_position] = Some(score_logit_row(
+                        &self.target_logits[row(row_index, Qwen38_27B::VOCAB)],
+                        token_ids[target_position],
+                    )?);
+                }
+            }
+            cursor += tokens;
+        }
+
+        while cursor < primed {
+            replay_target_token(&mut self.program, &self.stream, token_ids[cursor], cursor)?;
+            self.program.target().read_logits_into(
+                &self.stream,
+                1,
+                &mut self.target_logits[target_download_logits(1)],
+            )?;
+            prompt[cursor + 1] = Some(score_logit_row(
+                &self.target_logits[row(0, Qwen38_27B::VOCAB)],
+                token_ids[cursor + 1],
+            )?);
+            cursor += 1;
+        }
+
+        replay_target_token(&mut self.program, &self.stream, token_ids[primed], primed)?;
+        self.program.target().read_logits_into(
+            &self.stream,
+            1,
+            &mut self.target_logits[target_download_logits(1)],
+        )?;
+        let completion = score_greedy_row(&self.target_logits[row(0, Qwen38_27B::VOCAB)])?;
+        let mut echoed_ids = token_ids.to_vec();
+        echoed_ids.push(completion.token_id);
+        let echoed_text = self.frontend.decode(&echoed_ids, false)?;
+        let token_text = echoed_ids
+            .iter()
+            .map(|&token| self.frontend.decode(&[token], false))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(PromptLogprobs {
+            prompt_token_ids: token_ids.to_vec(),
+            prompt,
+            completion,
+            echoed_text,
+            token_text,
+        })
     }
 
     /// Admits one request while reporting processed prompt tokens at existing stream boundaries.
@@ -1996,6 +2143,63 @@ fn checked_rows(label: &str, rows: usize, columns: usize) -> EngineResult<usize>
         .ok_or_else(|| EngineError::layout(format!("{label} overflows")))
 }
 
+fn score_logit_row(logits: &[u16], token_id: u32) -> EngineResult<PromptTokenLogprob> {
+    let token = usize::try_from(token_id)
+        .ok()
+        .filter(|&token| token < logits.len())
+        .ok_or_else(|| EngineError::sampling("scored token is outside its logit row"))?;
+    let (top_token, top_logit, log_normalizer) = logit_row_normalizer(logits)?;
+    let selected = f64::from(bf16_to_f32(logits[token]));
+    Ok(PromptTokenLogprob {
+        token_id,
+        logprob: (selected - log_normalizer) as f32,
+        top_token_id: u32::try_from(top_token)
+            .map_err(|_| EngineError::sampling("greedy token exceeds u32"))?,
+        top_logprob: (top_logit - log_normalizer) as f32,
+    })
+}
+
+fn score_greedy_row(logits: &[u16]) -> EngineResult<PromptTokenLogprob> {
+    let (top_token, top_logit, log_normalizer) = logit_row_normalizer(logits)?;
+    let token_id =
+        u32::try_from(top_token).map_err(|_| EngineError::sampling("greedy token exceeds u32"))?;
+    let logprob = (top_logit - log_normalizer) as f32;
+    Ok(PromptTokenLogprob {
+        token_id,
+        logprob,
+        top_token_id: token_id,
+        top_logprob: logprob,
+    })
+}
+
+fn logit_row_normalizer(logits: &[u16]) -> EngineResult<(usize, f64, f64)> {
+    let mut best = None;
+    for (token, &bits) in logits.iter().enumerate() {
+        let value = bf16_to_f32(bits);
+        if !value.is_finite() {
+            return Err(EngineError::sampling(format!(
+                "prompt scoring logit {token} is not finite"
+            )));
+        }
+        if best.is_none_or(|(_, retained): (usize, f32)| value.total_cmp(&retained).is_gt()) {
+            best = Some((token, value));
+        }
+    }
+    let (top_token, top_logit) =
+        best.ok_or_else(|| EngineError::sampling("prompt scoring received an empty logit row"))?;
+    let top_logit = f64::from(top_logit);
+    let denominator = logits
+        .iter()
+        .map(|&bits| (f64::from(bf16_to_f32(bits)) - top_logit).exp())
+        .sum::<f64>();
+    if !denominator.is_finite() || denominator <= 0.0 {
+        return Err(EngineError::sampling(
+            "prompt scoring softmax denominator is not finite and positive",
+        ));
+    }
+    Ok((top_token, top_logit, top_logit + denominator.ln()))
+}
+
 fn target_slot_logits(slot: usize) -> std::ops::Range<usize> {
     row(slot, Qwen38_27B::VOCAB)
 }
@@ -2036,7 +2240,7 @@ fn compact_hidden_row(row_index: usize) -> std::ops::Range<usize> {
 mod tests {
     use super::{
         DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, RetainedMtpSlot, RetainedReuse, TARGET_LOGIT_ROWS,
-        best_retained_prefix,
+        best_retained_prefix, score_greedy_row, score_logit_row,
     };
     use crate::MAX_BATCH;
 
@@ -2045,6 +2249,20 @@ mod tests {
         assert_eq!(TARGET_LOGIT_ROWS, MAX_BATCH + 4 * MAX_BATCH);
         assert_eq!(DRAFT_LOGIT_ROWS, 2 * MAX_BATCH);
         assert_eq!(DRAFT_HIDDEN_ROWS, 2 * MAX_BATCH);
+    }
+
+    #[test]
+    fn prompt_logprobs_use_natural_log_softmax_and_first_argmax_ties() {
+        let logits = [0.0f32, 1.0, 1.0, -2.0].map(|value| (value.to_bits() >> 16) as u16);
+        let selected = score_logit_row(&logits, 0).unwrap();
+        let greedy = score_greedy_row(&logits).unwrap();
+        let normalizer = (1.0f64.exp() + 1.0f64.exp() + 1.0 + (-2.0f64).exp()).ln();
+
+        assert_eq!(selected.token_id, 0);
+        assert_eq!(selected.top_token_id, 1);
+        assert!((f64::from(selected.logprob) + normalizer).abs() < 1.0e-6);
+        assert_eq!(greedy.token_id, 1);
+        assert!((f64::from(greedy.logprob) - (1.0 - normalizer)).abs() < 1.0e-6);
     }
 
     #[test]
