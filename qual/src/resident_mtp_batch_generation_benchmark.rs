@@ -313,9 +313,8 @@ pub fn benchmark_resident_mtp_prompt_scoring(
         ))
     })?;
     let prompts = scoring_prompts(&frontend)?;
+    let (prompt_tokens, common_tokens) = scoring_prompt_shape(&prompts)?;
     let input_reference = prompts.clone();
-    let prompt_tokens = prompts[0].len();
-    let common_tokens = prompt_tokens - 1;
     let context = CudaContext::new(0).map_err(GpuError::from)?;
     if context.compute_capability().map_err(GpuError::from)? != (12, 0) {
         return Err(DeviceBenchmarkError::Precondition(
@@ -428,38 +427,56 @@ pub fn benchmark_resident_mtp_prompt_scoring(
 
 fn scoring_prompts(frontend: &TextFrontend) -> Result<Vec<Vec<u32>>, DeviceBenchmarkError> {
     let stem = "The following is a multiple choice question. Select the best answer.\n\nWhich property must every prime number greater than two have?\nA. It is even.\nB. It is odd.\nC. It is divisible by three.\nD. It is a perfect square.\nAnswer:";
-    let prefix = frontend.encode(stem).map_err(|error| {
-        DeviceBenchmarkError::Precondition(format!(
-            "prompt scoring benchmark stem encoding failed: {error}"
-        ))
-    })?;
     let mut prompts = Vec::with_capacity(SCORING_BATCH as usize);
     for choice in [" A", " B", " C", " D"] {
-        let suffix = frontend.encode(choice).map_err(|error| {
-            DeviceBenchmarkError::Precondition(format!(
-                "prompt scoring benchmark choice encoding failed: {error}"
-            ))
-        })?;
-        if suffix.len() != 1 {
-            return Err(DeviceBenchmarkError::Precondition(format!(
-                "prompt scoring benchmark choice {choice:?} encoded to {} tokens instead of one",
-                suffix.len()
-            )));
-        }
-        let mut prompt = prefix.clone();
-        prompt.extend(suffix);
+        let prompt = frontend
+            .encode(&format!("{stem}{choice}"))
+            .map_err(|error| {
+                DeviceBenchmarkError::Precondition(format!(
+                    "prompt scoring benchmark full choice encoding failed: {error}"
+                ))
+            })?;
         prompts.push(prompt);
     }
-    if prefix.is_empty()
-        || prompts
-            .iter()
-            .any(|prompt| prompt.len() != prefix.len() + 1)
-    {
+    scoring_prompt_shape(&prompts)?;
+    Ok(prompts)
+}
+
+fn scoring_prompt_shape(prompts: &[Vec<u32>]) -> Result<(usize, usize), DeviceBenchmarkError> {
+    if prompts.len() != SCORING_BATCH as usize {
         return Err(DeviceBenchmarkError::Precondition(
-            "prompt scoring benchmark did not form four equal one-choice suffixes".to_string(),
+            "prompt scoring benchmark requires exactly four choices".to_string(),
         ));
     }
-    Ok(prompts)
+    let prompt_tokens = prompts[0].len();
+    if prompt_tokens < 2 || prompts.iter().any(|prompt| prompt.len() != prompt_tokens) {
+        return Err(DeviceBenchmarkError::Precondition(
+            "prompt scoring benchmark choices are not equal nontrivial lengths".to_string(),
+        ));
+    }
+    let common_tokens = (0..prompt_tokens)
+        .take_while(|&position| {
+            prompts[1..]
+                .iter()
+                .all(|prompt| prompt[position] == prompts[0][position])
+        })
+        .count();
+    if common_tokens != prompt_tokens - 1 {
+        return Err(DeviceBenchmarkError::Precondition(format!(
+            "prompt scoring benchmark common prefix is {common_tokens}, expected {}",
+            prompt_tokens - 1
+        )));
+    }
+    let final_choices = prompts
+        .iter()
+        .map(|prompt| prompt[prompt_tokens - 1])
+        .collect::<std::collections::BTreeSet<_>>();
+    if final_choices.len() != SCORING_BATCH as usize {
+        return Err(DeviceBenchmarkError::Precondition(
+            "prompt scoring benchmark final choice token IDs are not distinct".to_string(),
+        ));
+    }
+    Ok((prompt_tokens, common_tokens))
 }
 
 fn run_shared_scoring(
@@ -812,5 +829,28 @@ mod tests {
             super::SHARED_SCORING_METRIC,
             super::INDEPENDENT_SCORING_METRIC
         );
+    }
+
+    #[test]
+    fn resident_mtp_batch_suite_prompt_scoring_shape_requires_one_distinct_choice_token() {
+        let valid = vec![
+            vec![10, 11, 20],
+            vec![10, 11, 21],
+            vec![10, 11, 22],
+            vec![10, 11, 23],
+        ];
+        assert_eq!(super::scoring_prompt_shape(&valid).unwrap(), (3, 2));
+
+        let mut duplicate = valid.clone();
+        duplicate[3][2] = 22;
+        assert!(super::scoring_prompt_shape(&duplicate).is_err());
+
+        let mut short_prefix = valid.clone();
+        short_prefix[3][1] = 12;
+        assert!(super::scoring_prompt_shape(&short_prefix).is_err());
+
+        let mut unequal = valid;
+        unequal[3].push(24);
+        assert!(super::scoring_prompt_shape(&unequal).is_err());
     }
 }
