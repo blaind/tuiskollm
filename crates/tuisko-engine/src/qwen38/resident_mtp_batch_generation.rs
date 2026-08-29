@@ -165,6 +165,7 @@ struct PromptScoringBatchPlan {
     common_prefix: usize,
     shared_boundary: usize,
     shared_routes: Vec<usize>,
+    required_positions: usize,
 }
 
 impl LaneDrafts {
@@ -416,17 +417,11 @@ impl ResidentMtpBatchGenerator {
         }
 
         let slot = 0;
-        let required_positions = prompts
-            .iter()
-            .map(Vec::len)
-            .max()
-            .expect("validated scoring batch is nonempty");
-        // Reclaim for the widest branch now, but publish only the exact shared boundary.
-        self.prepare_kv_slot(slot, true, required_positions)?;
+        self.prepare_kv_slot(slot, true, plan.required_positions)?;
         self.program.activate_kv_slot(slot)?;
         if let Err(error) =
             self.program
-                .reserve_kv_slot_tokens(&self.stream, slot, plan.shared_boundary)
+                .reserve_kv_slot_tokens(&self.stream, slot, plan.required_positions)
         {
             self.program.recycle_kv_slot(&self.stream, slot)?;
             return Err(error);
@@ -461,6 +456,8 @@ impl ResidentMtpBatchGenerator {
         let common_prompt = &prompts[0][..common];
         let (common_scores, boundary_scores) =
             self.score_shared_prefix_in_slot(common_prompt, prompts, &plan.shared_routes, slot)?;
+        self.program
+            .truncate_kv_slot_tokens(&self.stream, slot, common)?;
         self.program.target().capture_gdn_slot(
             &self.stream,
             slot,
@@ -2500,6 +2497,11 @@ fn plan_prompt_scoring_batch<T: AsRef<[u32]>>(prompts: &[T]) -> PromptScoringBat
         common_prefix,
         shared_boundary,
         shared_routes,
+        required_positions: prompts
+            .iter()
+            .map(|prompt| prompt.as_ref().len())
+            .max()
+            .expect("validated prompt scoring batch is nonempty"),
     }
 }
 
@@ -2635,10 +2637,10 @@ fn compact_hidden_row(row_index: usize) -> std::ops::Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, RetainedMtpSlot, RetainedReuse, TARGET_LOGIT_ROWS,
-        best_retained_prefix, longest_common_token_prefix, plan_prompt_scoring_batch,
-        prompt_scoring_routes, score_greedy_row, score_logit_row, target_download_logits,
-        target_download_row, validate_prompt_scoring_batch,
+        ATTENTION_PAGE_SIZE, DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, RetainedMtpSlot, RetainedReuse,
+        TARGET_LOGIT_ROWS, best_retained_prefix, longest_common_token_prefix,
+        plan_prompt_scoring_batch, prompt_scoring_routes, score_greedy_row, score_logit_row,
+        target_download_logits, target_download_row, validate_prompt_scoring_batch,
     };
     use crate::MAX_BATCH;
     use crate::common::banks::row;
@@ -2701,6 +2703,7 @@ mod tests {
             let plan = plan_prompt_scoring_batch(&[left, right]);
             assert_eq!(plan.common_prefix, boundary);
             assert_eq!(plan.shared_boundary, boundary);
+            assert_eq!(plan.required_positions, boundary + 1);
             assert_eq!(
                 plan.shared_routes,
                 prompt_scoring_routes(boundary + 1)[..plan.shared_routes.len()]
@@ -2713,13 +2716,31 @@ mod tests {
             let incompatible = plan_prompt_scoring_batch(&[shorter, longer]);
             assert_eq!(incompatible.common_prefix, seam);
             assert_eq!(incompatible.shared_boundary, 0);
+            assert_eq!(incompatible.required_positions, seam + 1);
 
             let shorter = vec![7; seam + 1];
             let longer = vec![7; seam + 2];
             let compatible = plan_prompt_scoring_batch(&[shorter, longer]);
             assert_eq!(compatible.common_prefix, seam + 1);
             assert_eq!(compatible.shared_boundary, seam + 1);
+            assert_eq!(compatible.required_positions, seam + 2);
         }
+    }
+
+    #[test]
+    fn prompt_scoring_batch_reserves_the_independent_macro_context_before_reuse() {
+        let prefix = vec![7; 1_024];
+        let prompts = [
+            prefix.iter().copied().chain([8]).collect::<Vec<_>>(),
+            prefix.iter().copied().chain([9]).collect::<Vec<_>>(),
+        ];
+        let plan = plan_prompt_scoring_batch(&prompts);
+
+        assert_eq!(plan.shared_routes, [1_024]);
+        assert_eq!(plan.shared_boundary, 1_024);
+        assert_eq!(plan.required_positions, 1_025);
+        assert_eq!(plan.shared_boundary.div_ceil(ATTENTION_PAGE_SIZE), 16);
+        assert_eq!(plan.required_positions.div_ceil(ATTENTION_PAGE_SIZE), 17);
     }
 
     #[test]

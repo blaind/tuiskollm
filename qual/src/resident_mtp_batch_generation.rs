@@ -792,9 +792,10 @@ mod tests {
                 .iter()
                 .map(|prompt| generator.score_prompt(prompt).unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(
-                shared, independent,
-                "equal-length shared-prefix scoring differed at common length {common}"
+            assert_prompt_scoring_equal(
+                &format!("equal-length common={common}"),
+                &shared,
+                &independent,
             );
 
             let mut exact_prefix = prefix.clone();
@@ -815,12 +816,61 @@ mod tests {
                 .iter()
                 .map(|prompt| generator.score_prompt(prompt).unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(
-                shared, independent,
-                "unequal shared-prefix scoring differed after common length {common}"
-            );
+            assert_prompt_scoring_equal(&format!("unequal common={common}"), &shared, &independent);
         }
         crate::device_benchmark::require_current_process_exclusive().unwrap();
+    }
+
+    fn assert_prompt_scoring_equal(
+        case: &str,
+        shared: &[tuisko_engine::PromptLogprobs],
+        independent: &[tuisko_engine::PromptLogprobs],
+    ) {
+        assert_eq!(shared.len(), independent.len(), "{case}: result count");
+        for (prompt_index, (shared, independent)) in shared.iter().zip(independent).enumerate() {
+            if shared.prompt_token_ids != independent.prompt_token_ids {
+                let position = shared
+                    .prompt_token_ids
+                    .iter()
+                    .zip(&independent.prompt_token_ids)
+                    .position(|(left, right)| left != right);
+                panic!("{case}: prompt {prompt_index} token IDs differ at {position:?}");
+            }
+            assert_eq!(
+                shared.prompt.len(),
+                independent.prompt.len(),
+                "{case}: prompt {prompt_index} causal score count"
+            );
+            for (position, (shared, independent)) in
+                shared.prompt.iter().zip(&independent.prompt).enumerate()
+            {
+                assert_eq!(
+                    shared, independent,
+                    "{case}: prompt {prompt_index} causal score at position {position}"
+                );
+            }
+            assert_eq!(
+                shared.completion, independent.completion,
+                "{case}: prompt {prompt_index} completion"
+            );
+            assert!(
+                shared.echoed_text == independent.echoed_text,
+                "{case}: prompt {prompt_index} echoed text"
+            );
+            assert_eq!(
+                shared.token_text.len(),
+                independent.token_text.len(),
+                "{case}: prompt {prompt_index} token-text count"
+            );
+            if let Some(position) = shared
+                .token_text
+                .iter()
+                .zip(&independent.token_text)
+                .position(|(left, right)| left != right)
+            {
+                panic!("{case}: prompt {prompt_index} token text differs at {position}");
+            }
+        }
     }
 
     #[test]
