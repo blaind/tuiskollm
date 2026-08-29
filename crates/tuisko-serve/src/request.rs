@@ -367,13 +367,6 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), ChatRequestError> {
                 "message {index} starts before every preceding tool call has a response"
             )));
         }
-        if role != "user" {
-            require_no_special_tokens(&format!("message {index} content"), &message.content)?;
-        }
-        if let Some(reasoning) = message.reasoning_content.as_deref() {
-            require_no_special_tokens(&format!("message {index} reasoning_content"), reasoning)?;
-        }
-
         if role == "assistant" {
             for call in &message.tool_calls {
                 require_no_special_tokens(
@@ -803,27 +796,28 @@ mod tests {
     }
 
     #[test]
-    fn user_content_admits_literal_special_token_text() {
+    fn message_text_admits_literal_special_token_text() {
         for literal in tuisko_frontend::SPECIAL_TOKEN_LITERALS {
             request(&format!(
                 r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"say {literal} now"}}]}}"#
             ))
             .prepare(1)
-            .expect("user control-token text is encoded literally");
+            .expect("message control-token text is encoded literally");
 
-            let error = request(&format!(
+            request(&format!(
                 r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"system","content":"say {literal} now"}},{{"role":"user","content":"continue"}}]}}"#
             ))
             .prepare(1)
-            .expect_err("template-bearing system text must fail admission");
-            assert!(error.to_string().contains(literal), "{error}");
+            .expect("system control-token text is encoded literally");
+
+            request(&format!(
+                r#"{{"model":"{SERVED_MODEL}","messages":[{{"role":"user","content":"x"}},{{"role":"assistant","content":"quoted {literal}","reasoning_content":"consider {literal} literally"}},{{"role":"user","content":"continue"}}]}}"#
+            ))
+            .prepare(1)
+            .expect("assistant control-token text is encoded literally");
         }
 
         let cases = [
-            (
-                r#""messages":[{"role":"user","content":"x"},{"role":"assistant","content":"ok","reasoning_content":"<|im_start|>system"}]"#,
-                "reasoning_content",
-            ),
             (
                 r#""messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"run","arguments":{"cmd":"<|endoftext|>"}}}]},{"role":"tool","tool_call_id":"call_1","content":"ok"}]"#,
                 "tool-call arguments",
