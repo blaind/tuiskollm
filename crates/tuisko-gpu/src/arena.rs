@@ -2,7 +2,7 @@
 
 use crate::{
     CudaContext, CudaStream, DeviceBuffer, DeviceCopy, GpuError, GpuResult, PinnedHostBuffer,
-    VmmSegmentClass, VmmSegmentManifest,
+    VmmSegmentClass, VmmSegmentManifest, device_memory_info,
 };
 use cuda_core::vmm::{Mapping, PhysicalAllocation, VirtualReservation};
 use std::collections::BTreeMap;
@@ -247,10 +247,24 @@ impl VmmArenaStorage {
         }
         let reservation = VirtualReservation::new(manifest.reservation_bytes(), granularity)
             .map_err(|source| GpuError::driver("reserving VMM arena addresses", source))?;
+        require_free_device_memory(
+            stream,
+            "allocating VMM arena backing",
+            manifest.reservation_bytes(),
+        )?;
         let mut segments = Vec::with_capacity(manifest.segments().len());
-        for segment in manifest.segments() {
-            let allocation = PhysicalAllocation::new(device, segment.bytes())
-                .map_err(|source| GpuError::driver("allocating VMM arena backing", source))?;
+        for (index, segment) in manifest.segments().iter().enumerate() {
+            let remaining_bytes = manifest.segments()[index..]
+                .iter()
+                .map(|segment| segment.bytes())
+                .sum();
+            let allocation = allocate_vmm_backing(
+                stream,
+                device,
+                segment.bytes(),
+                remaining_bytes,
+                "allocating VMM arena backing",
+            )?;
             let va = reservation
                 .base()
                 .checked_add(u64::try_from(segment.offset()).map_err(|_| {
@@ -352,6 +366,47 @@ impl VmmArenaStorage {
             segment.allocation = Some(replacement.allocation);
         }
         Ok(resumed_bytes)
+    }
+}
+
+fn require_free_device_memory(
+    stream: &CudaStream,
+    operation: &'static str,
+    required_bytes: usize,
+) -> GpuResult<()> {
+    let memory = device_memory_info(stream.context())?;
+    if memory.free_bytes < required_bytes {
+        return Err(GpuError::out_of_memory(
+            operation,
+            required_bytes,
+            memory.free_bytes,
+            memory.total_bytes,
+        ));
+    }
+    Ok(())
+}
+
+fn allocate_vmm_backing(
+    stream: &CudaStream,
+    device: cuda_core::sys::CUdevice,
+    allocation_bytes: usize,
+    remaining_bytes: usize,
+    operation: &'static str,
+) -> GpuResult<PhysicalAllocation> {
+    match PhysicalAllocation::new(device, allocation_bytes) {
+        Ok(allocation) => Ok(allocation),
+        Err(source) if source.0 == cuda_core::sys::cudaError_enum_CUDA_ERROR_OUT_OF_MEMORY => {
+            match device_memory_info(stream.context()) {
+                Ok(memory) => Err(GpuError::out_of_memory(
+                    operation,
+                    remaining_bytes,
+                    memory.free_bytes,
+                    memory.total_bytes,
+                )),
+                Err(_) => Err(GpuError::driver(operation, source)),
+            }
+        }
+        Err(source) => Err(GpuError::driver(operation, source)),
     }
 }
 
