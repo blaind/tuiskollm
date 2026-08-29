@@ -2466,10 +2466,9 @@ fn plan_prompt_scoring_batch<T: AsRef<[u32]>>(prompts: &[T]) -> PromptScoringBat
         .map(|prompt| prompt.as_ref().len())
         .max()
         .expect("validated prompt scoring batch is nonempty");
-    let reserved_pages = prompts[0].as_ref().len().div_ceil(ATTENTION_PAGE_SIZE);
     if prompts
         .iter()
-        .any(|prompt| prompt.as_ref().len().div_ceil(ATTENTION_PAGE_SIZE) != reserved_pages)
+        .any(|prompt| prompt.as_ref().len() != required_positions)
     {
         return PromptScoringBatchPlan {
             common_prefix,
@@ -2482,6 +2481,11 @@ fn plan_prompt_scoring_batch<T: AsRef<[u32]>>(prompts: &[T]) -> PromptScoringBat
         .iter()
         .map(|prompt| prompt_scoring_routes(prompt.as_ref().len()))
         .collect::<Vec<_>>();
+    let reusable_prefix = prompts
+        .iter()
+        .map(|prompt| prompt.as_ref().len() - 1)
+        .min()
+        .expect("validated prompt scoring batch is nonempty");
     let mut route_indices = vec![0usize; prompts.len()];
     let mut shared_boundary = 0usize;
     let mut shared_routes = Vec::new();
@@ -2500,7 +2504,7 @@ fn plan_prompt_scoring_batch<T: AsRef<[u32]>>(prompts: &[T]) -> PromptScoringBat
         let Some(boundary) = shared_boundary.checked_add(next) else {
             break;
         };
-        if boundary > common_prefix {
+        if boundary > common_prefix.min(reusable_prefix) {
             break;
         }
         shared_routes.push(next);
@@ -2735,9 +2739,21 @@ mod tests {
             let longer = vec![7; seam + 2];
             let compatible = plan_prompt_scoring_batch(&[shorter, longer]);
             assert_eq!(compatible.common_prefix, seam + 1);
-            assert_eq!(compatible.shared_boundary, seam + 1);
+            assert_eq!(compatible.shared_boundary, 0);
             assert_eq!(compatible.required_positions, seam + 2);
         }
+    }
+
+    #[test]
+    fn prompt_scoring_batch_does_not_share_across_unequal_same_page_reservations() {
+        let shorter = vec![7; 1_026];
+        let longer = vec![7; 1_028];
+        let plan = plan_prompt_scoring_batch(&[shorter, longer]);
+
+        assert_eq!(plan.common_prefix, 1_026);
+        assert!(plan.shared_routes.is_empty());
+        assert_eq!(plan.shared_boundary, 0);
+        assert_eq!(plan.required_positions, 1_028);
     }
 
     #[test]
