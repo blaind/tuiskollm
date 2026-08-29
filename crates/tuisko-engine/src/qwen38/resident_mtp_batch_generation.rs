@@ -449,7 +449,7 @@ impl ResidentMtpBatchGenerator {
                 for row_index in 0..rows {
                     let target_position = cursor + first_row + row_index + 1;
                     prompt[target_position] = Some(score_logit_row(
-                        &self.target_logits[row(row_index, Qwen38_27B::VOCAB)],
+                        &self.target_logits[target_download_row(row_index)],
                         token_ids[target_position],
                     )?);
                 }
@@ -465,7 +465,7 @@ impl ResidentMtpBatchGenerator {
                 &mut self.target_logits[target_download_logits(1)],
             )?;
             prompt[cursor + 1] = Some(score_logit_row(
-                &self.target_logits[row(0, Qwen38_27B::VOCAB)],
+                &self.target_logits[target_download_row(0)],
                 token_ids[cursor + 1],
             )?);
             cursor += 1;
@@ -477,7 +477,7 @@ impl ResidentMtpBatchGenerator {
             1,
             &mut self.target_logits[target_download_logits(1)],
         )?;
-        let completion = score_greedy_row(&self.target_logits[row(0, Qwen38_27B::VOCAB)])?;
+        let completion = score_greedy_row(&self.target_logits[target_download_row(0)])?;
         let mut echoed_ids = token_ids.to_vec();
         echoed_ids.push(completion.token_id);
         let echoed_text = self.frontend.decode(&echoed_ids, false)?;
@@ -2240,9 +2240,12 @@ fn compact_hidden_row(row_index: usize) -> std::ops::Range<usize> {
 mod tests {
     use super::{
         DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, RetainedMtpSlot, RetainedReuse, TARGET_LOGIT_ROWS,
-        best_retained_prefix, score_greedy_row, score_logit_row,
+        best_retained_prefix, score_greedy_row, score_logit_row, target_download_logits,
+        target_download_row,
     };
     use crate::MAX_BATCH;
+    use crate::common::banks::row;
+    use tuisko_model::{Arch, Qwen38_27B};
 
     #[test]
     fn host_stager_inventory_has_disjoint_slot_and_compact_banks() {
@@ -2263,6 +2266,14 @@ mod tests {
         assert!((f64::from(selected.logprob) + normalizer).abs() < 1.0e-6);
         assert_eq!(greedy.token_id, 1);
         assert!((f64::from(greedy.logprob) - (1.0 - normalizer)).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn prompt_scoring_download_rows_follow_the_per_slot_logit_bank() {
+        let first_download = row(MAX_BATCH, Qwen38_27B::VOCAB);
+
+        assert_eq!(target_download_row(0), first_download);
+        assert_eq!(target_download_logits(1), first_download);
     }
 
     #[test]
