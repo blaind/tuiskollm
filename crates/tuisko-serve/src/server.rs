@@ -16,6 +16,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
+use std::future::Future;
 use std::io::{IsTerminal, Write as IoWrite};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -206,6 +207,131 @@ struct WorkerControl {
     alive: Arc<AtomicBool>,
     lifecycle: Arc<Mutex<LifecycleState>>,
     progress: Arc<ResidentLoadProgress>,
+    interactive: bool,
+    color: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DisplayOptions {
+    interactive: bool,
+    color: bool,
+}
+
+struct WorkerRuntime {
+    alive: Arc<AtomicBool>,
+    lifecycle: Arc<Mutex<LifecycleState>>,
+    display: DisplayOptions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InferencePhase {
+    Prefill,
+    Decode,
+}
+
+struct InferenceDisplay {
+    interactive: bool,
+    color: bool,
+    phase: Option<InferencePhase>,
+    last_draw: Option<Instant>,
+    last_active: usize,
+    spinner_tick: usize,
+    rounds: usize,
+    output_tokens: usize,
+    session_active: bool,
+}
+
+impl InferenceDisplay {
+    fn new(interactive: bool, color: bool) -> Self {
+        Self {
+            interactive,
+            color,
+            phase: None,
+            last_draw: None,
+            last_active: 0,
+            spinner_tick: 0,
+            rounds: 0,
+            output_tokens: 0,
+            session_active: false,
+        }
+    }
+
+    fn prefill(&mut self, requests: usize) {
+        self.begin_session();
+        self.draw(InferencePhase::Prefill, requests, true);
+    }
+
+    fn decode(&mut self, active: usize) {
+        self.begin_session();
+        self.rounds = self.rounds.saturating_add(1);
+        let redraw = self.phase != Some(InferencePhase::Decode)
+            || self.last_active != active
+            || self
+                .last_draw
+                .is_none_or(|draw| draw.elapsed() >= Duration::from_millis(100));
+        self.draw(InferencePhase::Decode, active, redraw);
+    }
+
+    fn observe_outputs(&mut self, outputs: usize) {
+        self.output_tokens = self.output_tokens.saturating_add(outputs);
+    }
+
+    fn clear(&mut self) {
+        if self.interactive && self.phase.take().is_some() {
+            let mut stdout = std::io::stdout().lock();
+            if stdout
+                .write_all(b"\r\x1b[2K")
+                .and_then(|_| stdout.flush())
+                .is_err()
+            {
+                self.interactive = false;
+            }
+        }
+    }
+
+    fn idle(&mut self) {
+        self.clear();
+        self.last_draw = None;
+        self.last_active = 0;
+        self.rounds = 0;
+        self.output_tokens = 0;
+        self.session_active = false;
+    }
+
+    fn begin_session(&mut self) {
+        if !self.session_active {
+            self.rounds = 0;
+            self.output_tokens = 0;
+            self.session_active = true;
+        }
+    }
+
+    fn draw(&mut self, phase: InferencePhase, active: usize, redraw: bool) {
+        if !self.interactive || !redraw {
+            return;
+        }
+        let line = render_inference_progress(
+            phase,
+            active,
+            self.rounds,
+            self.output_tokens,
+            self.spinner_tick,
+            self.color,
+        );
+        let mut stdout = std::io::stdout().lock();
+        if stdout
+            .write_all(line.as_bytes())
+            .and_then(|_| stdout.flush())
+            .is_err()
+        {
+            self.interactive = false;
+            return;
+        }
+        self.phase = Some(phase);
+        self.last_draw = Some(Instant::now());
+        self.last_active = active;
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+    }
 }
 
 trait ReloadableGenerator: TextGenerator + Sized {
@@ -365,7 +491,8 @@ pub fn run(config: ServerConfig) -> Result<(), ServerError> {
         let mut stdout = stdout.lock();
         stdout.write_all(output.as_bytes())?;
         stdout.flush()?;
-        serve_until_worker_failure(listener, router(state), worker_failure).await
+        serve_until_worker_failure(listener, router(state), worker_failure, interactive, color)
+            .await
     })
 }
 
@@ -373,13 +500,41 @@ async fn serve_until_worker_failure(
     listener: tokio::net::TcpListener,
     router: Router,
     worker_failure: oneshot::Receiver<String>,
+    interactive: bool,
+    color: bool,
+) -> Result<(), ServerError> {
+    serve_until_worker_failure_or_shutdown(
+        listener,
+        router,
+        worker_failure,
+        shutdown_signal(interactive, color),
+    )
+    .await
+}
+
+async fn serve_until_worker_failure_or_shutdown(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    worker_failure: oneshot::Receiver<String>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServerError> {
     tokio::select! {
-        result = axum::serve(listener, router) => result.map_err(ServerError::Io),
+        result = axum::serve(listener, router).with_graceful_shutdown(shutdown) => {
+            result.map_err(ServerError::Io)
+        },
         failure = worker_failure => Err(ServerError::WorkerFailed(
             failure.unwrap_or_else(|_| "resident engine worker exited".into()),
         )),
     }
+}
+
+async fn shutdown_signal(interactive: bool, color: bool) {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(render_shutdown(interactive, color).as_bytes());
+    let _ = stdout.flush();
 }
 
 fn start_worker(
@@ -415,6 +570,8 @@ fn start_worker(
                     alive: worker_alive_clone,
                     lifecycle: worker_lifecycle,
                     progress: worker_progress,
+                    interactive,
+                    color,
                 },
             )
         })?;
@@ -490,39 +647,30 @@ fn engine_worker(
         alive: Arc::clone(&control.alive),
         lifecycle: Arc::clone(&control.lifecycle),
     };
+    let runtime = WorkerRuntime {
+        alive: control.alive,
+        lifecycle: control.lifecycle,
+        display: DisplayOptions {
+            interactive: control.interactive,
+            color: control.color,
+        },
+    };
     match target {
-        ServerModel::Qwen38 => start_reloadable_qwen38(
-            snapshot,
-            control.progress,
-            jobs,
-            ready,
-            failure,
-            &control.alive,
-            control.lifecycle,
-        ),
-        ServerModel::Qwen35 => start_generator(
-            load_qwen35(&snapshot),
-            jobs,
-            ready,
-            failure,
-            &control.alive,
-            &control.lifecycle,
-        ),
-        ServerModel::Qwen36 => start_generator(
-            load_qwen36(&snapshot),
-            jobs,
-            ready,
-            failure,
-            &control.alive,
-            &control.lifecycle,
-        ),
+        ServerModel::Qwen38 => {
+            start_reloadable_qwen38(snapshot, control.progress, jobs, ready, failure, &runtime)
+        }
+        ServerModel::Qwen35 => {
+            start_generator(load_qwen35(&snapshot), jobs, ready, failure, &runtime)
+        }
+        ServerModel::Qwen36 => {
+            start_generator(load_qwen36(&snapshot), jobs, ready, failure, &runtime)
+        }
         ServerModel::Qwen38FlashNext => start_generator(
             load_qwen38_flash_next(&snapshot, control.progress.as_ref()),
             jobs,
             ready,
             failure,
-            &control.alive,
-            &control.lifecycle,
+            &runtime,
         ),
     }
 }
@@ -708,8 +856,7 @@ fn start_generator<G: TextGenerator>(
     jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
     failure: oneshot::Sender<String>,
-    worker_alive: &AtomicBool,
-    lifecycle: &Mutex<LifecycleState>,
+    runtime: &WorkerRuntime,
 ) {
     let (generator, startup) = match loaded {
         Ok(loaded) => loaded,
@@ -718,13 +865,19 @@ fn start_generator<G: TextGenerator>(
             return;
         }
     };
-    *lifecycle.lock().expect("lifecycle mutex poisoned") = LifecycleState::Loaded;
-    worker_alive.store(true, Ordering::Release);
+    *runtime.lifecycle.lock().expect("lifecycle mutex poisoned") = LifecycleState::Loaded;
+    runtime.alive.store(true, Ordering::Release);
     if ready.send(Ok(startup)).is_err() {
         return;
     }
 
-    serve_requests(generator, jobs, failure);
+    serve_requests(
+        generator,
+        jobs,
+        failure,
+        runtime.display.interactive,
+        runtime.display.color,
+    );
 }
 
 fn start_reloadable_qwen38(
@@ -733,8 +886,7 @@ fn start_reloadable_qwen38(
     jobs: Receiver<Job>,
     ready: std_mpsc::SyncSender<Result<Ready, String>>,
     failure: oneshot::Sender<String>,
-    worker_alive: &AtomicBool,
-    lifecycle: Arc<Mutex<LifecycleState>>,
+    runtime: &WorkerRuntime,
 ) {
     let (generator, startup) = match load_qwen38(&snapshot, progress.as_ref()) {
         Ok(loaded) => loaded,
@@ -743,15 +895,21 @@ fn start_reloadable_qwen38(
             return;
         }
     };
-    *lifecycle.lock().expect("lifecycle mutex poisoned") = LifecycleState::Loaded;
-    worker_alive.store(true, Ordering::Release);
+    *runtime.lifecycle.lock().expect("lifecycle mutex poisoned") = LifecycleState::Loaded;
+    runtime.alive.store(true, Ordering::Release);
     if ready.send(Ok(startup)).is_err() {
         return;
     }
 
-    serve_reloadable(generator, jobs, failure, lifecycle, move || {
-        reload_qwen38(&snapshot).map(|(generator, _)| generator)
-    });
+    serve_reloadable(
+        generator,
+        jobs,
+        failure,
+        Arc::clone(&runtime.lifecycle),
+        move || reload_qwen38(&snapshot).map(|(generator, _)| generator),
+        runtime.display.interactive,
+        runtime.display.color,
+    );
 }
 
 /// One resident scheduler round loop, identical for every admitted target.
@@ -759,22 +917,28 @@ fn serve_requests<G: TextGenerator>(
     mut generator: G,
     mut jobs: Receiver<Job>,
     failure: oneshot::Sender<String>,
+    interactive: bool,
+    color: bool,
 ) {
+    let mut display = InferenceDisplay::new(interactive, color);
     let mut replies = HashMap::new();
     let mut jobs_open = true;
     let mut waiting = Vec::new();
     loop {
-        if let Err(error) = cancel_disconnected(&mut generator, &mut replies) {
+        if let Err(error) = cancel_disconnected(&mut generator, &mut replies, &mut display) {
             fail_all(&mut replies, error.clone());
             jobs.close();
             fail_queued(&mut jobs, &error);
             let _ = failure.send(error);
             break;
         }
+        if generator.active_requests() == 0 {
+            display.idle();
+        }
 
         if generator.active_requests() == 0 && jobs_open {
             match jobs.blocking_recv() {
-                Some(Job::Chat(job)) => hold_job(&mut waiting, *job),
+                Some(Job::Chat(job)) => hold_job(&mut waiting, *job, &mut display),
                 Some(Job::Admin(job)) => {
                     let _ = job.reply.send(AdminReply::Failed(
                         "model lifecycle is unsupported for this exact target".into(),
@@ -785,7 +949,7 @@ fn serve_requests<G: TextGenerator>(
         }
         while jobs_open && generator.active_requests() + waiting.len() < generator.slot_capacity() {
             match jobs.try_recv() {
-                Ok(Job::Chat(job)) => hold_job(&mut waiting, *job),
+                Ok(Job::Chat(job)) => hold_job(&mut waiting, *job, &mut display),
                 Ok(Job::Admin(job)) => {
                     let _ = job.reply.send(AdminReply::Failed(
                         "model lifecycle is unsupported for this exact target".into(),
@@ -799,18 +963,21 @@ fn serve_requests<G: TextGenerator>(
             }
         }
         if !waiting.is_empty() {
-            admit_group(&mut generator, &mut replies, &mut waiting);
+            admit_group(&mut generator, &mut replies, &mut waiting, &mut display);
         }
         if generator.active_requests() == 0 {
+            display.idle();
             if jobs_open {
                 continue;
             }
             break;
         }
 
+        display.decode(generator.active_requests());
         let events = match generator.step() {
             Ok(events) => events,
             Err(error) => {
+                display.clear();
                 let error = error.to_string();
                 fail_all(&mut replies, error.clone());
                 jobs.close();
@@ -819,6 +986,11 @@ fn serve_requests<G: TextGenerator>(
                 break;
             }
         };
+        let outputs = events.iter().map(|event| event.steps().count()).sum();
+        display.observe_outputs(outputs);
+        if events.iter().any(|event| event.completed().is_some()) {
+            display.clear();
+        }
         for event in events.iter() {
             let request_id = event.request_id();
             let failed = replies.get_mut(&request_id).is_some_and(|reply| {
@@ -856,6 +1028,7 @@ fn serve_requests<G: TextGenerator>(
             }
         }
     }
+    display.idle();
 }
 
 fn serve_reloadable<G: ReloadableGenerator>(
@@ -864,7 +1037,10 @@ fn serve_reloadable<G: ReloadableGenerator>(
     failure: oneshot::Sender<String>,
     lifecycle: Arc<Mutex<LifecycleState>>,
     mut reload: impl FnMut() -> Result<G, String>,
+    interactive: bool,
+    color: bool,
 ) {
+    let mut display = InferenceDisplay::new(interactive, color);
     let mut generator = Some(generator);
     let mut parked = None;
     let mut replies = HashMap::new();
@@ -874,13 +1050,19 @@ fn serve_reloadable<G: ReloadableGenerator>(
 
     loop {
         if let Some(loaded) = generator.as_mut()
-            && let Err(error) = cancel_disconnected(loaded, &mut replies)
+            && let Err(error) = cancel_disconnected(loaded, &mut replies, &mut display)
         {
             fail_all(&mut replies, error.clone());
             jobs.close();
             fail_queued(&mut jobs, &error);
             let _ = failure.send(error);
             break;
+        }
+        if generator
+            .as_ref()
+            .is_none_or(|loaded| loaded.active_requests() == 0)
+        {
+            display.idle();
         }
 
         if let Some(parked_owner) = parked.take() {
@@ -954,7 +1136,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
                         generator = Some(loaded);
                         *lifecycle.lock().expect("lifecycle mutex poisoned") =
                             LifecycleState::Loaded;
-                        hold_job(&mut waiting, *job);
+                        hold_job(&mut waiting, *job, &mut display);
                     }
                     Err((owner, error)) => {
                         parked = Some(owner);
@@ -986,7 +1168,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
                     generator = Some(loaded);
                     *lifecycle.lock().expect("lifecycle mutex poisoned") = LifecycleState::Loaded;
                     match job {
-                        Job::Chat(job) => hold_job(&mut waiting, *job),
+                        Job::Chat(job) => hold_job(&mut waiting, *job, &mut display),
                         Job::Admin(job) => {
                             debug_assert_eq!(job.kind, AdminKind::Load);
                             let _ = job.reply.send(AdminReply::Loaded {
@@ -1020,7 +1202,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
         if loaded.active_requests() == 0 && waiting.is_empty() && held_admin.is_none() && jobs_open
         {
             match jobs.blocking_recv() {
-                Some(Job::Chat(job)) => hold_job(&mut waiting, *job),
+                Some(Job::Chat(job)) => hold_job(&mut waiting, *job, &mut display),
                 Some(Job::Admin(job)) => held_admin = Some(job),
                 None => jobs_open = false,
             }
@@ -1030,7 +1212,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
             && loaded.active_requests() + waiting.len() < loaded.slot_capacity()
         {
             match jobs.try_recv() {
-                Ok(Job::Chat(job)) => hold_job(&mut waiting, *job),
+                Ok(Job::Chat(job)) => hold_job(&mut waiting, *job, &mut display),
                 Ok(Job::Admin(job)) => held_admin = Some(job),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -1040,9 +1222,10 @@ fn serve_reloadable<G: ReloadableGenerator>(
             }
         }
         if !waiting.is_empty() {
-            admit_group(loaded, &mut replies, &mut waiting);
+            admit_group(loaded, &mut replies, &mut waiting, &mut display);
         }
         if loaded.active_requests() == 0 {
+            display.idle();
             if let Some(admin) = held_admin.take() {
                 match admin.kind {
                     AdminKind::Unload => {
@@ -1103,9 +1286,11 @@ fn serve_reloadable<G: ReloadableGenerator>(
             break;
         }
 
+        display.decode(loaded.active_requests());
         let events = match loaded.step() {
             Ok(events) => events,
             Err(error) => {
+                display.clear();
                 let error = error.to_string();
                 fail_all(&mut replies, error.clone());
                 jobs.close();
@@ -1114,6 +1299,11 @@ fn serve_reloadable<G: ReloadableGenerator>(
                 break;
             }
         };
+        let outputs = events.iter().map(|event| event.steps().count()).sum();
+        display.observe_outputs(outputs);
+        if events.iter().any(|event| event.completed().is_some()) {
+            display.clear();
+        }
         for event in events.iter() {
             let request_id = event.request_id();
             let failed = replies.get_mut(&request_id).is_some_and(|reply| {
@@ -1150,6 +1340,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
             }
         }
     }
+    display.idle();
 }
 
 fn render_loading(model_id: &str, color: bool, interactive: bool) -> String {
@@ -1220,6 +1411,44 @@ fn render_weight_progress(
         gibibytes(submitted_bytes),
         gibibytes(total_bytes),
     )
+}
+
+fn render_inference_progress(
+    phase: InferencePhase,
+    active: usize,
+    rounds: usize,
+    output_tokens: usize,
+    spinner_tick: usize,
+    color: bool,
+) -> String {
+    const FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+    let frame = FRAMES[spinner_tick % FRAMES.len()];
+    let (label, detail) = match phase {
+        InferencePhase::Prefill => {
+            let suffix = if active == 1 { "" } else { "s" };
+            ("PREFILL", format!("{active} request{suffix}"))
+        }
+        InferencePhase::Decode => (
+            "DECODE",
+            format!("B={active} · {rounds} rounds · {output_tokens} output tok"),
+        ),
+    };
+    let (active_color, reset) = if color {
+        ("\x1b[1;36m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    format!("\r\x1b[2K{active_color}{label}{reset} {frame}       {detail}…")
+}
+
+fn render_shutdown(interactive: bool, color: bool) -> String {
+    let (stopping, reset) = if color {
+        ("\x1b[1;33m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    let clear = if interactive { "\r\x1b[2K" } else { "" };
+    format!("{clear}{stopping}STOPPING{reset}       interrupt received · draining connections…\n")
 }
 
 fn clear_progress_line(output: &mut impl IoWrite, interactive: bool) -> std::io::Result<()> {
@@ -1306,8 +1535,9 @@ fn mebibytes(bytes: usize) -> f64 {
     bytes as f64 / (1_u64 << 20) as f64
 }
 
-fn hold_job(waiting: &mut Vec<ChatJob>, job: ChatJob) {
+fn hold_job(waiting: &mut Vec<ChatJob>, job: ChatJob, display: &mut InferenceDisplay) {
     if job.reply.is_closed() {
+        display.clear();
         job.log.finish(None, 0, 0, "cancelled", None);
         return;
     }
@@ -1318,9 +1548,12 @@ fn admit_group<G: TextGenerator>(
     generator: &mut G,
     replies: &mut HashMap<ResidentRequestId, ActiveReply>,
     waiting: &mut Vec<ChatJob>,
+    display: &mut InferenceDisplay,
 ) {
+    display.prefill(waiting.len());
     let requests = waiting.iter().map(|job| &job.request).collect::<Vec<_>>();
     let admissions = generator.admit_batch(&requests);
+    display.clear();
     debug_assert_eq!(admissions.len(), waiting.len());
     for (job, admission) in waiting.drain(..).zip(admissions) {
         record_admission(replies, job, admission);
@@ -1376,6 +1609,7 @@ fn record_admission(
 fn cancel_disconnected<G: TextGenerator>(
     generator: &mut G,
     replies: &mut HashMap<ResidentRequestId, ActiveReply>,
+    display: &mut InferenceDisplay,
 ) -> Result<(), String> {
     let cancelled = generator
         .active_request_ids()
@@ -1385,6 +1619,9 @@ fn cancel_disconnected<G: TextGenerator>(
                 .is_none_or(|reply| reply.sender.as_ref().is_none_or(Sender::is_closed))
         })
         .collect::<Vec<_>>();
+    if !cancelled.is_empty() {
+        display.clear();
+    }
     for request in cancelled {
         let reply = replies.remove(&request);
         match generator.cancel(request) {
@@ -1979,12 +2216,13 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, ChatJob, EnqueueError, Job, LifecycleState,
+        AppState, ChatJob, EnqueueError, InferencePhase, Job, LifecycleState,
         QWEN38_FLASH_NEXT_SERVED_REASONING_EFFORT, Ready, ServerConfig, ServerError, ServerModel,
         chat_completions, completion_id, enqueue_chat_job, fail_queued, health, load, models,
-        readiness, record_admission, render_loading, render_startup, render_weight_progress,
-        router, run, serve_reloadable, serve_until_worker_failure, try_send_generation_steps,
-        unload,
+        readiness, record_admission, render_inference_progress, render_loading, render_shutdown,
+        render_startup, render_weight_progress, router, run, serve_reloadable,
+        serve_until_worker_failure, serve_until_worker_failure_or_shutdown,
+        try_send_generation_steps, unload,
     };
     use crate::text_generator::{GenerationEvent, GenerationEvents, TextGenerator};
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
@@ -2395,6 +2633,8 @@ mod tests {
                 listener,
                 router(state(jobs, true)),
                 failure_rx,
+                false,
+                false,
             ));
             failure_tx.send("device launch failed".into()).unwrap();
             let error = serve.await.unwrap().unwrap_err();
@@ -2410,6 +2650,8 @@ mod tests {
                 listener,
                 router(state(jobs, true)),
                 failure_rx,
+                false,
+                false,
             ));
             drop(failure_tx);
             let error = serve.await.unwrap().unwrap_err();
@@ -2419,6 +2661,46 @@ mod tests {
                 "resident engine worker failed: resident engine worker exited"
             );
         });
+    }
+
+    #[test]
+    fn explicit_shutdown_gracefully_stops_the_listener() {
+        runtime().block_on(async {
+            let (jobs, _receiver) = channel(1);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (_failure_tx, failure_rx) = tokio::sync::oneshot::channel::<String>();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let serve = tokio::spawn(serve_until_worker_failure_or_shutdown(
+                listener,
+                router(state(jobs, true)),
+                failure_rx,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            ));
+
+            shutdown_tx.send(()).unwrap();
+            serve.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn interactive_inference_and_shutdown_lines_are_terminal_only() {
+        let prefill = render_inference_progress(InferencePhase::Prefill, 2, 0, 0, 0, false);
+        assert_eq!(prefill, "\r\x1b[2KPREFILL ⠋       2 requests…");
+
+        let decode = render_inference_progress(InferencePhase::Decode, 3, 17, 41, 1, true);
+        assert!(decode.starts_with("\r\x1b[2K\x1b[1;36mDECODE\x1b[0m ⠙"));
+        assert!(decode.ends_with("B=3 · 17 rounds · 41 output tok…"));
+
+        let daemon = render_shutdown(false, false);
+        assert_eq!(
+            daemon,
+            "STOPPING       interrupt received · draining connections…\n"
+        );
+        let terminal = render_shutdown(true, true);
+        assert!(terminal.starts_with("\r\x1b[2K\x1b[1;33mSTOPPING\x1b[0m"));
+        assert!(terminal.ends_with("draining connections…\n"));
     }
 
     #[test]
@@ -2527,6 +2809,8 @@ mod tests {
                         })
                     }
                 },
+                false,
+                false,
             );
         });
 
@@ -2714,6 +2998,8 @@ mod tests {
                 failure,
                 worker_lifecycle,
                 || unreachable!("park/resume fixture never reloads"),
+                false,
+                false,
             );
         });
 
