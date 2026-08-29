@@ -360,26 +360,7 @@ impl ResidentMtpBatchGenerator {
                 "prompt scoring requires an idle resident scheduler",
             ));
         }
-        if token_ids.is_empty() {
-            return Err(EngineError::generation(
-                "prompt scoring requires at least one token",
-            ));
-        }
-        for (position, &token) in token_ids.iter().enumerate() {
-            if usize::try_from(token).map_or(true, |token| token >= Qwen38_27B::VOCAB) {
-                return Err(EngineError::generation(format!(
-                    "prompt scoring token {token} at position {position} is outside vocabulary 0..{}",
-                    Qwen38_27B::VOCAB
-                )));
-            }
-        }
-        if token_ids.len() > self.program.target().context_capacity() {
-            return Err(EngineError::capacity(format!(
-                "prompt scoring requires {} positions, current resident capacity is {}",
-                token_ids.len(),
-                self.program.target().context_capacity()
-            )));
-        }
+        validate_prompt_scoring_batch(&[token_ids], self.program.target().context_capacity())?;
 
         let slot = 0;
         self.prepare_kv_slot(slot, true, token_ids.len())?;
@@ -411,11 +392,139 @@ impl ResidentMtpBatchGenerator {
         }
     }
 
+    /// Scores one admitted API batch, reusing its exact longest common token prefix.
+    pub fn score_prompts(&mut self, prompts: &[Vec<u32>]) -> EngineResult<Vec<PromptLogprobs>> {
+        if self.active != 0 {
+            return Err(EngineError::capacity(
+                "prompt scoring requires an idle resident scheduler",
+            ));
+        }
+        let common =
+            validate_prompt_scoring_batch(prompts, self.program.target().context_capacity())?;
+        if prompts.len() == 1 || common == 0 {
+            return prompts
+                .iter()
+                .map(|prompt| self.score_prompt(prompt))
+                .collect();
+        }
+
+        let slot = 0;
+        let required_positions = prompts
+            .iter()
+            .map(Vec::len)
+            .max()
+            .expect("validated scoring batch is nonempty");
+        // Reclaim for the widest branch now, but publish only the exact shared boundary.
+        self.prepare_kv_slot(slot, true, required_positions)?;
+        self.program.activate_kv_slot(slot)?;
+        if let Err(error) = self
+            .program
+            .reserve_kv_slot_tokens(&self.stream, slot, common)
+        {
+            self.program.recycle_kv_slot(&self.stream, slot)?;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .program
+            .target()
+            .load_slot_routes(&self.stream, &[slot])
+        {
+            self.program.recycle_kv_slot(&self.stream, slot)?;
+            return Err(error);
+        }
+
+        let scored = self.score_prompts_with_common_prefix(prompts, common, slot);
+        let recycled = self.program.recycle_kv_slot(&self.stream, slot);
+        self.retained[slot] = None;
+        self.message_boundary_valid[slot] = false;
+        match (scored, recycled) {
+            (Ok(scored), Ok(_)) => Ok(scored),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn score_prompts_with_common_prefix(
+        &mut self,
+        prompts: &[Vec<u32>],
+        common: usize,
+        slot: usize,
+    ) -> EngineResult<Vec<PromptLogprobs>> {
+        let common_prompt = &prompts[0][..common];
+        let common_scores = self.score_token_prefix_in_slot(common_prompt, slot)?;
+        let boundary_scores = prompts
+            .iter()
+            .map(|prompt| {
+                if prompt.len() == common {
+                    score_greedy_row(&self.target_logits[target_download_row(0)])
+                } else {
+                    score_logit_row(&self.target_logits[target_download_row(0)], prompt[common])
+                }
+            })
+            .collect::<EngineResult<Vec<_>>>()?;
+        self.program.target().capture_gdn_slot(
+            &self.stream,
+            slot,
+            &mut self.message_boundary_history,
+            &mut self.message_boundary_state,
+        )?;
+
+        let mut scored = Vec::with_capacity(prompts.len());
+        for (prompt, boundary_score) in prompts.iter().zip(boundary_scores) {
+            self.program.target().restore_gdn_slot(
+                &self.stream,
+                slot,
+                &self.message_boundary_history,
+                &self.message_boundary_state,
+            )?;
+            self.program
+                .truncate_kv_slot_tokens(&self.stream, slot, common)?;
+            self.program
+                .reserve_kv_slot_tokens(&self.stream, slot, prompt.len())?;
+            self.program
+                .target()
+                .load_slot_routes(&self.stream, &[slot])?;
+
+            if prompt.len() == common {
+                scored.push(finish_prompt_logprobs(
+                    &self.frontend,
+                    prompt,
+                    common_scores.clone(),
+                    boundary_score,
+                )?);
+                continue;
+            }
+
+            let mut prompt_scores = common_scores.clone();
+            prompt_scores.push(Some(boundary_score));
+            prompt_scores.resize(prompt.len(), None);
+            let completion =
+                self.score_prompt_tail_in_slot(prompt, slot, common, &mut prompt_scores)?;
+            scored.push(finish_prompt_logprobs(
+                &self.frontend,
+                prompt,
+                prompt_scores,
+                completion,
+            )?);
+        }
+        Ok(scored)
+    }
+
     fn score_prompt_in_slot(
         &mut self,
         token_ids: &[u32],
         slot: usize,
     ) -> EngineResult<PromptLogprobs> {
+        let prompt = self.score_token_prefix_in_slot(token_ids, slot)?;
+        let completion = score_greedy_row(&self.target_logits[target_download_row(0)])?;
+        finish_prompt_logprobs(&self.frontend, token_ids, prompt, completion)
+    }
+
+    fn score_token_prefix_in_slot(
+        &mut self,
+        token_ids: &[u32],
+        slot: usize,
+    ) -> EngineResult<Vec<Option<PromptTokenLogprob>>> {
         let mut prompt = vec![None; token_ids.len()];
         let primed = token_ids.len() - 1;
         let mut cursor = 0usize;
@@ -477,22 +586,76 @@ impl ResidentMtpBatchGenerator {
             1,
             &mut self.target_logits[target_download_logits(1)],
         )?;
-        let completion = score_greedy_row(&self.target_logits[target_download_row(0)])?;
-        let mut echoed_ids = token_ids.to_vec();
-        echoed_ids.push(completion.token_id);
-        let echoed_text = self.frontend.decode(&echoed_ids, false)?;
-        let token_text = echoed_ids
-            .iter()
-            .map(|&token| self.frontend.decode(&[token], false))
-            .collect::<Result<Vec<_>, _>>()?;
+        Ok(prompt)
+    }
 
-        Ok(PromptLogprobs {
-            prompt_token_ids: token_ids.to_vec(),
-            prompt,
-            completion,
-            echoed_text,
-            token_text,
-        })
+    fn score_prompt_tail_in_slot(
+        &mut self,
+        token_ids: &[u32],
+        slot: usize,
+        mut cursor: usize,
+        prompt: &mut [Option<PromptTokenLogprob>],
+    ) -> EngineResult<PromptTokenLogprob> {
+        let primed = token_ids.len() - 1;
+        let mut cosine = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+        let mut sine = [0.0f32; MAX_NATIVE_PREFILL_TOKENS * ROTARY_PAIRS];
+
+        while let Some(tokens) = next_native_prefill_tile(primed - cursor) {
+            let rotary_values = fill_contiguous_rope(cursor, tokens, &mut cosine, &mut sine)?;
+            replay_prefill_tile(
+                &mut self.program,
+                &self.stream,
+                &token_ids[cursor..cursor + tokens],
+                slot,
+                cursor,
+                &cosine[..rotary_values],
+                &sine[..rotary_values],
+            )?;
+            for first_row in (0..tokens).step_by(MAX_BATCH) {
+                let rows = MAX_BATCH.min(tokens - first_row);
+                self.program.target().launch_prefill_lm_head_rows(
+                    &self.stream,
+                    first_row,
+                    rows,
+                    tokens,
+                )?;
+                self.program.target().read_logits_into(
+                    &self.stream,
+                    rows,
+                    &mut self.target_logits[target_download_logits(rows)],
+                )?;
+                for row_index in 0..rows {
+                    let target_position = cursor + first_row + row_index + 1;
+                    prompt[target_position] = Some(score_logit_row(
+                        &self.target_logits[target_download_row(row_index)],
+                        token_ids[target_position],
+                    )?);
+                }
+            }
+            cursor += tokens;
+        }
+
+        while cursor < primed {
+            replay_target_token(&mut self.program, &self.stream, token_ids[cursor], cursor)?;
+            self.program.target().read_logits_into(
+                &self.stream,
+                1,
+                &mut self.target_logits[target_download_logits(1)],
+            )?;
+            prompt[cursor + 1] = Some(score_logit_row(
+                &self.target_logits[target_download_row(0)],
+                token_ids[cursor + 1],
+            )?);
+            cursor += 1;
+        }
+
+        replay_target_token(&mut self.program, &self.stream, token_ids[primed], primed)?;
+        self.program.target().read_logits_into(
+            &self.stream,
+            1,
+            &mut self.target_logits[target_download_logits(1)],
+        )?;
+        score_greedy_row(&self.target_logits[target_download_row(0)])
     }
 
     /// Admits one request while reporting processed prompt tokens at existing stream boundaries.
@@ -2143,6 +2306,76 @@ fn checked_rows(label: &str, rows: usize, columns: usize) -> EngineResult<usize>
         .ok_or_else(|| EngineError::layout(format!("{label} overflows")))
 }
 
+fn validate_prompt_scoring_batch<T: AsRef<[u32]>>(
+    prompts: &[T],
+    context_capacity: usize,
+) -> EngineResult<usize> {
+    if prompts.is_empty() || prompts.len() > MAX_BATCH {
+        return Err(EngineError::capacity(format!(
+            "prompt scoring batch size {} is outside 1..={MAX_BATCH}",
+            prompts.len()
+        )));
+    }
+    for (prompt_index, prompt) in prompts.iter().enumerate() {
+        let prompt = prompt.as_ref();
+        if prompt.is_empty() {
+            return Err(EngineError::generation(format!(
+                "prompt scoring prompt {prompt_index} requires at least one token"
+            )));
+        }
+        for (position, &token) in prompt.iter().enumerate() {
+            if usize::try_from(token).map_or(true, |token| token >= Qwen38_27B::VOCAB) {
+                return Err(EngineError::generation(format!(
+                    "prompt scoring token {token} in prompt {prompt_index} at position {position} is outside vocabulary 0..{}",
+                    Qwen38_27B::VOCAB
+                )));
+            }
+        }
+        if prompt.len() > context_capacity {
+            return Err(EngineError::capacity(format!(
+                "prompt scoring prompt {prompt_index} requires {} positions, current resident capacity is {context_capacity}",
+                prompt.len()
+            )));
+        }
+    }
+
+    Ok(longest_common_token_prefix(prompts))
+}
+
+fn longest_common_token_prefix<T: AsRef<[u32]>>(prompts: &[T]) -> usize {
+    let first = prompts[0].as_ref();
+    (0..first.len())
+        .take_while(|&position| {
+            prompts[1..]
+                .iter()
+                .all(|prompt| prompt.as_ref().get(position) == Some(&first[position]))
+        })
+        .count()
+}
+
+fn finish_prompt_logprobs(
+    frontend: &TextFrontend,
+    token_ids: &[u32],
+    prompt: Vec<Option<PromptTokenLogprob>>,
+    completion: PromptTokenLogprob,
+) -> EngineResult<PromptLogprobs> {
+    let mut echoed_ids = token_ids.to_vec();
+    echoed_ids.push(completion.token_id);
+    let echoed_text = frontend.decode(&echoed_ids, false)?;
+    let token_text = echoed_ids
+        .iter()
+        .map(|&token| frontend.decode(&[token], false))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(PromptLogprobs {
+        prompt_token_ids: token_ids.to_vec(),
+        prompt,
+        completion,
+        echoed_text,
+        token_text,
+    })
+}
+
 fn score_logit_row(logits: &[u16], token_id: u32) -> EngineResult<PromptTokenLogprob> {
     let token = usize::try_from(token_id)
         .ok()
@@ -2240,8 +2473,8 @@ fn compact_hidden_row(row_index: usize) -> std::ops::Range<usize> {
 mod tests {
     use super::{
         DRAFT_HIDDEN_ROWS, DRAFT_LOGIT_ROWS, RetainedMtpSlot, RetainedReuse, TARGET_LOGIT_ROWS,
-        best_retained_prefix, score_greedy_row, score_logit_row, target_download_logits,
-        target_download_row,
+        best_retained_prefix, longest_common_token_prefix, score_greedy_row, score_logit_row,
+        target_download_logits, target_download_row, validate_prompt_scoring_batch,
     };
     use crate::MAX_BATCH;
     use crate::common::banks::row;
@@ -2274,6 +2507,36 @@ mod tests {
 
         assert_eq!(target_download_row(0), first_download);
         assert_eq!(target_download_logits(1), first_download);
+    }
+
+    #[test]
+    fn prompt_scoring_batch_plans_the_exact_longest_common_prefix() {
+        let unequal = [vec![4, 5, 6, 7], vec![4, 5, 8], vec![4, 5, 6, 9, 10]];
+        let identical = [vec![4, 5, 6], vec![4, 5, 6]];
+        let disjoint = [vec![4, 5], vec![6, 5]];
+
+        assert_eq!(longest_common_token_prefix(&unequal), 2);
+        assert_eq!(longest_common_token_prefix(&identical), 3);
+        assert_eq!(longest_common_token_prefix(&disjoint), 0);
+        assert_eq!(validate_prompt_scoring_batch(&unequal, 8).unwrap(), 2);
+    }
+
+    #[test]
+    fn prompt_scoring_batch_rejects_every_invalid_admission_before_planning() {
+        let empty: [Vec<u32>; 0] = [];
+        assert!(validate_prompt_scoring_batch(&empty, 8).is_err());
+
+        let too_many = vec![vec![0]; MAX_BATCH + 1];
+        assert!(validate_prompt_scoring_batch(&too_many, 8).is_err());
+
+        let empty_prompt = [vec![0], vec![]];
+        assert!(validate_prompt_scoring_batch(&empty_prompt, 8).is_err());
+
+        let invalid_token = [vec![0], vec![Qwen38_27B::VOCAB as u32]];
+        assert!(validate_prompt_scoring_batch(&invalid_token, 8).is_err());
+
+        let too_long = [vec![0, 1, 2]];
+        assert!(validate_prompt_scoring_batch(&too_long, 2).is_err());
     }
 
     #[test]

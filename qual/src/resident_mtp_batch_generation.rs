@@ -770,6 +770,42 @@ mod tests {
 
     #[test]
     #[ignore = "requires the admitted source snapshot and an exclusive RTX 5090"]
+    fn resident_mtp_batch_suite_shared_prefix_scoring_matches_independent_scoring() {
+        let _preflight = crate::device_benchmark::preflight().unwrap();
+        let root = std::env::var_os("TUISKO_SNAPSHOT")
+            .expect("TUISKO_SNAPSHOT must name the admitted snapshot");
+        let snapshot = Arc::new(
+            CheckpointSnapshot::<Qwen38_27B>::open(Path::new(&root))
+                .expect("snapshot must be admitted"),
+        );
+        let context = CudaContext::new(0).unwrap();
+        let mut generator = ResidentMtpBatchGenerator::from_snapshot(&context, snapshot).unwrap();
+
+        for common in [31, 32, 33, 63, 64, 65, 127, 128, 129, 1023, 1024, 1025] {
+            let prefix = (0..common)
+                .map(|position| 100 + u32::try_from(position % 1_000).unwrap())
+                .collect::<Vec<_>>();
+            let mut one_token_suffix = prefix.clone();
+            one_token_suffix.push(2_001);
+            let mut unequal_suffix = prefix.clone();
+            unequal_suffix.extend([2_002, 2_003, 2_004]);
+            let prompts = vec![prefix.clone(), prefix, one_token_suffix, unequal_suffix];
+
+            let shared = generator.score_prompts(&prompts).unwrap();
+            let independent = prompts
+                .iter()
+                .map(|prompt| generator.score_prompt(prompt).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                shared, independent,
+                "shared-prefix scoring differed at common length {common}"
+            );
+        }
+        crate::device_benchmark::require_current_process_exclusive().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the admitted source snapshot and an exclusive RTX 5090"]
     fn resident_mtp_batch_suite_reclaims_inactive_pages_before_refusing_capacity() {
         let _preflight = crate::device_benchmark::preflight().unwrap();
         let root = std::env::var_os("TUISKO_SNAPSHOT")
