@@ -33,24 +33,59 @@ during active generation returns a retryable capacity error.
 
 ## lm-eval smoke run
 
-Use the exact pinned checkpoint tokenizer and tokenized requests. Start with a small limit because
-multiple-choice tasks score every answer alternative:
+Use the exact pinned checkpoint tokenizer and tokenized requests. The verified lean environment is
+lm-evaluation-harness 0.4.12 with its API dependencies and tokenizer-only Transformers support;
+PyTorch is not required because the Rust server owns inference:
 
 ```bash
-lm_eval \
+python3 -m venv target/lm-eval-venv
+target/lm-eval-venv/bin/python -m pip install \
+  'lm_eval[api]==0.4.12' 'transformers==5.16.1'
+```
+
+The harness writes task data and tokenizer metadata through the Hugging Face cache. Keep that cache
+under the ignored `target/` tree when the global cache is read-only or when evaluation artifacts
+must remain worktree-local:
+
+```bash
+export HF_HOME="$PWD/target/lm-eval-hf"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+```
+
+Stage the tokenizer and HellaSwag before loading the resident model. This avoids holding the GPU
+while the harness downloads or prepares host-only inputs:
+
+```bash
+target/lm-eval-venv/bin/python - <<'PY'
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+revision = "16b6615af3548b88e2d8e382457bc705b00479cf"
+AutoTokenizer.from_pretrained("unsloth/Qwen3.8-27B-NVFP4", revision=revision)
+load_dataset("Rowan/hellaswag")
+PY
+```
+
+Then start the server and begin with one example. Multiple-choice tasks score every answer
+alternative, so one HellaSwag example produces four prompt-scoring requests:
+
+```bash
+target/lm-eval-venv/bin/lm_eval run \
   --model local-completions \
   --model_args model=unsloth/Qwen3.8-27B-NVFP4,base_url=http://127.0.0.1:8000/v1/completions,tokenizer=unsloth/Qwen3.8-27B-NVFP4,revision=16b6615af3548b88e2d8e382457bc705b00479cf,tokenizer_backend=huggingface,tokenized_requests=true,max_length=220000,num_concurrent=1 \
   --tasks hellaswag \
   --batch_size 4 \
-  --limit 10 \
+  --limit 1 \
   --log_samples \
-  --output_path target/lm-eval/hellaswag-smoke
+  --output_path target/lm-eval/hellaswag-smoke-limit-1
 ```
 
 Keep `num_concurrent=1`: one HTTP scoring job may carry up to eight prompts, while concurrent
 jobs would contend for the one scoring scratch slot. Full MMLU and HellaSwag runs contain tens of
-thousands of alternative prompts and can take hours; establish a measured examples/second rate
-with `--limit 10`, then `--limit 100`, before scheduling a full suite.
+thousands of alternative prompts and can take hours. A limited result proves plumbing only; its
+accuracy is not evaluation authority. On an exclusive GPU, establish a measured examples/second
+rate with `--limit 10`, then `--limit 100`, before scheduling a full suite. On a shared GPU, keep
+the cases sequential and bounded, then stop the server promptly to release resident memory.
 
 Generation-only tasks continue to use `local-chat-completions` and
 `http://127.0.0.1:8000/v1/chat/completions`.
