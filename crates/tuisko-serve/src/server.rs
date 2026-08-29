@@ -822,6 +822,9 @@ fn serve_requests<G: TextGenerator>(
         for event in events.iter() {
             let request_id = event.request_id();
             let failed = replies.get_mut(&request_id).is_some_and(|reply| {
+                if let Some((accepted, proposed)) = event.mtp_acceptance() {
+                    reply.log.observe_mtp_acceptance(accepted, proposed);
+                }
                 if event.steps().any(|step| step.delta.is_some()) {
                     reply.log.observe_output();
                 }
@@ -1114,6 +1117,9 @@ fn serve_reloadable<G: ReloadableGenerator>(
         for event in events.iter() {
             let request_id = event.request_id();
             let failed = replies.get_mut(&request_id).is_some_and(|reply| {
+                if let Some((accepted, proposed)) = event.mtp_acceptance() {
+                    reply.log.observe_mtp_acceptance(accepted, proposed);
+                }
                 if event.steps().any(|step| step.delta.is_some()) {
                     reply.log.observe_output();
                 }
