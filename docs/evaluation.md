@@ -25,9 +25,10 @@ target/lm-eval-venv/bin/python scripts/lm_eval_tuisko_native.py \
 
 The adapter uses lm-eval's exact concatenated context/continuation tokenization rule, including
 moving trailing context spaces across the token boundary and using the tokenizer EOS token for an
-empty text context. Rolling-loglikelihood and generation tasks fail with an explicit unsupported
-operation; use the chat adapter for generation. The existing `/v1/completions` scoring subset
-below remains available as a compatibility path.
+empty text context. It ignores lm-eval's local device hint because inference is owned by the HTTP
+server. Rolling-loglikelihood and generation tasks fail with an explicit unsupported operation;
+use the chat adapter for generation. The existing `/v1/completions` scoring subset below remains
+available as a compatibility path.
 
 TuiskoLLM exposes a scoring-only subset of `POST /v1/completions` for the
 `local-completions` adapter in lm-evaluation-harness. This is separate from generation, which
