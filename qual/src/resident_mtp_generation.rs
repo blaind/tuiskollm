@@ -12,6 +12,23 @@ use tuisko_gpu::{CudaContext, GpuError, device_memory_info};
 use tuisko_model::{CheckpointError, CheckpointSnapshot, Qwen38_27B};
 
 const LIMIT_CASES: [usize; 4] = [2, 3, 4, 8];
+const QUALITY_CASES: [(&str, &str, usize); 3] = [
+    (
+        "factual",
+        "In one sentence, state the capital of Finland and name its country.",
+        16,
+    ),
+    (
+        "structured",
+        "List the first six prime numbers separated only by commas.",
+        24,
+    ),
+    (
+        "unicode",
+        "Translate the English word snow to Finnish. Reply with only the translation.",
+        12,
+    ),
+];
 
 /// Failure of the exact greedy target-plus-MTP generation gate.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +57,8 @@ pub struct ResidentMtpGenerationQualification {
     pub source_owner_suites: usize,
     /// Complete target-only outputs compared with MTP outputs.
     pub fallback_cases: usize,
+    /// Factual, structured, Unicode, and multi-turn comparisons beyond route selection.
+    pub quality_cases: usize,
     /// K=1,2,3,4 target verification routes observed.
     pub verification_routes: [usize; 4],
     /// Draft proposals evaluated across all cases.
@@ -74,11 +93,14 @@ pub fn qualify_resident_mtp_generation(
             "device zero is not compute capability 12.0".to_string(),
         ));
     }
-    let requests = LIMIT_CASES.map(greedy_request);
+    let mut requests = LIMIT_CASES.map(greedy_request).to_vec();
+    requests.extend(quality_requests());
     let mut baseline = ResidentTextGenerator::from_snapshot(&context, snapshot.clone())?;
-    let mut expected = Vec::with_capacity(LIMIT_CASES.len());
-    for request in &requests {
-        expected.push(run_target(&mut baseline, request)?);
+    let mut expected = Vec::with_capacity(requests.len());
+    for (case, request) in requests.iter().enumerate() {
+        let output = run_target(&mut baseline, request)?;
+        validate_quality_output(case_label(case), &output.text)?;
+        expected.push(output);
     }
     drop(baseline);
 
@@ -107,14 +129,22 @@ pub fn qualify_resident_mtp_generation(
     let mut streaming_steps = 0;
     for (case, (request, expected)) in requests.iter().zip(&expected).enumerate() {
         let (actual, stats, steps) = run_mtp(&mut generator, request)?;
-        compare_output(LIMIT_CASES[case], expected, &actual)?;
-        let required_route = LIMIT_CASES[case].saturating_sub(2).min(3);
-        if stats.verification_routes[required_route] == 0 {
-            return Err(ResidentMtpGenerationQualificationError::Mismatch(format!(
-                "max_new_tokens={} did not select target verification K={}",
-                LIMIT_CASES[case],
-                required_route + 1
-            )));
+        let route_limit = LIMIT_CASES.get(case).copied();
+        compare_output(
+            case_label(case),
+            request.max_new_tokens,
+            route_limit.is_some(),
+            expected,
+            &actual,
+        )?;
+        if let Some(limit) = route_limit {
+            let required_route = limit.saturating_sub(2).min(3);
+            if stats.verification_routes[required_route] == 0 {
+                return Err(ResidentMtpGenerationQualificationError::Mismatch(format!(
+                    "max_new_tokens={limit} did not select target verification K={}",
+                    required_route + 1
+                )));
+            }
         }
         for (total, count) in routes.iter_mut().zip(stats.verification_routes) {
             *total += count;
@@ -138,7 +168,8 @@ pub fn qualify_resident_mtp_generation(
 
     Ok(ResidentMtpGenerationQualification {
         source_owner_suites: 1,
-        fallback_cases: LIMIT_CASES.len(),
+        fallback_cases: requests.len(),
+        quality_cases: requests.len() - LIMIT_CASES.len(),
         verification_routes: routes,
         draft_proposals,
         accepted_drafts,
@@ -158,6 +189,47 @@ fn greedy_request(maximum_new_tokens: usize) -> ChatGenerationRequest {
     request.sampling = SamplingOptions::greedy();
     request.max_new_tokens = maximum_new_tokens;
     request
+}
+
+fn quality_requests() -> Vec<ChatGenerationRequest> {
+    let mut requests = QUALITY_CASES
+        .map(|(_, prompt, maximum_new_tokens)| {
+            quality_request(vec![ChatMessage::new("user", prompt)], maximum_new_tokens)
+        })
+        .to_vec();
+    requests.push(quality_request(
+        vec![
+            ChatMessage::new("user", "Name one primary color."),
+            ChatMessage::new("assistant", "Blue."),
+            ChatMessage::new(
+                "user",
+                "Name a different primary color and explain the choice in one short sentence.",
+            ),
+        ],
+        24,
+    ));
+    requests
+}
+
+fn quality_request(messages: Vec<ChatMessage>, maximum_new_tokens: usize) -> ChatGenerationRequest {
+    let mut request = ChatGenerationRequest::new(messages);
+    request.template = ChatTemplateOptions {
+        enable_thinking: Some(false),
+        ..ChatTemplateOptions::default()
+    };
+    request.sampling = SamplingOptions::greedy();
+    request.max_new_tokens = maximum_new_tokens;
+    request
+}
+
+fn case_label(case: usize) -> &'static str {
+    if case < LIMIT_CASES.len() {
+        "route"
+    } else if case - LIMIT_CASES.len() < QUALITY_CASES.len() {
+        QUALITY_CASES[case - LIMIT_CASES.len()].0
+    } else {
+        "multi-turn"
+    }
 }
 
 fn run_target(
@@ -198,7 +270,9 @@ fn run_mtp(
 }
 
 fn compare_output(
+    label: &str,
     maximum_new_tokens: usize,
+    require_length: bool,
     expected: &GeneratedText,
     actual: &GeneratedText,
 ) -> Result<(), ResidentMtpGenerationQualificationError> {
@@ -207,11 +281,40 @@ fn compare_output(
         || actual.token_ids != expected.token_ids
         || actual.text != expected.text
         || actual.finish_reason != expected.finish_reason
-        || actual.finish_reason != FinishReason::Length
+        || require_length && actual.finish_reason != FinishReason::Length
     {
         return Err(ResidentMtpGenerationQualificationError::Mismatch(format!(
-            "max_new_tokens={maximum_new_tokens} differs from the target-only fallback: target={:?}/{:?}, MTP={:?}/{:?}",
-            expected.token_ids, expected.finish_reason, actual.token_ids, actual.finish_reason
+            "{label} max_new_tokens={} differs from the target-only fallback: target={:?}/{:?}, MTP={:?}/{:?}",
+            maximum_new_tokens,
+            expected.token_ids,
+            expected.finish_reason,
+            actual.token_ids,
+            actual.finish_reason
+        )));
+    }
+    Ok(())
+}
+
+fn validate_quality_output(
+    label: &str,
+    text: &str,
+) -> Result<(), ResidentMtpGenerationQualificationError> {
+    let trimmed = text.trim();
+    let lowercase = trimmed.to_lowercase();
+    let valid = match label {
+        "route" => true,
+        "factual" => lowercase.contains("helsinki") && lowercase.contains("finland"),
+        "structured" => trimmed
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .eq("2,3,5,7,11,13".chars()),
+        "unicode" => lowercase == "lumi",
+        "multi-turn" => lowercase.contains("red") || lowercase.contains("yellow"),
+        _ => false,
+    };
+    if !valid {
+        return Err(ResidentMtpGenerationQualificationError::Mismatch(format!(
+            "{label} target-only quality answer was not semantically acceptable: {text:?}"
         )));
     }
     Ok(())
@@ -238,13 +341,28 @@ fn verify_owner(
 
 #[cfg(test)]
 mod tests {
-    use super::LIMIT_CASES;
+    use super::{
+        LIMIT_CASES, QUALITY_CASES, case_label, quality_requests, validate_quality_output,
+    };
     use std::path::Path;
 
     #[test]
     fn resident_mtp_generation_suite_inventory_is_exact() {
         assert_eq!(LIMIT_CASES, [2, 3, 4, 8]);
         assert_eq!(LIMIT_CASES.map(|limit| (limit - 1).min(4)), [1, 2, 3, 4]);
+        let quality = quality_requests();
+        assert_eq!(quality.len(), QUALITY_CASES.len() + 1);
+        assert_eq!(quality.last().unwrap().messages.len(), 3);
+        assert_eq!(case_label(LIMIT_CASES.len()), "factual");
+        assert_eq!(
+            case_label(LIMIT_CASES.len() + quality.len() - 1),
+            "multi-turn"
+        );
+        assert!(validate_quality_output("factual", "Helsinki is the capital of Finland.").is_ok());
+        assert!(validate_quality_output("structured", "2, 3, 5, 7, 11, 13").is_ok());
+        assert!(validate_quality_output("unicode", "Lumi\n").is_ok());
+        assert!(validate_quality_output("multi-turn", "Red is another primary color.").is_ok());
+        assert!(validate_quality_output("structured", "2,3,5,7,11").is_err());
     }
 
     #[test]
@@ -254,7 +372,8 @@ mod tests {
             .expect("TUISKO_SNAPSHOT must name the admitted snapshot");
         let report = super::qualify_resident_mtp_generation(Path::new(&root)).unwrap();
         assert_eq!(report.source_owner_suites, 1);
-        assert_eq!(report.fallback_cases, 4);
+        assert_eq!(report.fallback_cases, 8);
+        assert_eq!(report.quality_cases, 4);
         assert!(report.verification_routes.iter().all(|&routes| routes > 0));
         assert!(report.draft_proposals > 0);
         assert!(report.streaming_steps >= 8);

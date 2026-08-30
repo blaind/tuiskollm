@@ -17,6 +17,9 @@ const LONG_CONTEXT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const LONG_CONTEXT_COMPLETION_TOKENS: usize = 4;
 const LONG_CONTEXTS: [usize; 4] = [4_096, 16_384, 65_536, 178_000];
 const LONG_CONTEXT_CONCURRENT_TARGET: usize = 65_536;
+const LONG_CONTEXT_NEEDLES: [&str; 8] = [
+    "amber", "cobalt", "jade", "violet", "scarlet", "silver", "coral", "indigo",
+];
 const OVER_CAPACITY_TARGET: usize = 220_160;
 const RESIDENT_CONTEXT_CAPACITY: usize = 220_000;
 const PROMPT: &str = "Reply with exactly the word blue.";
@@ -412,7 +415,9 @@ impl Qualification {
     }
 
     fn run_long_context_case(&mut self, target: usize) -> Result<()> {
-        let messages = long_context_messages(0x10_0000 + target, target - 32);
+        let nonce = 0x10_0000 + target;
+        let needle = long_context_needle(nonce);
+        let messages = long_context_messages(nonce, target - 32);
         let fresh = self.client.streaming_request(
             request_with_messages(messages.clone(), true, LONG_CONTEXT_COMPLETION_TOKENS),
             &format!("fresh {target}-token long-context stream"),
@@ -420,8 +425,11 @@ impl Qualification {
         self.long_context_requests += 1;
         self.check_long_context_usage(&fresh, target, None)?;
         self.check(
-            !fresh.content.is_empty(),
-            format!("fresh {target}-token long-context stream returned empty content"),
+            exact_word(&fresh.content, needle),
+            format!(
+                "fresh {target}-token long-context stream returned {:?}, expected exact needle {needle:?}",
+                fresh.content
+            ),
         )?;
 
         let followup = long_context_followup(&messages, &fresh.content)?;
@@ -432,8 +440,11 @@ impl Qualification {
         self.long_context_requests += 1;
         self.check_long_context_usage(&reused, target, Some(fresh.usage.prompt_tokens))?;
         self.check(
-            !reused.content.is_empty(),
-            format!("reused {target}-token long-context completion returned empty content"),
+            exact_word(&reused.content, "green"),
+            format!(
+                "reused {target}-token long-context completion returned {:?}, expected exact word \"green\"",
+                reused.content
+            ),
         )
     }
 
@@ -452,11 +463,15 @@ impl Qualification {
         .into_iter()
         .enumerate()
         {
+            let needle = long_context_needle(0x20_0000 + lane);
             self.long_context_requests += 1;
             self.check_long_context_usage(&completion, LONG_CONTEXT_CONCURRENT_TARGET, None)?;
             self.check(
-                !completion.content.is_empty(),
-                format!("concurrent 65K lane {lane} returned empty content"),
+                exact_word(&completion.content, needle),
+                format!(
+                    "concurrent 65K lane {lane} returned {:?}, expected exact needle {needle:?}",
+                    completion.content
+                ),
             )?;
         }
         Ok(())
@@ -584,11 +599,17 @@ fn concurrent_messages(
 }
 
 fn long_context_messages(nonce: usize, repeated_tokens: usize) -> Value {
+    let needle = long_context_needle(nonce);
     let content = format!(
-        "{nonce:016x} begin unique qualification prompt.{}",
+        "{nonce:016x} begin unique qualification prompt. The password is {needle}. Remember it.{} What is the password? Reply with exactly the password and nothing else.",
         " blue".repeat(repeated_tokens)
     );
     json!([{"role": "user", "content": content}])
+}
+
+fn long_context_needle(nonce: usize) -> &'static str {
+    let mixed = nonce ^ nonce.rotate_right(7) ^ nonce.rotate_left(11);
+    LONG_CONTEXT_NEEDLES[mixed % LONG_CONTEXT_NEEDLES.len()]
 }
 
 fn long_context_followup(messages: &Value, assistant: &str) -> Result<Value> {
@@ -615,6 +636,10 @@ fn same_completion_semantics(left: &Completion, right: &Completion) -> bool {
         && left.usage.prompt_tokens == right.usage.prompt_tokens
         && left.usage.completion_tokens == right.usage.completion_tokens
         && left.usage.total_tokens == right.usage.total_tokens
+}
+
+fn exact_word(content: &str, expected: &str) -> bool {
+    content.trim().eq_ignore_ascii_case(expected)
 }
 
 fn expect_status(
@@ -995,9 +1020,9 @@ fn expect_str_value(value: Option<&Value>, label: &str, expected: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        Completion, LONG_CONTEXTS, Options, QualError, Usage, long_context_followup,
-        long_context_messages, parse_capacity_refusal, parse_sse, same_completion_semantics,
-        validate_blocking, validate_invalid_request, validate_stream,
+        Completion, LONG_CONTEXTS, Options, QualError, Usage, exact_word, long_context_followup,
+        long_context_messages, long_context_needle, parse_capacity_refusal, parse_sse,
+        same_completion_semantics, validate_blocking, validate_invalid_request, validate_stream,
     };
     use serde_json::json;
 
@@ -1095,16 +1120,27 @@ mod tests {
         assert_eq!(LONG_CONTEXTS, [4_096, 16_384, 65_536, 178_000]);
         let first = long_context_messages(7, 4);
         let second = long_context_messages(8, 4);
+        let needle = long_context_needle(7);
         assert_eq!(first[0]["role"], "user");
         assert_eq!(
             first[0]["content"],
-            "0000000000000007 begin unique qualification prompt. blue blue blue blue"
+            format!(
+                "0000000000000007 begin unique qualification prompt. The password is {needle}. Remember it. blue blue blue blue What is the password? Reply with exactly the password and nothing else."
+            )
         );
         assert_ne!(first, second);
         let followup = long_context_followup(&first, "blue").unwrap();
         assert_eq!(followup[0], first[0]);
         assert_eq!(followup[1], json!({"role": "assistant", "content": "blue"}));
         assert_eq!(followup[2]["role"], "user");
+    }
+
+    #[test]
+    fn long_context_semantic_answers_are_exact_words() {
+        assert!(exact_word(" amber\n", "amber"));
+        assert!(exact_word("AMBER", "amber"));
+        assert!(!exact_word("The password is amber.", "amber"));
+        assert_ne!(long_context_needle(7), long_context_needle(8));
     }
 
     #[test]

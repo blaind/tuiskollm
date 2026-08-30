@@ -201,6 +201,27 @@ the server lifecycle separately before relying on unattended multi-subject runs.
 Generation-only tasks continue to use `local-chat-completions` and
 `http://127.0.0.1:8000/v1/chat/completions`.
 
+### Product text-quality qualification
+
+The MTP greedy gate compares complete prompt IDs, rendered prompts, output token IDs, decoded text,
+and finish reasons with the target-only resident generator. Its route inventory forces K=1..4,
+then a separate matrix covers factual, structured, Unicode, and multi-turn prompts with longer
+outputs. Those target-only answers must first satisfy case-specific semantic assertions; MTP must
+then reproduce them exactly. The compact MTP gate independently covers B=1..8, sampled lanes,
+retained-prefix restores, divergent fallbacks, and cancellation/recycling.
+
+The long-context server gate embeds a deterministic password near the beginning of every 4K, 16K,
+65K, and 178K prompt and requires the exact password at the end. Both concurrent 65K lanes carry
+independent passwords. Each reused follow-up must report at least the full preceding prompt as
+cached and return its separately requested exact word. These are deterministic retrieval and state
+continuity checks, not a broad long-context knowledge benchmark or perplexity measurement.
+
+```bash
+cargo run -p xtask -- qualify-generation-mtp-greedy "$TUISKO_SNAPSHOT"
+cargo run -p xtask -- qualify-generation-mtp-batch "$TUISKO_SNAPSHOT"
+cargo run -p xtask -- qualify-server-long-context "$TUISKO_SNAPSHOT"
+```
+
 Every admitted scoring request emits a content-free terminal log after success or failure. The
 line reports the request ID, batch size, total prompt and output-token counts, prompt-length range,
 common-prefix length, queue and scoring durations, scoring throughput, total latency, and route.
