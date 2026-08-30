@@ -237,6 +237,11 @@ complete source, device, driver, toolchain, resource, executable, and PTX identi
 copy verified immutable artifacts from another registered worktree; it never shares a mutable
 Cargo target directory.
 
+Direct `bench-*` and profiling commands use the same exact-input build receipt. A matching receipt
+proves that the complete SM120 resource audit already passed for the verified executable and PTX;
+these commands therefore proceed to their device preflight without rerunning that unrelated audit.
+`build-sm120` remains the explicit command that reruns the complete product resource audit.
+
 ## Profiling
 
 Profile only the production owner or CUDA Graph after allocation and warmup. Nsight Systems is the

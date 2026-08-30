@@ -1921,8 +1921,48 @@ fn build_sm120(root: &Path) -> Result<(), Box<dyn Error>> {
 
 fn build_sm120_for_performance(root: &Path) -> Result<(), Box<dyn Error>> {
     require_performance_device_idle()?;
-    build_sm120(root)?;
+    let device_inputs = perf_artifact::device_input_sha256(root)?;
+    let resource_baselines =
+        perf_artifact::resource_baselines_sha256(root, SM120_RESOURCE_BASELINES)?;
+    let local_current = perf_artifact::local_build_is_current(
+        root,
+        &device_inputs,
+        &resource_baselines,
+        CUDA_OXIDE_REVISION,
+    )?;
+    reuse_or_build_sm120_for_performance(
+        local_current,
+        || {
+            perf_artifact::restore_build_from_worktrees(
+                root,
+                &device_inputs,
+                &resource_baselines,
+                CUDA_OXIDE_REVISION,
+            )
+        },
+        || build_sm120(root),
+    )?;
     wait_for_device_idle()
+}
+
+fn reuse_or_build_sm120_for_performance(
+    local_current: bool,
+    restore: impl FnOnce() -> Result<Option<PathBuf>, Box<dyn Error>>,
+    build: impl FnOnce() -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    if local_current {
+        println!("reusing fully audited worktree-local SM120 benchmark artifacts");
+        return Ok(());
+    }
+    if let Some(source) = restore()? {
+        println!(
+            "restored fully audited SM120 benchmark artifacts from {}",
+            source.display()
+        );
+        return Ok(());
+    }
+
+    build()
 }
 
 /// Concatenates the resource baselines binding one benchmark's measurement
@@ -15358,8 +15398,10 @@ mod tests {
         parse_performance_iteration, parse_resources, parse_rustc_identity,
         preflight_performance_baselines, qualification_test_arguments,
         require_consumed_baseline_keys, require_count, require_registers, require_uniform_value,
-        resolve_target_output, sass_function_body, workspace_root,
+        resolve_target_output, reuse_or_build_sm120_for_performance, sass_function_body,
+        workspace_root,
     };
+    use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::ffi::{OsStr, OsString};
 
@@ -16213,6 +16255,37 @@ mod tests {
             error.to_string(),
             "remote execution requires `cargo run -p xtask --features remote -- remote ...`"
         );
+    }
+
+    #[test]
+    fn performance_build_receipts_skip_the_complete_rebuild_and_audit() {
+        let restore_called = Cell::new(false);
+        let build_called = Cell::new(false);
+        reuse_or_build_sm120_for_performance(
+            true,
+            || {
+                restore_called.set(true);
+                Ok(None)
+            },
+            || {
+                build_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!restore_called.get());
+        assert!(!build_called.get());
+
+        reuse_or_build_sm120_for_performance(
+            false,
+            || Ok(Some("/verified-sibling".into())),
+            || {
+                build_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!build_called.get());
     }
 
     /// Every canonical `bench-device` subcommand must reach the handler that
