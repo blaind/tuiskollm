@@ -19,6 +19,8 @@ use tuisko_model::{CheckpointSnapshot, Qwen38_27B};
 
 const OUTPUT_TOKENS: usize = 8;
 const SCORING_BATCH: u32 = 4;
+const CANCELLATION_METRIC: &str = "qwen3_8/generation/cancellation_resume";
+const COMPLETION_FALLBACK_METRIC: &str = "qwen3_8/generation/completed_prefix_fallback";
 const SHARED_SCORING_METRIC: &str = "qwen3_8/scoring/prompt_batch_shared_prefix";
 const INDEPENDENT_SCORING_METRIC: &str = "qwen3_8/scoring/prompt_batch_independent";
 const NATIVE_SCORING_METRIC: &str = "qwen3_8/scoring/native_loglikelihood";
@@ -236,7 +238,7 @@ pub fn benchmark_resident_mtp_batch_generation(
         )?);
     }
     metrics.push(host_completion_metric(
-        "qwen3_8/generation/cancellation_resume",
+        CANCELLATION_METRIC,
         format!(
             "B=1,prompt={},boundary={},followup={}",
             cancellation_reference.prompt_tokens,
@@ -253,7 +255,7 @@ pub fn benchmark_resident_mtp_batch_generation(
         cancellation_samples,
     )?);
     metrics.push(host_completion_metric(
-        "qwen3_8/generation/completed_prefix_fallback",
+        COMPLETION_FALLBACK_METRIC,
         format!(
             "B=1,prompt={},retained={},boundary={},followup={}",
             completion_fallback_reference.prompt_tokens,
@@ -888,6 +890,19 @@ fn completed_followup_request() -> ChatGenerationRequest {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qwen38_resident_mtp_suite_terminal_mirror_owner_benchmark_accounting_is_exact() {
+        assert_eq!(super::OUTPUT_TOKENS, 8);
+        assert_eq!(
+            super::CANCELLATION_METRIC,
+            "qwen3_8/generation/cancellation_resume"
+        );
+        assert_eq!(
+            super::COMPLETION_FALLBACK_METRIC,
+            "qwen3_8/generation/completed_prefix_fallback"
+        );
+    }
+
     #[test]
     fn resident_mtp_batch_suite_benchmark_inventory_is_exact() {
         assert_eq!(

@@ -15411,6 +15411,7 @@ mod tests {
             "resident_mtp::tests::qwen38_resident_mtp_suite_inventory_is_exact",
             "resident_mtp::tests::qwen38_resident_mtp_suite_source_values_match_every_route_and_lifecycle",
             "resident_mtp_benchmark::tests::qwen38_resident_mtp_suite_benchmark_inventory_and_accounting_are_exact",
+            "resident_mtp_batch_generation_benchmark::tests::qwen38_resident_mtp_suite_terminal_mirror_owner_benchmark_accounting_is_exact",
         ];
         for test in selected {
             assert!(test.contains(RESIDENT_MTP_TEST_FILTER));

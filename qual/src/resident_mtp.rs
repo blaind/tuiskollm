@@ -796,21 +796,43 @@ fn verify_lifecycle(
 
     program.truncate_kv_slot_tokens(stream, slot, 0)?;
     require_zero_page(program, stream, physical, "truncate")?;
+    require_shared_block_tables(program, stream, "truncate")?;
     report.lifecycle_transitions += 1;
     program.reserve_kv_slot_tokens(stream, slot, 64)?;
     let reused = usize::try_from(program.target().qualification_kv_physical_page(slot, 0)?)
         .map_err(|_| ResidentMtpQualificationError::Mismatch("reused page exceeds usize".into()))?;
     require_zero_page(program, stream, reused, "reassignment")?;
     report.lifecycle_transitions += 1;
+    program
+        .target()
+        .load_residual(stream, 1, &hidden_fixture(1, 9_001))?;
+    let route = program.stage_prompt(stream, 1, slot, 0, &[token_id(9_001)], &cosine, &sine)?;
+    program.replay_prompt(stream, route)?;
     program.retain_kv_slot(slot)?;
     program.activate_kv_slot(slot)?;
     report.lifecycle_transitions += 2;
     program.recycle_kv_slot(stream, slot)?;
     require_zero_page(program, stream, reused, "recycle")?;
+    require_shared_block_tables(program, stream, "recycle")?;
     report.lifecycle_transitions += 1;
     program.activate_kv_slot(slot)?;
     program.reserve_kv_slot_tokens(stream, slot, 1_024)?;
     report.lifecycle_transitions += 2;
+    Ok(())
+}
+
+fn require_shared_block_tables(
+    program: &ResidentMtpProgram,
+    stream: &CudaStream,
+    transition: &str,
+) -> Result<(), ResidentMtpQualificationError> {
+    let target = program.target().qualification_block_tables(stream)?;
+    let mtp = program.qualification_block_tables(stream)?;
+    if target != mtp {
+        return Err(ResidentMtpQualificationError::Mismatch(format!(
+            "{transition} left the target and MTP block tables inconsistent"
+        )));
+    }
     Ok(())
 }
 

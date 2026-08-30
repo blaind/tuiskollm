@@ -2457,6 +2457,40 @@ impl ResidentModelProgram {
         Ok(())
     }
 
+    /// Enqueues one current page-table row into the MTP mirror.
+    ///
+    /// # Safety
+    ///
+    /// The destination arena must remain live until the stream reaches the copy.
+    pub(crate) unsafe fn enqueue_mtp_block_table_row_handoff(
+        &self,
+        stream: &CudaStream,
+        destination: &DeviceArena,
+        block_tables: ArenaRegion<u32>,
+        slot: usize,
+    ) -> EngineResult<()> {
+        require_slot(slot)?;
+        let start = product(
+            "resident MTP block-table row offset",
+            slot,
+            LONG_CONTEXT_PHYSICAL_PAGES,
+        )?;
+        // SAFETY: both complete table regions remain owned at stable addresses, and the checked
+        // row is within both exact MAX_BATCH table inventories.
+        unsafe {
+            destination.copy_slice_from_arena_async(
+                stream,
+                block_tables,
+                start,
+                &self.kv_arena,
+                self.layout.kv_layout.block_tables(),
+                start,
+                LONG_CONTEXT_PHYSICAL_PAGES,
+            )?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "qualification")]
     pub(crate) fn qualification_mtp_prompt_source_addresses(&self) -> GpuResult<[usize; 2]> {
         Ok([

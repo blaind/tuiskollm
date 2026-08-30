@@ -1219,8 +1219,13 @@ impl ResidentMtpProgram {
             let physical_page = self.target.mtp_kv_physical_page(slot, logical_page)?;
             self.clear_mtp_physical_page(stream, physical_page)?;
         }
-        self.target
-            .truncate_kv_slot_tokens(stream, slot, token_count)
+        let released = self
+            .target
+            .truncate_kv_slot_tokens(stream, slot, token_count)?;
+        if released != 0 {
+            self.sync_mtp_table_row(stream, slot)?;
+        }
+        Ok(released)
     }
 
     /// Marks the one shared row as a reusable prefix.
@@ -1231,7 +1236,24 @@ impl ResidentMtpProgram {
     /// Clears MTP pages before the shared route is returned to the free inventory.
     pub fn recycle_kv_slot(&mut self, stream: &CudaStream, slot: usize) -> EngineResult<usize> {
         self.clear_mtp_slot_cache(stream, slot)?;
-        self.target.recycle_kv_slot(stream, slot)
+        let released = self.target.recycle_kv_slot(stream, slot)?;
+        if released != 0 {
+            self.sync_mtp_table_row(stream, slot)?;
+        }
+        Ok(released)
+    }
+
+    fn sync_mtp_table_row(&self, stream: &CudaStream, slot: usize) -> EngineResult<()> {
+        // SAFETY: the resident target and MTP arenas remain owned at stable addresses through
+        // every stream operation issued by this program.
+        unsafe {
+            self.target.enqueue_mtp_block_table_row_handoff(
+                stream,
+                &self.arena,
+                self.layout.regions().block_tables,
+                slot,
+            )
+        }
     }
 
     /// Clears target recurrent/cache state and the complete MTP cache mirror.
@@ -1833,6 +1855,14 @@ impl ResidentMtpProgram {
         let mut addresses = self.pointers()?.addresses();
         addresses.extend(self.target.qualification_mtp_prompt_source_addresses()?);
         Ok(addresses)
+    }
+
+    #[cfg(feature = "qualification")]
+    /// Reads all eight mirrored long-context page-table rows.
+    pub fn qualification_block_tables(&self, stream: &CudaStream) -> EngineResult<Vec<u32>> {
+        Ok(self
+            .arena
+            .copy_to_host(stream, self.layout.regions().block_tables)?)
     }
 
     #[cfg(feature = "qualification")]
