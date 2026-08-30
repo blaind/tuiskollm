@@ -554,14 +554,59 @@ mod tests {
         let (layout, regions) = layout().unwrap();
         assert_eq!(CONTEXT_TOKENS, 220_000);
         assert_eq!(scalar_elements(), 165_120);
-        assert_eq!(regions.cache_bytes(), 901_251_072);
-        assert_eq!(regions.partition_workspace_bytes(), 170_403_840);
+        assert_eq!(table_elements(), 27_492);
+
+        // The two composite buckets are defined as specific owners, so pin that identity rather
+        // than trusting a byte total that could silently absorb an unrelated region.
         assert_eq!(
-            layout.byte_len() - regions.cache_bytes() - regions.partition_workspace_bytes() - 288,
-            503_472
+            regions.cache_bytes(),
+            regions.key_pages.byte_len() + regions.value_pages.byte_len()
+        );
+        assert_eq!(regions.cache_bytes(), 901_251_072);
+        assert_eq!(
+            regions.partition_workspace_bytes(),
+            regions.partial_maximum.byte_len()
+                + regions.partial_denominator.byte_len()
+                + regions.partial_numerator.byte_len()
+        );
+        assert_eq!(regions.partition_workspace_bytes(), 170_403_840);
+
+        // Everything the two buckets do not cover, named individually so growth in one owner
+        // cannot be offset by shrinkage in another.
+        let owners = regions.query.byte_len()
+            + regions.block_tables.byte_len()
+            + regions.table_rows.byte_len()
+            + regions.lengths.byte_len()
+            + regions.output.byte_len();
+        assert_eq!(owners, 503_568);
+        assert_eq!(
+            layout.byte_len()
+                - regions.cache_bytes()
+                - regions.partition_workspace_bytes()
+                - (layout.byte_len() - regions.payload_bytes()),
+            owners
+        );
+
+        // The sentinel's point: named owners plus alignment padding is the whole arena, with no
+        // unattributed byte. The three constants this replaces came from
+        // long_context_paged_gqa_benchmark, whose arena is this one minus a second page plane:
+        // 503_472 is that fixture's owner residual and 336 is its padding, so neither pair can
+        // describe this layout, and 503_472/1_072_158_432/288 never satisfied each other here.
+        assert_eq!(
+            regions.query.byte_len()
+                + regions.key_pages.byte_len()
+                + regions.value_pages.byte_len()
+                + regions.block_tables.byte_len()
+                + regions.table_rows.byte_len()
+                + regions.lengths.byte_len()
+                + regions.partial_maximum.byte_len()
+                + regions.partial_denominator.byte_len()
+                + regions.partial_numerator.byte_len()
+                + regions.output.byte_len(),
+            regions.payload_bytes()
         );
         assert_eq!(layout.byte_len(), 1_072_158_720);
-        assert_eq!(regions.payload_bytes(), 1_072_158_432);
-        assert_eq!(layout.byte_len() - regions.payload_bytes(), 288);
+        assert_eq!(regions.payload_bytes(), 1_072_158_480);
+        assert_eq!(layout.byte_len() - regions.payload_bytes(), 240);
     }
 }
