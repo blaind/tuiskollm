@@ -11,12 +11,13 @@ use crate::{
     LoglikelihoodRequest, PreparedChatRequest, PreparedCompletionRequest,
     PreparedLoglikelihoodRequest, openai_error,
 };
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION, header::RETRY_AFTER};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
@@ -42,6 +43,7 @@ use tuisko_model::{
 };
 
 const REQUEST_BODY_LIMIT: usize = 2 * 1024 * 1024;
+const MAX_FORCED_PARK_SECONDS: u64 = u32::MAX as u64;
 const DEFAULT_SEED_SCRAMBLE: u64 = 0x9e37_79b9_7f4a_7c15;
 // Bounded so the single-threaded worker never blocks on a stalled client; a full
 // lane is treated exactly like a disconnected one.
@@ -94,6 +96,7 @@ struct AppState {
     response_namespace: u128,
     worker_alive: Arc<AtomicBool>,
     lifecycle: Arc<Mutex<LifecycleState>>,
+    forced_park_until: Arc<Mutex<Option<Instant>>>,
     lifecycle_supported: bool,
     admin_token: Option<Arc<str>>,
     server_started: Instant,
@@ -144,6 +147,7 @@ enum Job {
 
 struct AdminJob {
     kind: AdminKind,
+    park_for: Duration,
     reply: std_mpsc::SyncSender<AdminReply>,
 }
 
@@ -217,6 +221,12 @@ enum EnqueueError {
     Full,
     Closed,
     Transition(LifecycleState),
+    ForcedPark(Duration),
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+struct ParkQuery {
+    seconds: Option<u64>,
 }
 
 struct Ready {
@@ -242,6 +252,7 @@ struct Ready {
 struct WorkerControl {
     alive: Arc<AtomicBool>,
     lifecycle: Arc<Mutex<LifecycleState>>,
+    forced_park_until: Arc<Mutex<Option<Instant>>>,
     progress: Arc<ResidentLoadProgress>,
     interactive: bool,
     color: bool,
@@ -258,6 +269,7 @@ struct DisplayOptions {
 struct WorkerRuntime {
     alive: Arc<AtomicBool>,
     lifecycle: Arc<Mutex<LifecycleState>>,
+    forced_park_until: Arc<Mutex<Option<Instant>>>,
     display: DisplayOptions,
 }
 
@@ -820,10 +832,12 @@ fn start_worker(
     let (failure_tx, failure_rx) = oneshot::channel();
     let worker_alive = Arc::new(AtomicBool::new(false));
     let lifecycle = Arc::new(Mutex::new(LifecycleState::Loading));
+    let forced_park_until = Arc::new(Mutex::new(None));
     let progress = Arc::new(ResidentLoadProgress::new());
     let snapshot = snapshot.to_owned();
     let worker_alive_clone = Arc::clone(&worker_alive);
     let worker_lifecycle = Arc::clone(&lifecycle);
+    let worker_forced_park_until = Arc::clone(&forced_park_until);
     let worker_progress = Arc::clone(&progress);
     std::thread::Builder::new()
         .name("tuiskollm-engine".into())
@@ -837,6 +851,7 @@ fn start_worker(
                 WorkerControl {
                     alive: worker_alive_clone,
                     lifecycle: worker_lifecycle,
+                    forced_park_until: worker_forced_park_until,
                     progress: worker_progress,
                     interactive,
                     color,
@@ -888,6 +903,7 @@ fn start_worker(
             response_namespace,
             worker_alive,
             lifecycle,
+            forced_park_until,
             lifecycle_supported: target == ServerModel::Qwen38,
             admin_token: admin_token.map(Arc::from),
             server_started,
@@ -926,6 +942,7 @@ fn engine_worker(
     let runtime = WorkerRuntime {
         alive: control.alive,
         lifecycle: control.lifecycle,
+        forced_park_until: control.forced_park_until,
         display: DisplayOptions {
             interactive: control.interactive,
             color: control.color,
@@ -1184,6 +1201,7 @@ fn start_reloadable_qwen38(
         jobs,
         failure,
         Arc::clone(&runtime.lifecycle),
+        Arc::clone(&runtime.forced_park_until),
         move || reload_qwen38(&snapshot).map(|(generator, _)| generator),
         runtime.display.interactive,
         runtime.display.color,
@@ -1321,6 +1339,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
     mut jobs: Receiver<Job>,
     failure: oneshot::Sender<String>,
     lifecycle: Arc<Mutex<LifecycleState>>,
+    forced_park_until: Arc<Mutex<Option<Instant>>>,
     mut reload: impl FnMut() -> Result<G, String>,
     interactive: bool,
     color: bool,
@@ -1400,8 +1419,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
                     AdminKind::Park => {
                         let (host_bytes, device_bytes, _) = G::parked_ownership(&parked_owner);
                         parked = Some(parked_owner);
-                        *lifecycle.lock().expect("lifecycle mutex poisoned") =
-                            LifecycleState::Parked;
+                        publish_parked(&lifecycle, &forced_park_until, admin.park_for);
                         let _ = admin.reply.send(AdminReply::Parked {
                             host_bytes,
                             device_bytes,
@@ -1561,8 +1579,7 @@ fn serve_reloadable<G: ReloadableGenerator>(
                         match G::park(owner) {
                             Ok((owner, host_bytes, device_bytes)) => {
                                 parked = Some(owner);
-                                *lifecycle.lock().expect("lifecycle mutex poisoned") =
-                                    LifecycleState::Parked;
+                                publish_parked(&lifecycle, &forced_park_until, admin.park_for);
                                 let _ = admin.reply.send(AdminReply::Parked {
                                     host_bytes,
                                     device_bytes,
@@ -2283,6 +2300,23 @@ fn fail_resume_queued(jobs: &mut Receiver<Job>, message: &str) {
     }
 }
 
+fn publish_parked(
+    lifecycle: &Mutex<LifecycleState>,
+    forced_park_until: &Mutex<Option<Instant>>,
+    park_for: Duration,
+) {
+    let mut lifecycle = lifecycle.lock().expect("lifecycle mutex poisoned");
+    let mut deadline = forced_park_until
+        .lock()
+        .expect("forced park mutex poisoned");
+    *deadline = (!park_for.is_zero()).then(|| {
+        Instant::now()
+            .checked_add(park_for)
+            .expect("validated forced park duration overflowed Instant")
+    });
+    *lifecycle = LifecycleState::Parked;
+}
+
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -2335,22 +2369,56 @@ async fn readiness(State(state): State<AppState>) -> Response {
 }
 
 async fn unload(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    lifecycle_request(&state, &headers, AdminKind::Unload).await
+    lifecycle_request(&state, &headers, AdminKind::Unload, Duration::ZERO).await
 }
 
 async fn load(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    lifecycle_request(&state, &headers, AdminKind::Load).await
+    lifecycle_request(&state, &headers, AdminKind::Load, Duration::ZERO).await
 }
 
-async fn park(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    lifecycle_request(&state, &headers, AdminKind::Park).await
+async fn park(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<ParkQuery>, QueryRejection>,
+) -> Response {
+    let seconds = match query {
+        Ok(Query(query)) => query.seconds.unwrap_or(0),
+        Err(error) => {
+            return lifecycle_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &error.to_string(),
+            );
+        }
+    };
+    if seconds > MAX_FORCED_PARK_SECONDS {
+        return lifecycle_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("park seconds cannot exceed {MAX_FORCED_PARK_SECONDS}"),
+        );
+    }
+    let park_for = Duration::from_secs(seconds);
+    if Instant::now().checked_add(park_for).is_none() {
+        return lifecycle_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "park duration is too large",
+        );
+    }
+    lifecycle_request(&state, &headers, AdminKind::Park, park_for).await
 }
 
 async fn resume(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    lifecycle_request(&state, &headers, AdminKind::Resume).await
+    lifecycle_request(&state, &headers, AdminKind::Resume, Duration::ZERO).await
 }
 
-async fn lifecycle_request(state: &AppState, headers: &HeaderMap, kind: AdminKind) -> Response {
+async fn lifecycle_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    kind: AdminKind,
+    park_for: Duration,
+) -> Response {
     if let Some(expected) = state.admin_token.as_deref() {
         let authorized = headers
             .get(AUTHORIZATION)
@@ -2443,7 +2511,11 @@ async fn lifecycle_request(state: &AppState, headers: &HeaderMap, kind: AdminKin
                 );
             }
         }
-        if let Err(error) = state.jobs.try_send(Job::Admin(AdminJob { kind, reply })) {
+        if let Err(error) = state.jobs.try_send(Job::Admin(AdminJob {
+            kind,
+            park_for,
+            reply,
+        })) {
             *lifecycle = previous;
             return match error {
                 TrySendError::Full(_) => lifecycle_error(
@@ -2457,6 +2529,14 @@ async fn lifecycle_request(state: &AppState, headers: &HeaderMap, kind: AdminKin
                     "resident engine worker is unavailable",
                 ),
             };
+        }
+        if previous == LifecycleState::Parked
+            && matches!(kind, AdminKind::Resume | AdminKind::Unload)
+        {
+            *state
+                .forced_park_until
+                .lock()
+                .expect("forced park mutex poisoned") = None;
         }
     }
 
@@ -2483,6 +2563,7 @@ async fn lifecycle_request(state: &AppState, headers: &HeaderMap, kind: AdminKin
             "object": "model_park",
             "model": state.model_id,
             "state": "parked",
+            "minimum_park_seconds": park_for.as_secs(),
             "host_bytes": host_bytes,
             "device_allocation_bytes_released": device_bytes,
             "park_ms": park_ms,
@@ -2960,6 +3041,22 @@ fn enqueue_chat_job(state: &AppState, job: ChatJob) -> Result<(), EnqueueError> 
                 Some(LifecycleState::Unloaded)
             }
             LifecycleState::Parked => {
+                let mut deadline = state
+                    .forced_park_until
+                    .lock()
+                    .expect("forced park mutex poisoned");
+                if let Some(remaining) = deadline
+                    .as_ref()
+                    .and_then(|until| until.checked_duration_since(Instant::now()))
+                {
+                    let message = format!(
+                        "model is forced parked for {} more seconds",
+                        retry_after_seconds(remaining)
+                    );
+                    job.log.finish(None, 0, 0, "error", Some(&message));
+                    return Err(EnqueueError::ForcedPark(remaining));
+                }
+                *deadline = None;
                 *lifecycle = LifecycleState::Resuming;
                 Some(LifecycleState::Parked)
             }
@@ -3022,6 +3119,22 @@ fn enqueue_score_job(state: &AppState, job: ScoreJob) -> Result<(), EnqueueError
                 Some(LifecycleState::Unloaded)
             }
             LifecycleState::Parked => {
+                let mut deadline = state
+                    .forced_park_until
+                    .lock()
+                    .expect("forced park mutex poisoned");
+                if let Some(remaining) = deadline
+                    .as_ref()
+                    .and_then(|until| until.checked_duration_since(Instant::now()))
+                {
+                    let message = format!(
+                        "model is forced parked for {} more seconds",
+                        retry_after_seconds(remaining)
+                    );
+                    job.log.finish(None, "error", Some(&message));
+                    return Err(EnqueueError::ForcedPark(remaining));
+                }
+                *deadline = None;
                 *lifecycle = LifecycleState::Resuming;
                 Some(LifecycleState::Parked)
             }
@@ -3085,7 +3198,28 @@ fn enqueue_error_response(error: EnqueueError) -> Response {
                 .insert(RETRY_AFTER, HeaderValue::from_static("1"));
             response
         }
+        EnqueueError::ForcedPark(remaining) => {
+            let seconds = retry_after_seconds(remaining);
+            let mut response = lifecycle_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "model_forced_parked",
+                &format!("model is forced parked for {seconds} more seconds"),
+            );
+            response.headers_mut().insert(
+                RETRY_AFTER,
+                HeaderValue::from_str(&seconds.to_string())
+                    .expect("u64 seconds always form a valid header value"),
+            );
+            response
+        }
     }
+}
+
+fn retry_after_seconds(remaining: Duration) -> u64 {
+    remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() != 0))
+        .max(1)
 }
 
 #[cfg(test)]
@@ -3104,7 +3238,7 @@ mod tests {
     use crate::{ChatCompletionRequest, GenerationReply, SERVED_MODEL};
     use axum::Json;
     use axum::body::to_bytes;
-    use axum::extract::State;
+    use axum::extract::{Query, State};
     use axum::http::{
         HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION, header::RETRY_AFTER,
     };
@@ -3114,7 +3248,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, mpsc as std_mpsc};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::runtime::Builder;
     use tokio::sync::mpsc::channel;
     use tuisko_engine::{
@@ -3248,6 +3382,7 @@ mod tests {
             } else {
                 LifecycleState::Dead
             })),
+            forced_park_until: Arc::new(Mutex::new(None)),
             lifecycle_supported: true,
             admin_token: None,
             server_started: std::time::Instant::now(),
@@ -3522,6 +3657,27 @@ mod tests {
         *app.lifecycle.lock().unwrap() = LifecycleState::Parked;
         assert_eq!(enqueue_chat_job(&app, job().0), Err(EnqueueError::Full));
         assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Parked);
+    }
+
+    #[test]
+    fn forced_park_refuses_chat_until_its_deadline() {
+        let (jobs, mut receiver) = channel(1);
+        let app = state(jobs, true);
+        *app.lifecycle.lock().unwrap() = LifecycleState::Parked;
+        *app.forced_park_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(30));
+
+        assert!(matches!(
+            enqueue_chat_job(&app, job().0),
+            Err(EnqueueError::ForcedPark(remaining))
+                if remaining > Duration::from_secs(29)
+        ));
+        assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Parked);
+        assert!(receiver.try_recv().is_err());
+
+        *app.forced_park_until.lock().unwrap() = Some(Instant::now());
+        enqueue_chat_job(&app, job().0).unwrap();
+        assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Resuming);
+        assert!(matches!(receiver.try_recv(), Ok(Job::Chat(_))));
     }
 
     #[test]
@@ -3833,6 +3989,8 @@ mod tests {
         let attempts = Arc::new(AtomicU64::new(0));
         let (failure, _failure_receiver) = tokio::sync::oneshot::channel();
         let worker_lifecycle = Arc::clone(&lifecycle);
+        let forced_park_until = Arc::new(Mutex::new(None));
+        let worker_forced_park_until = Arc::clone(&forced_park_until);
         let worker_drops = Arc::clone(&drops);
         let worker_attempts = Arc::clone(&attempts);
         let worker = std::thread::spawn(move || {
@@ -3844,6 +4002,7 @@ mod tests {
                 receiver,
                 failure,
                 worker_lifecycle,
+                worker_forced_park_until,
                 move || {
                     if worker_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
                         Err("fixture reload failed".into())
@@ -3864,6 +4023,7 @@ mod tests {
         let (unload_reply, unload_receiver) = std_mpsc::sync_channel(1);
         jobs.blocking_send(Job::Admin(super::AdminJob {
             kind: super::AdminKind::Unload,
+            park_for: Duration::ZERO,
             reply: unload_reply,
         }))
         .unwrap();
@@ -3947,7 +4107,11 @@ mod tests {
         runtime().block_on(async {
             let (jobs, mut receiver) = channel(2);
             let app = state(jobs, true);
-            let handler = tokio::spawn(super::park(State(app.clone()), HeaderMap::new()));
+            let handler = tokio::spawn(super::park(
+                State(app.clone()),
+                HeaderMap::new(),
+                Ok(axum::extract::Query(super::ParkQuery::default())),
+            ));
             tokio::task::yield_now().await;
 
             assert_eq!(*app.lifecycle.lock().unwrap(), LifecycleState::Parking);
@@ -4025,12 +4189,78 @@ mod tests {
     }
 
     #[test]
+    fn timed_park_blocks_inference_and_explicit_resume_overrides_it() {
+        runtime().block_on(async {
+            let (jobs, mut receiver) = channel(2);
+            let app = state(jobs, true);
+            let handler = tokio::spawn(super::park(
+                State(app.clone()),
+                HeaderMap::new(),
+                Ok(Query(super::ParkQuery { seconds: Some(30) })),
+            ));
+            tokio::task::yield_now().await;
+
+            let Job::Admin(admin) = receiver.recv().await.unwrap() else {
+                panic!("timed park handler queued an inference job")
+            };
+            assert_eq!(admin.kind, super::AdminKind::Park);
+            assert_eq!(admin.park_for, Duration::from_secs(30));
+            super::publish_parked(&app.lifecycle, &app.forced_park_until, admin.park_for);
+            admin
+                .reply
+                .send(super::AdminReply::Parked {
+                    host_bytes: 45,
+                    device_bytes: 67,
+                    park_ms: 8,
+                })
+                .unwrap();
+
+            let response = handler.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["minimum_park_seconds"], 30);
+
+            let blocked = chat_completions(State(app.clone()), Ok(Json(streaming_request()))).await;
+            assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let retry_after = blocked.headers()[RETRY_AFTER]
+                .to_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            assert!((1..=30).contains(&retry_after));
+            let body = to_bytes(blocked.into_body(), 1 << 20).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "model_forced_parked");
+            assert!(receiver.try_recv().is_err());
+
+            let handler = tokio::spawn(super::resume(State(app.clone()), HeaderMap::new()));
+            tokio::task::yield_now().await;
+            assert!(app.forced_park_until.lock().unwrap().is_none());
+            let Job::Admin(admin) = receiver.recv().await.unwrap() else {
+                panic!("resume handler queued an inference job")
+            };
+            *app.lifecycle.lock().unwrap() = LifecycleState::Loaded;
+            admin
+                .reply
+                .send(super::AdminReply::Resumed {
+                    resumed: true,
+                    restore_ms: 11,
+                })
+                .unwrap();
+            assert_eq!(handler.await.unwrap().status(), StatusCode::OK);
+        });
+    }
+
+    #[test]
     fn reloadable_worker_auto_resumes_parked_state_for_chat_without_dropping_it() {
         let (jobs, receiver) = channel(MAX_BATCH);
         let lifecycle = Arc::new(Mutex::new(LifecycleState::Loaded));
         let drops = Arc::new(AtomicU64::new(0));
         let (failure, _failure_receiver) = tokio::sync::oneshot::channel();
         let worker_lifecycle = Arc::clone(&lifecycle);
+        let forced_park_until = Arc::new(Mutex::new(None));
+        let worker_forced_park_until = Arc::clone(&forced_park_until);
         let worker_drops = Arc::clone(&drops);
         let resume_failures = Arc::new(AtomicU64::new(1));
         let worker_resume_failures = Arc::clone(&resume_failures);
@@ -4043,6 +4273,7 @@ mod tests {
                 receiver,
                 failure,
                 worker_lifecycle,
+                worker_forced_park_until,
                 || unreachable!("park/resume fixture never reloads"),
                 false,
                 false,
@@ -4054,6 +4285,7 @@ mod tests {
         let (reply, receiver) = std_mpsc::sync_channel(1);
         jobs.blocking_send(Job::Admin(super::AdminJob {
             kind: super::AdminKind::Park,
+            park_for: Duration::ZERO,
             reply,
         }))
         .unwrap();

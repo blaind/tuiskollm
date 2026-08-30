@@ -95,7 +95,7 @@ portable floor or baseline.
 | --- | --- | --- |
 | `POST /v1/unload` | `200 {"object":"model_unload","model":...,"state":"unloaded","was_loaded":bool,"was_parked":bool,"device_allocation_bytes_released":N}` | `409 transition_in_progress` or unsupported target; `503 worker_dead` |
 | `POST /v1/load` | `200 {"object":"model_load","model":...,"state":"loaded","reloaded":bool,"load_ms":M}` | `409 model_parked`, transition, or unsupported target; `500 load_failed`; `503 worker_dead` |
-| `POST /v1/park` | `200 {"object":"model_park","model":...,"state":"parked","host_bytes":N,"device_allocation_bytes_released":M,"park_ms":P}` | `409 unloaded`, transition, or unsupported target; `500 park_failed`; `503 worker_dead` |
+| `POST /v1/park[?seconds=N]` | `200 {"object":"model_park","model":...,"state":"parked","minimum_park_seconds":N,"host_bytes":H,"device_allocation_bytes_released":M,"park_ms":P}` | `400 invalid duration`; `409 unloaded`, transition, or unsupported target; `500 park_failed`; `503 worker_dead` |
 | `POST /v1/resume` | `200 {"object":"model_resume","model":...,"state":"loaded","resumed":bool,"restore_ms":R}` | `409 unloaded`, transition, or unsupported target; `500 resume_failed`; `503 worker_dead` |
 | `GET /health` | `200` while the HTTP process and engine worker are alive; includes `model_state` | `503 worker_dead` |
 | `GET /ready` | `200` only in `Loaded`; includes `model_state` | `503` in every other live state |
@@ -109,6 +109,11 @@ administrative `500 load_failed` response in the table above. A parked chat simi
 resume attempt. Failure maps to retryable `503 model_resume_failed` for every chat admitted during
 that attempt, returns to `Parked`, and retains the mirror for a later retry; an explicit
 `/v1/resume` caller receives `500 resume_failed`.
+
+When `seconds=N` is present, the deadline starts only after park has completed. Chat and scoring
+requests during the minimum hold are not enqueued and return `503 model_forced_parked` with a
+ceiling-seconds `Retry-After`. The next request after expiry follows the ordinary auto-resume path;
+an explicit `/v1/resume` overrides the deadline.
 
 The default listener is loopback. If the configured listener is non-loopback, lifecycle routes
 must be disabled unless an explicit admin bearer token is configured; chat authorization is a
