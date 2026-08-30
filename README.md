@@ -101,7 +101,10 @@ The lifecycle routes are enabled only for the exact Qwen3.8 target. A non-loopba
 requires `--admin-token-env NAME`; requests then authenticate with `Authorization: Bearer ...`.
 Park is accepted only after previously admitted chats drain. The first chat submitted while parked
 starts one resume attempt; concurrent chats pend behind that same attempt. Explicit `/v1/resume`
-remains available for administrative warmup.
+remains available for administrative warmup. `POST /v1/park?seconds=N` instead enforces a minimum
+park of `N` whole seconds after the park completes. Inference requests received during that hold
+return `503 model_forced_parked` with `Retry-After`; after it expires, the next request auto-resumes
+normally. An explicit `/v1/resume` overrides the hold.
 
 For qualification commands and engineering constraints, see
 [`docs/performance.md`](docs/performance.md) and [`AGENTS.md`](AGENTS.md). The optional
